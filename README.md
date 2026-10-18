@@ -2,8 +2,6 @@
 
 A small, private podcast player for slow evenings. Afterhours is a single file that runs on your own computer and opens in your browser. It comes with 30 shows already on the shelf, recommends related ones, and captions episodes that don't have captions.
 
-![afterhours-preview](/Users/zodiac/Documents/Models/Claude5.5/Afterhours/afterhours-preview.png)
-
 ## Quick start
 
 You need Python 3.8 or newer and a current browser (Chrome, Edge, Safari 16 or later, or Firefox).
