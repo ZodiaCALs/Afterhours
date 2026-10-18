@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 """
-夜更かしラジオ (After Hours): a small, private podcast player.
+夜更かしラジオ (After Hours) 2.0: a small, private podcast player.
 
-Run it:    python3 afterhours.py
+Run it:    python3 afterhours.py        (Windows: py afterhours.py)
 It opens:  http://127.0.0.1:8765  in your browser
 
 Needs only Python 3.8 or newer, with nothing extra to install.
 
 Why a script and not just a web page: podcast sites don't let a web page read
 their feeds directly (browsers block it, a rule called CORS). This script serves
-the player and fetches feeds, transcripts and search results on its behalf.
-It only listens on your own computer, and your library, progress and settings
-stay in your browser on this machine.
+the player and fetches feeds, transcripts, cover art and Apple Podcasts directory
+results on its behalf. It only listens on your own computer, and your library,
+progress and settings stay in your browser on this machine.
 
 Options:
   --port 8765      use a different port (each port keeps its own library)
@@ -20,14 +20,18 @@ Options:
 """
 
 import argparse
+import collections
 import gzip
+import html
 import http.server
 import json
 import os
+import re
 import socket
 import ssl
 import sys
 import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -35,21 +39,24 @@ import webbrowser
 import zlib
 
 APP_ID = "afterhours"
-VERSION = "1.0"
+VERSION = "2.0"
 DEFAULT_PORT = 8765
 MAX_BYTES = 25 * 1024 * 1024
 TIMEOUT = 25
 USER_AGENT = "Mozilla/5.0 (compatible; AfterHours/%s; personal podcast player)" % VERSION
 ACCEPT = ("application/rss+xml, application/xml;q=0.9, text/xml;q=0.9, application/json;q=0.8, "
           "text/vtt;q=0.8, text/plain;q=0.6, */*;q=0.5")
+# Apple's public podcast directory. It allows roughly 20 requests a minute, so requests are paced.
+APPLE_BASE = os.environ.get("AFTERHOURS_APPLE_BASE", "https://itunes.apple.com").rstrip("/")
+APPLE_INTERVAL = float(os.environ.get("AFTERHOURS_APPLE_INTERVAL", "3.1"))
 
 CERT_HELP = ("A secure connection couldn't be checked. On a Mac with Python from python.org, open "
-             "your Applications > Python folder and run “Install Certificates.command”, then restart the player.")
+             "Applications > Python and run “Install Certificates.command”, then restart the player.")
+RATE_HELP = "Apple’s podcast directory asked the player to slow down. Try again in a minute."
 
-PAGE_CSP = ("default-src 'self'; script-src 'self' 'unsafe-inline'; "
-            "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
-            "font-src https://fonts.gstatic.com data:; img-src * data: blob:; media-src * data: blob:; "
-            "connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'")
+PAGE_CSP = ("default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; "
+            "img-src * data: blob:; media-src * data: blob:; font-src 'self' data:; connect-src 'self'; "
+            "frame-ancestors 'none'; base-uri 'none'; form-action 'none'")
 
 
 def make_ssl_context():
@@ -63,6 +70,161 @@ def make_ssl_context():
 
 
 SSL_CTX = make_ssl_context()
+
+
+class FetchError(Exception):
+    def __init__(self, code, message, upstream=None):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.upstream = upstream
+
+
+def fetch_url(url, max_bytes=MAX_BYTES, accept=ACCEPT, partial=False):
+    """Fetch a URL and return (bytes, content_type, final_url). With partial=True, keep the first max_bytes."""
+    parts = urllib.parse.urlsplit(url)
+    if parts.scheme not in ("http", "https") or not parts.netloc:
+        raise FetchError(400, "That isn't a web address the player can open.")
+    request = urllib.request.Request(url, headers={
+        "User-Agent": USER_AGENT, "Accept": accept, "Accept-Encoding": "gzip, deflate"})
+    try:
+        with urllib.request.urlopen(request, timeout=TIMEOUT, context=SSL_CTX) as resp:
+            data = resp.read(max_bytes + 1)
+            encoding = (resp.headers.get("Content-Encoding") or "").lower()
+            ctype = resp.headers.get("Content-Type") or "application/octet-stream"
+            final_url = resp.geturl()
+    except urllib.error.HTTPError as e:
+        raise FetchError(502, "The site answered with an error (%s)." % e.code, upstream=e.code)
+    except urllib.error.URLError as e:
+        reason = e.reason
+        if isinstance(reason, ssl.SSLCertVerificationError) or "CERTIFICATE_VERIFY_FAILED" in str(reason):
+            raise FetchError(502, CERT_HELP)
+        if isinstance(reason, socket.timeout) or "timed out" in str(reason):
+            raise FetchError(504, "The site took too long to answer.")
+        raise FetchError(502, "Couldn't reach the site (%s)." % reason)
+    except (socket.timeout, TimeoutError):
+        raise FetchError(504, "The site took too long to answer.")
+    except Exception as e:  # keep the helper alive whatever happens upstream
+        raise FetchError(502, "Couldn't load that address (%s)." % e.__class__.__name__)
+
+    if len(data) > max_bytes:
+        if not partial:
+            raise FetchError(413, "That file is too large to load.")
+        data = data[:max_bytes]
+    try:
+        if encoding == "gzip" or data[:2] == b"\x1f\x8b":
+            data = zlib.decompressobj(16 + zlib.MAX_WBITS).decompress(data) if partial else gzip.decompress(data)
+        elif encoding == "deflate":
+            try:
+                data = zlib.decompress(data)
+            except zlib.error:
+                data = zlib.decompressobj(-zlib.MAX_WBITS).decompress(data)
+    except Exception:
+        raise FetchError(502, "The site sent data the player couldn't unpack.")
+    if len(data) > MAX_BYTES * 4:
+        raise FetchError(413, "That file is too large to load.")
+    return data, ctype, final_url
+
+
+def decode_text(data, ctype):
+    head = data[:300].decode("latin-1")
+    m = re.search(r"<\?xml[^>]*encoding=[\"']([^\"']+)[\"']", head, re.I) or re.search(r"charset=[\"']?([^;\"']+)", ctype, re.I)
+    for enc in ((m.group(1).strip() if m else "utf-8"), "utf-8"):
+        try:
+            return data.decode(enc, errors="replace")
+        except LookupError:
+            continue
+    return data.decode("utf-8", errors="replace")
+
+
+# ---------- Apple Podcasts directory, paced and cached ----------
+_apple_lock = threading.Lock()
+_apple_last = [0.0]
+_apple_cache = {}
+
+
+def apple_get(path, params):
+    url = "%s%s?%s" % (APPLE_BASE, path, urllib.parse.urlencode(params))
+    hit = _apple_cache.get(url)
+    if hit and time.time() - hit[0] < 6 * 3600:
+        return hit[1]
+    with _apple_lock:
+        hit = _apple_cache.get(url)
+        if hit and time.time() - hit[0] < 6 * 3600:
+            return hit[1]
+        wait = APPLE_INTERVAL - (time.monotonic() - _apple_last[0])
+        if wait > 0:
+            time.sleep(wait)
+        try:
+            data, _, _ = fetch_url(url, max_bytes=4 * 1024 * 1024, accept="application/json")
+        except FetchError as e:
+            if e.upstream in (403, 429):
+                raise FetchError(429, RATE_HELP)
+            raise
+        finally:
+            _apple_last[0] = time.monotonic()
+    _apple_cache[url] = (time.time(), data)
+    return data
+
+
+# ---------- feed header, read from the start of a feed only ----------
+def _clean(s):
+    s = re.sub(r"<!\[CDATA\[(.*?)\]\]>", r"\1", s, flags=re.S)
+    s = re.sub(r"<[^>]+>", "", s)
+    return html.unescape(s).strip()
+
+
+def feed_info(url):
+    data, ctype, final_url = fetch_url(url, max_bytes=768 * 1024, partial=True)
+    text = decode_text(data, ctype)
+    cut = re.search(r"<item[\s>]", text, re.I)
+    head = text[:cut.start()] if cut else text
+    no_image = re.sub(r"<image\b.*?</image>", "", head, flags=re.I | re.S)
+
+    def first(pattern, source):
+        m = re.search(pattern, source, re.I | re.S)
+        return _clean(m.group(1)) if m else ""
+
+    image = (first(r"<itunes:image\b[^>]*\bhref\s*=\s*[\"']([^\"']+)[\"']", head)
+             or first(r"<image\b[^>]*>.*?<url[^>]*>(.*?)</url>", head))
+    return {
+        "title": first(r"<title[^>]*>(.*?)</title>", no_image),
+        "author": first(r"<itunes:author[^>]*>(.*?)</itunes:author>", head),
+        "image": image,
+        "link": first(r"<link[^>]*>(.*?)</link>", no_image),
+        "finalUrl": final_url,
+    }
+
+
+# ---------- cover art through this origin, so the page can read its colours ----------
+_img_cache = collections.OrderedDict()
+_img_lock = threading.Lock()
+
+
+def get_image(url):
+    with _img_lock:
+        if url in _img_cache:
+            _img_cache.move_to_end(url)
+            return _img_cache[url]
+    data, ctype, _ = fetch_url(url, max_bytes=8 * 1024 * 1024,
+                               accept="image/avif,image/webp,image/png,image/jpeg,image/*;q=0.8")
+    if not ctype.lower().startswith("image/"):
+        sniff = data[:12]
+        if sniff.startswith(b"\x89PNG"):
+            ctype = "image/png"
+        elif sniff[:3] == b"\xff\xd8\xff":
+            ctype = "image/jpeg"
+        elif sniff[:4] == b"RIFF" and sniff[8:12] == b"WEBP":
+            ctype = "image/webp"
+        elif sniff[:3] == b"GIF":
+            ctype = "image/gif"
+        else:
+            raise FetchError(415, "That address isn't an image.")
+    with _img_lock:
+        _img_cache[url] = (data, ctype)
+        while len(_img_cache) > 80:
+            _img_cache.popitem(last=False)
+    return data, ctype
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -80,14 +242,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
         name = host.split("]")[0] + "]" if host.startswith("[") else host.split(":")[0]
         return name in ("127.0.0.1", "localhost", "[::1]")
 
-    def _send(self, code, body, ctype, extra=None):
+    def _send(self, code, body, ctype, extra=None, cache="no-store"):
         if isinstance(body, str):
             body = body.encode("utf-8")
         try:
             self.send_response(code)
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(body)))
-            self.send_header("Cache-Control", "no-store")
+            self.send_header("Cache-Control", cache)
             self.send_header("X-Content-Type-Options", "nosniff")
             self.send_header("Referrer-Policy", "no-referrer")
             for key, value in (extra or {}).items():
@@ -102,68 +264,56 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self._send(code, json.dumps({"error": message}), "application/json; charset=utf-8",
                    {"Content-Security-Policy": "default-src 'none'"})
 
+    def _json(self, obj):
+        self._send(200, json.dumps(obj), "application/json; charset=utf-8")
+
     def do_GET(self):
         if not self._host_ok():
             return self._error(403, "This player only answers on 127.0.0.1.")
         path, _, query = self.path.partition("?")
-        if path in ("/", "/index.html"):
-            return self._send(200, PAGE, "text/html; charset=utf-8", {"Content-Security-Policy": PAGE_CSP})
-        if path == "/api/ping":
-            return self._send(200, json.dumps({"app": APP_ID, "version": VERSION}), "application/json")
-        if path == "/api/fetch":
-            return self._proxy(query)
-        if path == "/favicon.ico":
-            return self._send(204, b"", "image/x-icon")
-        return self._error(404, "Not found.")
-
-    def _proxy(self, query):
-        url = (urllib.parse.parse_qs(query).get("url") or [""])[0].strip()
-        parts = urllib.parse.urlsplit(url)
-        if parts.scheme not in ("http", "https") or not parts.netloc:
-            return self._error(400, "That isn't a web address the player can open.")
-        request = urllib.request.Request(url, headers={
-            "User-Agent": USER_AGENT, "Accept": ACCEPT, "Accept-Encoding": "gzip, deflate"})
+        params = urllib.parse.parse_qs(query)
+        arg = lambda name, default="": (params.get(name) or [default])[0].strip()
         try:
-            with urllib.request.urlopen(request, timeout=TIMEOUT, context=SSL_CTX) as resp:
-                data = resp.read(MAX_BYTES + 1)
-                encoding = (resp.headers.get("Content-Encoding") or "").lower()
-                ctype = resp.headers.get("Content-Type") or "application/octet-stream"
-                final_url = resp.geturl()
-        except urllib.error.HTTPError as e:
-            return self._error(502, "The site answered with an error (%s)." % e.code)
-        except urllib.error.URLError as e:
-            reason = e.reason
-            if isinstance(reason, ssl.SSLCertVerificationError) or "CERTIFICATE_VERIFY_FAILED" in str(reason):
-                return self._error(502, CERT_HELP)
-            if isinstance(reason, socket.timeout) or "timed out" in str(reason):
-                return self._error(504, "The site took too long to answer.")
-            return self._error(502, "Couldn't reach the site (%s)." % reason)
-        except (socket.timeout, TimeoutError):
-            return self._error(504, "The site took too long to answer.")
-        except Exception as e:  # keep the helper alive whatever happens upstream
-            return self._error(502, "Couldn't load that address (%s)." % e.__class__.__name__)
-
-        if len(data) > MAX_BYTES:
-            return self._error(413, "That file is too large to load.")
-        try:
-            if encoding == "gzip" or data[:2] == b"\x1f\x8b":
-                data = gzip.decompress(data)
-            elif encoding == "deflate":
-                try:
-                    data = zlib.decompress(data)
-                except zlib.error:
-                    data = zlib.decompress(data, -zlib.MAX_WBITS)
-        except Exception:
-            return self._error(502, "The site sent data the player couldn't unpack.")
-        if len(data) > MAX_BYTES * 4:
-            return self._error(413, "That file is too large to load.")
-
-        safe_url = urllib.parse.quote(final_url, safe=":/?#[]@!$&'()*+,;=%~")
-        self._send(200, data, ctype, {
-            "X-Final-URL": safe_url,
-            # Never let fetched content run as a page on this origin.
-            "Content-Security-Policy": "default-src 'none'; sandbox",
-        })
+            if path in ("/", "/index.html"):
+                return self._send(200, PAGE, "text/html; charset=utf-8", {"Content-Security-Policy": PAGE_CSP})
+            if path == "/api/ping":
+                return self._json({"app": APP_ID, "version": VERSION})
+            if path == "/api/fetch":
+                data, ctype, final_url = fetch_url(arg("url"))
+                return self._send(200, data, ctype, {
+                    "X-Final-URL": urllib.parse.quote(final_url, safe=":/?#[]@!$&'()*+,;=%~"),
+                    "Content-Security-Policy": "default-src 'none'; sandbox"})  # never runs as a page here
+            if path == "/api/feedinfo":
+                return self._json(feed_info(arg("url")))
+            if path == "/api/image":
+                data, ctype = get_image(arg("url"))
+                return self._send(200, data, ctype, {"Content-Security-Policy": "default-src 'none'; sandbox"},
+                                  cache="private, max-age=604800")
+            if path in ("/api/search", "/api/lookup"):
+                country = arg("country", "gb").lower()
+                if not re.fullmatch(r"[a-z]{2}", country):
+                    country = "gb"
+                if path == "/api/search":
+                    term = arg("term")[:120]
+                    if not term:
+                        return self._error(400, "Type something to search for.")
+                    try:
+                        limit = max(1, min(50, int(arg("limit", "20"))))
+                    except ValueError:
+                        limit = 20
+                    data = apple_get("/search", {"media": "podcast", "entity": "podcast", "term": term,
+                                                 "country": country, "limit": limit})
+                else:
+                    ids = re.findall(r"\d{3,12}", arg("id"))[:50]
+                    if not ids:
+                        return self._error(400, "No podcast IDs given.")
+                    data = apple_get("/lookup", {"id": ",".join(ids), "country": country})
+                return self._send(200, data, "application/json; charset=utf-8")
+            if path == "/favicon.ico":
+                return self._send(204, b"", "image/x-icon")
+            return self._error(404, "Not found.")
+        except FetchError as e:
+            return self._error(e.code, e.message)
 
 
 class Server(http.server.ThreadingHTTPServer):
@@ -226,18 +376,21 @@ PAGE = r'''<!DOCTYPE html>
 <meta name="color-scheme" content="light dark">
 <meta name="referrer" content="no-referrer">
 <title>夜更かしラジオ</title>
-<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0' y1='0' x2='0' y2='1'%3E%3Cstop offset='0' stop-color='%23FFC15E'/%3E%3Cstop offset='.6' stop-color='%23F26B7A'/%3E%3Cstop offset='1' stop-color='%23B2418F'/%3E%3C/linearGradient%3E%3C/defs%3E%3Ccircle cx='32' cy='32' r='28' fill='url(%23g)'/%3E%3C/svg%3E">
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Shippori+Mincho+B1:wght@600;800&family=Zen+Kaku+Gothic+New:wght@400;500;700&display=swap">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0' y1='0' x2='0' y2='1'%3E%3Cstop offset='0' stop-color='%23FFC15E'/%3E%3Cstop offset='.6' stop-color='%23F26B7A'/%3E%3Cstop offset='1' stop-color='%23B2418F'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect width='64' height='64' rx='14' fill='%2321184F'/%3E%3Ccircle cx='32' cy='32' r='20' fill='url(%23g)'/%3E%3C/svg%3E">
 <style>
 :root {
-  --bg: #F4F2F8; --bg-2: #ECE9F3; --surface: #FFFFFF; --ink: #1D1A3A; --muted: #5E5A83; --faint: #8F8BB0;
-  --line: #DDD9EA; --hover: #E5E1F0; --accent: #B42E59; --on-accent: #FFFFFF; --focus: #6A4DDB;
-  --panel: #1E1A45; --panel-2: #2A245E; --panel-ink: #F6F2FF; --panel-muted: #B8B1DD; --panel-line: rgba(255,255,255,.13);
-  --sun-a: #FFC15E; --sun-b: #F26B7A; --sun-c: #B2418F;
-  --font-ui: "Zen Kaku Gothic New", "Hiragino Sans", "Hiragino Kaku Gothic ProN", "Noto Sans JP", "PingFang SC", "Microsoft YaHei", system-ui, -apple-system, "Segoe UI", sans-serif;
-  --font-display: "Shippori Mincho B1", "Hiragino Mincho ProN", "Yu Mincho", "Noto Serif JP", "Songti SC", Georgia, serif;
+  --bg: #FFFFFF; --bg-2: #F5F5F7; --side: #F2F2F5; --bar: rgba(250,250,252,.82);
+  --fill: rgba(118,118,128,.1); --fill-2: rgba(118,118,128,.18);
+  --text: #1D1D1F; --text-2: #6E6E73; --text-3: #8A8A8F; --sep: rgba(60,60,67,.12);
+  --accent: #C8326C; --accent-ink: #FFFFFF; --accent-soft: rgba(200,50,108,.1);
+  --shadow-art: 0 10px 24px -12px rgba(28,18,58,.45), 0 0 0 .5px rgba(0,0,0,.05);
+  --shadow-float: 0 14px 44px -12px rgba(0,0,0,.26), 0 0 0 .5px rgba(0,0,0,.08);
+  --pop-bg: #FFFFFF;
+  --font: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI Variable Text", "Segoe UI", system-ui, Roboto, "Helvetica Neue", Arial, "Hiragino Sans", "Hiragino Kaku Gothic ProN", "PingFang SC", "Noto Sans JP", "Noto Sans CJK JP", "Microsoft YaHei", sans-serif;
+  --font-display: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Segoe UI Variable Display", "Segoe UI", system-ui, Roboto, "Helvetica Neue", Arial, "Hiragino Sans", "PingFang SC", "Noto Sans JP", "Noto Sans CJK JP", sans-serif;
+  --font-brand: "Hiragino Mincho ProN", "Yu Mincho", YuMincho, "Noto Serif JP", "Noto Serif CJK JP", "Songti SC", serif;
+  --side-w: 248px; --bar-h: 72px; --gutter: clamp(20px, 4vw, 48px);
+  --th: 335; --ts: 62%; --tl: 52%;
   color-scheme: light;
   box-sizing: border-box;
   padding-top: env(safe-area-inset-top, 0px);
@@ -245,455 +398,691 @@ PAGE = r'''<!DOCTYPE html>
 }
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
-    --bg: #110F26; --bg-2: #0C0A1D; --surface: #1A1740; --ink: #EEEAF8; --muted: #A9A3CC; --faint: #7B75A4;
-    --line: #2B2756; --hover: #201C4A; --accent: #FF8AAA; --on-accent: #26081B; --focus: #B7A0FF;
-    --panel: #19153C; --panel-2: #262058;
+    --bg: #18181A; --bg-2: #222225; --side: #1F1F22; --bar: rgba(44,44,48,.8);
+    --fill: rgba(118,118,128,.2); --fill-2: rgba(118,118,128,.3);
+    --text: #F5F5F7; --text-2: #A1A1A6; --text-3: #7C7C82; --sep: rgba(255,255,255,.09);
+    --accent: #FF6E9F; --accent-ink: #2B0715; --accent-soft: rgba(255,110,159,.15);
+    --shadow-art: 0 12px 28px -12px rgba(0,0,0,.75), 0 0 0 .5px rgba(255,255,255,.07);
+    --shadow-float: 0 16px 48px -10px rgba(0,0,0,.65), 0 0 0 .5px rgba(255,255,255,.1);
+    --pop-bg: #2C2C30;
     color-scheme: dark;
   }
+  :root:not([data-theme="light"]) .show-author { color: hsl(var(--th) 82% 74%); }
 }
 :root[data-theme="dark"] {
-  --bg: #110F26; --bg-2: #0C0A1D; --surface: #1A1740; --ink: #EEEAF8; --muted: #A9A3CC; --faint: #7B75A4;
-  --line: #2B2756; --hover: #201C4A; --accent: #FF8AAA; --on-accent: #26081B; --focus: #B7A0FF;
-  --panel: #19153C; --panel-2: #262058;
+  --bg: #18181A; --bg-2: #222225; --side: #1F1F22; --bar: rgba(44,44,48,.8);
+  --fill: rgba(118,118,128,.2); --fill-2: rgba(118,118,128,.3);
+  --text: #F5F5F7; --text-2: #A1A1A6; --text-3: #7C7C82; --sep: rgba(255,255,255,.09);
+  --accent: #FF6E9F; --accent-ink: #2B0715; --accent-soft: rgba(255,110,159,.15);
+  --shadow-art: 0 12px 28px -12px rgba(0,0,0,.75), 0 0 0 .5px rgba(255,255,255,.07);
+  --shadow-float: 0 16px 48px -10px rgba(0,0,0,.65), 0 0 0 .5px rgba(255,255,255,.1);
+  --pop-bg: #2C2C30;
   color-scheme: dark;
 }
+:root[data-theme="dark"] .show-author { color: hsl(var(--th) 82% 74%); }
 
 *, *::before, *::after { box-sizing: inherit; }
-html { height: 100%; background: var(--bg); scroll-padding-top: env(safe-area-inset-top, 0px); }
-body {
-  height: 100%; margin: 0; background: var(--bg); color: var(--ink);
-  font-family: var(--font-ui); font-size: 15px; line-height: 1.55; -webkit-font-smoothing: antialiased;
-}
-body::before { content: ""; position: fixed; inset: 0 0 auto; height: env(safe-area-inset-top, 0px); z-index: 30; background: var(--bg); }
+html { height: 100%; background: var(--bg); }
+body { height: 100%; margin: 0; overflow: hidden; background: var(--bg); color: var(--text); font-family: var(--font); font-size: 15px; line-height: 1.45; -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale; }
+body::before { content: ""; position: fixed; inset: 0 0 auto; height: env(safe-area-inset-top, 0px); z-index: 90; background: var(--bg); }
 button, input { font: inherit; color: inherit; }
 button { cursor: pointer; }
-button:disabled { cursor: default; opacity: .45; }
-:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+button:disabled { cursor: default; opacity: .4; }
+a { color: inherit; }
+:focus-visible { outline: 2.5px solid color-mix(in srgb, var(--accent) 75%, transparent); outline-offset: 2px; border-radius: 8px; }
 [hidden] { display: none !important; }
 svg { width: 20px; height: 20px; flex: none; }
 .sprite { position: absolute; width: 0; height: 0; overflow: hidden; }
-.visually-hidden { position: absolute !important; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+input[type=search]::-webkit-search-decoration, input[type=search]::-webkit-search-cancel-button { -webkit-appearance: none; }
 
-/* Layout */
-.app { height: 100%; display: grid; grid-template-columns: 276px minmax(0, 1fr) 400px; }
-.library { background: var(--bg-2); border-right: 1px solid var(--line); overflow: auto; min-height: 0; padding: 22px 16px 18px; display: flex; flex-direction: column; gap: 16px; }
-.episodes { overflow: auto; min-height: 0; padding: 30px clamp(20px, 3.2vw, 44px) 48px; }
-.player { background: var(--panel); color: var(--panel-ink); overflow: auto; min-height: 0; border-left: 1px solid rgba(255,255,255,.05); --track: rgba(255,255,255,.16); --track-buf: rgba(255,255,255,.3); --thumb: #fff; --focus: var(--sun-a); }
-.full { display: flex; flex-direction: column; gap: 16px; padding: 26px 28px 22px; height: 100%; }
-.mini, .full-top { display: none; }
+/* Shell */
+.app { display: grid; grid-template-columns: var(--side-w) minmax(0, 1fr); height: 100%; }
+.main { position: relative; height: 100%; min-height: 0; overflow-y: auto; overflow-x: hidden; outline: none; }
+.view { max-width: 1240px; margin: 0 auto; padding: 36px var(--gutter) 150px; animation: viewIn .32s cubic-bezier(.2,.8,.2,1); }
+@keyframes viewIn { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
 
-/* Library */
-.brand { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 0 4px; }
-.brand h1 { margin: 0; font-family: var(--font-display); font-weight: 800; font-size: 1.32rem; line-height: 1.2; letter-spacing: .02em; white-space: nowrap; }
-.brand h1::before { content: ""; display: inline-block; width: .78em; height: .78em; margin-right: .42em; vertical-align: -.04em; border-radius: 50%; background: linear-gradient(var(--sun-a), var(--sun-b) 60%, var(--sun-c)); }
-.add { display: flex; align-items: center; gap: 6px; background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 4px 4px 4px 10px; }
-.add:focus-within { border-color: var(--focus); box-shadow: 0 0 0 3px color-mix(in srgb, var(--focus) 18%, transparent); }
-.add > svg { width: 18px; height: 18px; color: var(--faint); }
-.add input { flex: 1; min-width: 0; border: 0; background: transparent; padding: 7px 2px; outline: none; font-size: .88rem; text-overflow: ellipsis; }
-.add input::placeholder { color: var(--faint); }
-.add button { flex: none; border: 0; border-radius: 7px; background: var(--ink); color: var(--bg); padding: 6px 10px; font-size: .8rem; font-weight: 500; min-width: 56px; }
-.results { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 10px; max-height: 55vh; overflow: auto; }
-.results-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 6px; }
-.results-head p { margin: 0; font-size: .82rem; color: var(--muted); }
-.results ul { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 2px; }
-.result { display: grid; grid-template-columns: 40px minmax(0, 1fr) auto; gap: 10px; align-items: center; padding: 6px; border-radius: 8px; }
-.result:hover { background: var(--hover); }
+/* Sidebar */
+.sidebar { position: relative; z-index: 5; display: flex; flex-direction: column; gap: 4px; min-height: 0; padding: 18px 12px 12px; background: var(--side); border-right: 1px solid var(--sep); overflow: hidden; }
+.brand { display: flex; align-items: center; gap: 10px; padding: 2px 10px 14px; text-decoration: none; }
+.brand-sun { flex: none; width: 24px; height: 24px; border-radius: 50%; background: linear-gradient(#FFC15E, #F26B7A 60%, #B2418F); box-shadow: 0 3px 10px -2px rgba(242,107,122,.55);
+  -webkit-mask: linear-gradient(#000 0 56%, transparent 56% 61%, #000 61% 69%, transparent 69% 75%, #000 75% 83%, transparent 83% 90%, #000 90%);
+          mask: linear-gradient(#000 0 56%, transparent 56% 61%, #000 61% 69%, transparent 69% 75%, #000 75% 83%, transparent 83% 90%, #000 90%); }
+.brand-name { font-family: var(--font-brand); font-weight: 700; font-size: 17px; letter-spacing: .05em; white-space: nowrap; }
+.side-search { display: flex; align-items: center; gap: 7px; height: 32px; margin: 0 2px 10px; padding: 0 10px; border-radius: 9px; background: var(--fill); }
+.side-search svg { width: 15px; height: 15px; color: var(--text-3); }
+.side-search input { flex: 1; min-width: 0; border: 0; background: none; outline: none; font-size: 13.5px; }
+.side-search input::placeholder { color: var(--text-3); }
+.side-search:focus-within { background: var(--bg); box-shadow: 0 0 0 3px var(--accent-soft), inset 0 0 0 1px color-mix(in srgb, var(--accent) 60%, transparent); }
+.nav { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 1px; }
+.nav a { display: flex; align-items: center; gap: 10px; height: 34px; padding: 0 10px; border-radius: 8px; text-decoration: none; font-size: 14px; font-weight: 500; }
+.nav a svg { width: 19px; height: 19px; color: var(--accent); }
+.nav a:hover { background: var(--fill); }
+.nav a[aria-current="page"] { background: var(--fill-2); }
+.rail-only { display: none !important; }
+.nav-head { display: flex; justify-content: space-between; align-items: baseline; margin: 18px 10px 4px; font-size: 11.5px; font-weight: 600; color: var(--text-3); }
+.side-progress { font-weight: 500; color: var(--accent); }
+.side-shows { flex: 1; min-height: 0; list-style: none; margin: 0; padding: 0 0 8px; overflow-y: auto; scrollbar-width: thin; }
+.side-shows a { display: flex; align-items: center; gap: 9px; height: 34px; padding: 0 8px; border-radius: 8px; text-decoration: none; font-size: 13.5px; }
+.side-shows a:hover { background: var(--fill); }
+.side-shows a[aria-current="page"] { background: var(--fill-2); }
+.side-shows a.dim { color: var(--text-3); }
+.side-shows .t { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.side-shows .eq { color: var(--accent); }
+.side-art { width: 24px !important; border-radius: 5px !important; }
+.side-art img { transition: none !important; opacity: 1 !important; }
+.side-foot { margin-top: auto; padding-top: 8px; border-top: 1px solid var(--sep); display: flex; flex-direction: column; gap: 1px; }
+.side-tool { display: flex; align-items: center; gap: 10px; height: 30px; padding: 0 10px; border: 0; border-radius: 8px; background: none; color: var(--text-2); font-size: 13px; text-align: left; }
+.side-tool:hover { background: var(--fill); color: var(--text); }
+.side-tool svg { width: 16px; height: 16px; }
 
-.cover { position: relative; display: block; width: 44px; height: 44px; border-radius: 7px; overflow: hidden; background: var(--line); flex: none; }
-.cover img { width: 100%; height: 100%; object-fit: cover; display: block; }
-.cover.fallback { display: grid; place-items: center; background: linear-gradient(160deg, var(--sun-a), var(--sun-b) 55%, var(--sun-c)); color: #fff; font-family: var(--font-display); font-weight: 800; font-size: 1.1rem; }
-.result .cover { width: 40px; height: 40px; }
-.cover.big { width: 132px; height: 132px; border-radius: 12px; font-size: 2.6rem; box-shadow: 0 14px 30px -18px rgba(20,14,60,.55); }
+/* Artwork */
+.art { position: relative; display: block; flex: none; width: 100%; aspect-ratio: 1 / 1; overflow: hidden; border-radius: 12px; background: var(--fill); container-type: inline-size; }
+.art .mono { position: absolute; inset: 0; display: grid; place-items: center; color: rgba(255,255,255,.95); font-weight: 700; font-size: 38cqw; line-height: 1; background: linear-gradient(145deg, hsl(var(--mh, 330) 62% 62%), hsl(calc(var(--mh, 330) + 38) 58% 40%)); }
+.art img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; opacity: 0; transition: opacity .35s; }
+.art img.ok { opacity: 1; }
+.shimmer::after { content: ""; position: absolute; inset: 0; background: linear-gradient(100deg, transparent 30%, rgba(255,255,255,.32) 50%, transparent 70%); background-size: 220% 100%; animation: shimmer 1.4s linear infinite; }
+@keyframes shimmer { from { background-position: 120% 0; } to { background-position: -120% 0; } }
 
-.shows { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 2px; }
-.show-btn { display: grid; grid-template-columns: 44px minmax(0, 1fr); gap: 12px; align-items: center; width: 100%; padding: 7px; border: 0; border-radius: 9px; background: transparent; text-align: left; }
-.show-btn:hover { background: var(--hover); }
-.show-btn[aria-current="true"] { background: var(--surface); box-shadow: 0 0 0 1px var(--line); }
-.show-btn[aria-current="true"] .show-title { color: var(--accent); }
-.show-text { display: flex; flex-direction: column; min-width: 0; }
-.show-title { font-weight: 700; font-size: .9rem; line-height: 1.3; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
-.show-author { font-size: .78rem; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.library-empty { padding: 2px 6px; color: var(--muted); font-size: .88rem; }
-.library-empty p { margin: 0 0 10px; }
-.try { display: flex; flex-wrap: wrap; gap: 6px; }
-.try button { border: 1px solid var(--line); background: var(--surface); border-radius: 999px; padding: 4px 11px; font-size: .8rem; }
-.try button:hover { border-color: var(--accent); color: var(--accent); }
-.library-foot { margin-top: auto; display: flex; gap: 16px; padding: 10px 6px 0; border-top: 1px solid var(--line); }
-.text-btn { border: 0; background: none; padding: 0; color: var(--muted); font-size: .8rem; text-decoration: underline; text-decoration-color: var(--line); text-underline-offset: 3px; }
-.text-btn:hover { color: var(--ink); }
-.text-btn.light { color: var(--panel-muted); text-decoration-color: rgba(255,255,255,.25); }
-.text-btn.light:hover { color: var(--panel-ink); }
-
-/* Episodes */
-.welcome { max-width: 34rem; margin: 8vh auto 0; }
-.welcome h2 { margin: 0 0 12px; font-family: var(--font-display); font-weight: 800; font-size: clamp(1.8rem, 3.4vw, 2.6rem); line-height: 1.15; }
-.welcome p { margin: 0 0 24px; color: var(--muted); }
-.keys { display: grid; grid-template-columns: auto 1fr; gap: 9px 18px; margin: 0; font-size: .88rem; }
-.keys dt { white-space: nowrap; }
-.keys dd { margin: 0; color: var(--muted); }
-kbd { font-family: var(--font-ui); font-size: .76rem; border: 1px solid var(--line); border-bottom-width: 2px; border-radius: 5px; padding: 1px 6px; background: var(--surface); }
-.show-head { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 24px; align-items: start; padding-bottom: 24px; border-bottom: 1px solid var(--line); max-width: 820px; }
-.show-head h2 { margin: 2px 0 0; font-family: var(--font-display); font-weight: 800; font-size: clamp(1.55rem, 2.8vw, 2.3rem); line-height: 1.15; }
-.byline { margin: 6px 0 0; color: var(--muted); font-size: .92rem; }
-.about { margin: 12px 0 0; color: var(--muted); font-size: .9rem; max-width: 68ch; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
-.head-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 16px; }
-.pill { display: inline-flex; align-items: center; gap: 6px; border: 1px solid var(--line); background: var(--surface); border-radius: 999px; padding: 6px 13px 6px 10px; font-size: .84rem; color: var(--ink); text-decoration: none; }
-.pill svg { width: 16px; height: 16px; }
-.pill:hover:not(:disabled) { border-color: var(--ink); }
-.pill.danger:hover { border-color: var(--accent); color: var(--accent); }
-.pill.small { padding: 4px 11px; font-size: .78rem; }
+/* Page furniture */
+.page-head { display: flex; flex-wrap: wrap; align-items: flex-end; justify-content: space-between; gap: 16px; margin: 0 0 22px; }
+.page-title { margin: 0; font-family: var(--font-display); font-size: 34px; line-height: 1.1; font-weight: 700; letter-spacing: -.022em; }
+.page-sub { margin: 6px 0 0; color: var(--text-2); font-size: 15px; }
+.section { margin-top: 30px; }
+.section-head { display: flex; align-items: flex-end; justify-content: space-between; gap: 12px; margin: 0 0 14px; padding-top: 18px; border-top: 1px solid var(--sep); }
+.section-title { margin: 0; font-size: 21px; line-height: 1.2; font-weight: 700; letter-spacing: -.016em; }
+.section-sub { margin: 3px 0 0; color: var(--text-2); font-size: 13.5px; }
+.section-tools { display: flex; align-items: center; gap: 6px; flex: none; }
+.see-all { margin-right: 6px; color: var(--accent); font-size: 14px; font-weight: 500; text-decoration: none; }
+.see-all:hover { text-decoration: underline; }
+.row-nav { width: 30px; height: 30px; border: 0; border-radius: 50%; display: grid; place-items: center; background: var(--fill); color: var(--text-2); }
+.row-nav:hover { background: var(--fill-2); color: var(--text); }
+.row-nav svg { width: 15px; height: 15px; }
+.row { display: grid; grid-auto-flow: column; grid-auto-columns: var(--card-w, 168px); gap: 18px; overflow-x: auto; overscroll-behavior-x: contain; scroll-snap-type: x mandatory; padding: 4px 2px 12px; margin: 0 -2px; scrollbar-width: none; }
+.row::-webkit-scrollbar { display: none; }
+.row.wide { --card-w: 336px; }
+.row:has(.row-empty) { display: block; }
+.row-empty { margin: 4px 0 8px; color: var(--text-2); font-size: 14px; }
+.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 26px 20px; }
+.grid:has(.row-empty) { display: block; }
+.chips { display: flex; gap: 8px; overflow-x: auto; scrollbar-width: none; padding: 2px; margin: 0 -2px 4px; }
+.chips::-webkit-scrollbar { display: none; }
+.chips.wrap { flex-wrap: wrap; }
+.chip { flex: none; display: inline-flex; align-items: center; height: 32px; padding: 0 15px; border-radius: 999px; background: var(--fill); color: var(--text); font-size: 13.5px; font-weight: 600; text-decoration: none; white-space: nowrap; transition: background .15s; }
+.chip:hover { background: var(--fill-2); }
+.chip[aria-selected="true"] { background: var(--text); color: var(--bg); }
+.btn { display: inline-flex; align-items: center; gap: 7px; height: 38px; padding: 0 18px; border: 0; border-radius: 999px; font-size: 14.5px; font-weight: 600; text-decoration: none; white-space: nowrap; transition: transform .12s, filter .15s, background .15s; }
+.btn:active { transform: scale(.97); }
+.btn svg { width: 17px; height: 17px; }
+.btn.primary { background: var(--accent); color: var(--accent-ink); }
+.btn.primary:hover { filter: brightness(1.07); }
+.btn.tonal { background: var(--fill-2); color: var(--text); }
+.btn.tonal:hover { background: color-mix(in srgb, var(--fill-2), var(--text) 7%); }
+.btn.small { height: 32px; padding: 0 13px; font-size: 13px; }
+.icon-round { width: 38px; height: 38px; border: 0; border-radius: 50%; display: grid; place-items: center; background: var(--fill-2); color: var(--text); text-decoration: none; }
+.icon-round:hover { background: color-mix(in srgb, var(--fill-2), var(--text) 7%); }
+.icon-round svg { width: 18px; height: 18px; }
 .spin svg { animation: spin 1s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
-.list-status { color: var(--muted); padding: 22px 6px; margin: 0; }
-.episode-list { list-style: none; margin: 0; padding: 0; max-width: 820px; }
-.ep { position: relative; display: grid; grid-template-columns: 40px minmax(0, 1fr); gap: 16px; padding: 18px 6px; border-bottom: 1px solid var(--line); cursor: pointer; }
-.ep:hover { background: color-mix(in srgb, var(--hover) 55%, transparent); }
-.ep-play { width: 40px; height: 40px; margin-top: 1px; border-radius: 50%; border: 1.5px solid var(--line); background: var(--surface); color: var(--ink); display: grid; place-items: center; }
-.ep-play svg { width: 16px; height: 16px; }
-.ep:hover .ep-play { border-color: var(--ink); }
-.ep[data-current="true"] .ep-play { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
-.ep[data-current="true"] .ep-title { color: var(--accent); }
-.ep-title { margin: 0; font-size: 1rem; font-weight: 700; line-height: 1.38; }
-.ep[data-done="true"] .ep-title { color: var(--muted); font-weight: 500; }
-.ep-meta { display: flex; flex-wrap: wrap; gap: 3px 14px; margin: 5px 0 0; font-size: .8rem; color: var(--muted); font-variant-numeric: tabular-nums; }
-.ep-meta span:empty { display: none; }
-.badge { border: 1px solid currentColor; border-radius: 4px; padding: 0 5px; font-size: .68rem; line-height: 1.5; font-weight: 700; }
-.ep-desc { margin: 8px 0 0; max-width: 68ch; color: var(--muted); font-size: .88rem; line-height: 1.55; white-space: pre-line; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
-.ep.open .ep-desc { display: block; }
-.ep-more { margin-top: 4px; color: var(--accent); text-decoration-color: currentColor; }
-.ep-bar { position: absolute; left: 62px; bottom: -1px; height: 2px; border-radius: 2px; background: linear-gradient(90deg, var(--sun-a), var(--sun-b)); }
-.more-row { padding: 22px 0; text-align: center; }
+.link-btn { padding: 0; border: 0; background: none; color: var(--accent); font-size: inherit; font-weight: 500; text-decoration: none; }
+.link-btn:hover { text-decoration: underline; }
+.list-note { margin: 18px 0; color: var(--text-2); }
+.banner { display: flex; align-items: center; gap: 18px; margin: 0 0 6px; padding: 16px 18px; border-radius: 16px; background: var(--bg-2); }
+.banner-text { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; font-size: 14px; color: var(--text-2); }
+.banner-text strong { font-size: 15px; color: var(--text); }
+.meter { flex: none; width: 160px; height: 6px; border-radius: 3px; background: var(--fill-2); overflow: hidden; }
+.meter i { display: block; height: 100%; border-radius: 3px; background: var(--accent); transition: width .4s; }
+.feed-status { margin: -4px 0 0; font-size: 13px; color: var(--text-3); min-height: 1.2em; }
+.empty { max-width: 30rem; margin: 10vh auto; text-align: center; }
+.empty h2 { margin: 0 0 8px; font-size: 22px; letter-spacing: -.015em; }
+.empty p { margin: 0 0 18px; color: var(--text-2); }
 
-/* Player */
-.np { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; gap: 16px; }
-.art { position: relative; flex: 1 1 0; min-height: 120px; max-height: 344px; width: auto; max-width: 100%; aspect-ratio: 1 / 1; align-self: center; border-radius: 14px; overflow: hidden; background: var(--panel-2); box-shadow: 0 24px 50px -24px rgba(0,0,0,.7); }
-.np-meta { flex: none; }
-.player.tr-open .np { flex: none; flex-direction: row; align-items: center; gap: 14px; }
-.player.tr-open .art { flex: none; width: 84px; height: 84px; min-height: 0; border-radius: 10px; box-shadow: none; }
-.player.tr-open .np-meta { flex: 1 1 auto; min-width: 0; }
-.player.tr-open .p-title { font-size: 1.08rem; -webkit-line-clamp: 2; }
-.player.tr-open .transcript { flex: 1 1 auto; min-height: 200px; }
-.art img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
-.art-sun { position: absolute; inset: 18%; width: 64%; height: 64%; }
-.p-show { margin: 0; color: var(--panel-muted); font-size: .84rem; }
-.p-title { margin: 4px 0 0; font-family: var(--font-display); font-weight: 800; font-size: 1.32rem; line-height: 1.3; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
-.caption { flex: none; min-height: 5.4em; padding: 12px 14px; border-radius: 10px; background: rgba(255,255,255,.05); border: 1px solid var(--panel-line); }
-.caption .speaker { display: block; margin-bottom: 2px; font-size: .72rem; color: var(--sun-a); letter-spacing: .02em; }
-.caption .line { margin: 0; font-family: var(--font-display); font-weight: 600; font-size: 1.08rem; line-height: 1.55; }
-.caption .line.idle { color: var(--panel-muted); }
-.caption .next { margin: 6px 0 0; font-size: .86rem; line-height: 1.45; color: var(--panel-muted); opacity: .75; }
-.caption .hint { margin: 0; font-size: .84rem; line-height: 1.55; color: var(--panel-muted); }
-.scrub { display: flex; flex-direction: column; gap: 2px; }
-.times { display: flex; justify-content: space-between; font-size: .76rem; color: var(--panel-muted); font-variant-numeric: tabular-nums; }
-.transport { display: flex; align-items: center; justify-content: center; gap: clamp(6px, 1.6vw, 16px); }
-.icon-btn { width: 44px; height: 44px; border: 0; border-radius: 50%; background: transparent; display: grid; place-items: center; color: inherit; }
-.icon-btn:hover:not(:disabled) { background: rgba(127,127,127,.16); }
-.icon-btn svg { width: 24px; height: 24px; }
-.icon-btn.small { width: 34px; height: 34px; }
-.icon-btn.small svg { width: 19px; height: 19px; }
-.skip svg { width: 30px; height: 30px; }
-.play-btn { width: 66px; height: 66px; border: 0; border-radius: 50%; display: grid; place-items: center; background: var(--panel-ink); color: var(--panel); box-shadow: 0 10px 28px -12px rgba(242,107,122,.75); transition: transform .15s; }
-.play-btn svg { width: 28px; height: 28px; }
-.play-btn:hover:not(:disabled) { transform: scale(1.04); }
-.buffering .play-btn { animation: pulse 1.2s ease-out infinite; }
-@keyframes pulse { from { box-shadow: 0 0 0 0 rgba(255,193,94,.55); } to { box-shadow: 0 0 0 14px rgba(255,193,94,0); } }
-.extras { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; container-type: inline-size; }
-@container (max-width: 330px) { #trBtn { width: 40px; padding: 0; justify-content: center; } #trBtn span { display: none; } }
-.chip { display: inline-flex; align-items: center; gap: 6px; height: 34px; padding: 0 12px; border: 1px solid var(--panel-line); border-radius: 999px; background: transparent; color: var(--panel-ink); font-size: .8rem; font-variant-numeric: tabular-nums; white-space: nowrap; }
-.chip svg { width: 17px; height: 17px; }
-.chip:hover:not(:disabled) { border-color: rgba(255,255,255,.38); }
-.chip[aria-pressed="true"] { background: rgba(255,255,255,.14); border-color: rgba(255,255,255,.3); }
-#speedBtn { min-width: 58px; justify-content: center; font-weight: 700; }
-.chip.icon-only { width: 40px; padding: 0; justify-content: center; }
-.speed-wrap { position: relative; }
-.speed-pop { position: absolute; left: 0; bottom: calc(100% + 10px); z-index: 5; width: 264px; padding: 14px; border-radius: 12px; background: var(--panel-2); border: 1px solid var(--panel-line); box-shadow: 0 18px 40px -16px rgba(0,0,0,.6); }
-.speed-row { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 4px; }
-#speedVal { font-weight: 700; font-size: 1.1rem; font-variant-numeric: tabular-nums; }
-.speed-presets { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; margin-top: 10px; }
-.preset { border: 1px solid var(--panel-line); background: transparent; color: var(--panel-ink); border-radius: 8px; padding: 5px 0; font-size: .8rem; font-variant-numeric: tabular-nums; }
-.preset:hover { border-color: rgba(255,255,255,.38); }
-.preset[aria-pressed="true"] { background: var(--panel-ink); color: var(--panel); border-color: var(--panel-ink); }
-.vol { display: flex; align-items: center; gap: 6px; margin-top: -6px; }
-.vol .range { flex: 1; }
-.transcript { display: flex; flex-direction: column; min-height: 0; border-top: 1px solid var(--panel-line); padding-top: 12px; }
-.player.tr-open #trList, .player.tr-open .tr-text { flex: 1 1 auto; min-height: 0; max-height: none; }
-.tr-head { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; margin-bottom: 8px; }
-.tr-head p { margin: 0; font-size: .84rem; color: var(--panel-muted); }
-#trList { position: relative; list-style: none; margin: 0; padding: 0; max-height: min(46vh, 420px); overflow: auto; overscroll-behavior: contain; }
-.cue { display: grid; grid-template-columns: 52px minmax(0, 1fr); gap: 10px; padding: 6px 8px; border-radius: 8px; font-size: .88rem; line-height: 1.5; color: var(--panel-muted); cursor: pointer; }
-.cue:hover { background: rgba(255,255,255,.05); }
-.cue.active { background: rgba(255,255,255,.1); color: var(--panel-ink); }
-.cue time { padding-top: 3px; font-size: .72rem; font-variant-numeric: tabular-nums; opacity: .85; }
-.cue b { color: var(--sun-a); font-weight: 500; }
-.cue-empty { padding: 6px 0; color: var(--panel-muted); font-size: .86rem; }
-.tr-text { max-height: min(46vh, 420px); overflow: auto; white-space: pre-line; font-size: .9rem; line-height: 1.65; color: var(--panel-muted); }
-.p-foot { margin-top: auto; padding-top: 4px; font-size: .8rem; color: var(--panel-muted); }
-.switch { display: inline-flex; align-items: center; gap: 8px; cursor: pointer; }
-.switch input { width: 16px; height: 16px; margin: 0; accent-color: var(--sun-b); }
+/* Cards */
+.card { position: relative; min-width: 0; container-type: inline-size; scroll-snap-align: start; }
+.card-body, .tile-link { display: flex; flex-direction: column; width: 100%; padding: 0; border: 0; background: none; text-align: left; text-decoration: none; color: inherit; }
+.card-body .art, .tile-link .art { box-shadow: var(--shadow-art); transition: transform .22s cubic-bezier(.2,.8,.2,1); }
+.card-body:hover .art, .tile-link:hover .art { transform: translateY(-3px); }
+.card-title { margin-top: 10px; font-size: 14px; font-weight: 600; line-height: 1.28; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.card-sub { margin-top: 2px; font-size: 13px; color: var(--text-2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.card-why { margin-top: 4px; font-size: 12.5px; line-height: 1.38; color: var(--text-3); display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.add-btn { position: absolute; top: calc(100cqw - 44px); right: 8px; width: 34px; height: 34px; border: 0; border-radius: 50%; display: grid; place-items: center; background: rgba(255,255,255,.9); color: #1D1D1F; box-shadow: 0 3px 12px rgba(0,0,0,.28); -webkit-backdrop-filter: blur(10px); backdrop-filter: blur(10px); transition: transform .15s, background .15s; }
+.add-btn:hover { transform: scale(1.08); }
+.add-btn svg { width: 17px; height: 17px; }
+.add-btn.added { background: var(--accent); color: var(--accent-ink); }
+.add-btn.busy { animation: pulse 1s ease-in-out infinite; }
+@keyframes pulse { 50% { opacity: .45; } }
+.card.unavailable .art { opacity: .45; filter: grayscale(.5); }
+.card.unavailable .add-btn { display: none; }
+.skeleton .sk { display: block; height: 11px; margin-top: 11px; border-radius: 6px; background: var(--fill); width: 82%; }
+.skeleton .sk.short { width: 52%; margin-top: 7px; }
+.sk-row { height: 92px; margin: 8px 0; border-radius: 14px; background: var(--fill); opacity: .7; }
+.tile { position: relative; min-width: 0; }
+.tile.missing .art { opacity: .45; filter: grayscale(.6); }
+.tile-eq { position: absolute; top: 8px; right: 8px; display: grid; place-items: center; width: 28px; height: 28px; border-radius: 50%; background: rgba(0,0,0,.55); color: #fff; }
+
+/* Discover hero */
+.hero { position: relative; display: grid; grid-template-columns: minmax(0, 1.25fr) minmax(240px, .75fr); align-items: center; gap: 24px; min-height: 236px; margin: 4px 0 6px; padding: 32px 36px; border-radius: 22px; overflow: hidden; color: #fff;
+  background: radial-gradient(120% 140% at 0% 0%, #3B2A86 0%, transparent 55%), radial-gradient(110% 120% at 100% 100%, #F26B7A 0%, transparent 58%), linear-gradient(135deg, #21184F, #7E3A8E 58%, #F08F6A);
+  box-shadow: 0 22px 50px -26px rgba(60,20,90,.7); }
+.hero-kicker { margin: 0; font-size: 13px; font-weight: 600; color: rgba(255,255,255,.75); }
+.hero-title { margin: 6px 0 0; max-width: 20ch; font-family: var(--font-display); font-size: clamp(24px, 2.8vw, 34px); font-weight: 700; line-height: 1.12; letter-spacing: -.02em; }
+.hero-sub { margin: 10px 0 0; max-width: 46ch; font-size: 15px; color: rgba(255,255,255,.84); }
+.hero-stack { position: relative; height: 190px; }
+.hero-stack .art { position: absolute; top: 22px; width: 148px; border-radius: 14px; box-shadow: 0 18px 40px -14px rgba(0,0,0,.6); }
+.hero-stack .s0 { right: 148px; transform: rotate(-8deg) translateY(10px); }
+.hero-stack .s1 { right: 74px; top: 4px; z-index: 2; }
+.hero-stack .s2 { right: 0; transform: rotate(8deg) translateY(10px); }
+
+/* Show page */
+.show-hero { position: relative; isolation: isolate; display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: end; gap: clamp(20px, 3vw, 36px); margin: -36px calc(-1 * var(--gutter)) 0; padding: 44px var(--gutter) 30px; }
+.show-hero::before { content: ""; position: absolute; inset: 0; z-index: -1; background: linear-gradient(180deg, hsl(var(--th) var(--ts) var(--tl) / .34), hsl(var(--th) var(--ts) var(--tl) / .1) 60%, transparent); transition: background .5s; }
+.hero-art { width: clamp(150px, 20vw, 236px); border-radius: 14px; box-shadow: 0 26px 50px -22px hsl(var(--th) 50% 18% / .75), 0 0 0 .5px rgba(0,0,0,.06); }
+.show-kicker { margin: 0; font-size: 13px; font-weight: 600; color: var(--text-2); }
+.show-title { margin: 6px 0 0; font-family: var(--font-display); font-size: clamp(28px, 3.4vw, 42px); font-weight: 700; line-height: 1.08; letter-spacing: -.025em; }
+.show-author { margin: 6px 0 0; font-size: 17px; font-weight: 600; color: hsl(var(--th) 52% 40%); }
+.show-about { margin: 12px 0 0; max-width: 72ch; color: var(--text-2); font-size: 14.5px; line-height: 1.5; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
+.show-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin-top: 18px; }
+.eps-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 26px 0 2px; }
+
+/* Episodes */
+.eps { list-style: none; margin: 4px -12px 0; padding: 0; }
+.ep { position: relative; display: grid; grid-template-columns: minmax(0, 1fr); gap: 14px; padding: 16px 12px; border-radius: 14px; cursor: pointer; }
+.ep.rich { grid-template-columns: 72px minmax(0, 1fr); align-items: start; }
+.ep::after { content: ""; position: absolute; left: 12px; right: 12px; bottom: 0; border-bottom: 1px solid var(--sep); }
+.ep:last-child::after, .ep:hover::after { opacity: 0; }
+.ep:hover { background: var(--fill); }
+.ep-art { width: 72px; border-radius: 10px; box-shadow: 0 6px 14px -8px rgba(0,0,0,.45); }
+.ep-date { display: flex; flex-wrap: wrap; gap: 3px 10px; margin: 0; font-size: 12px; font-weight: 600; color: var(--text-3); letter-spacing: .01em; }
+.ep-show { color: var(--accent); text-decoration: none; }
+.ep-show:hover { text-decoration: underline; }
+.ep-title { margin: 4px 0 0; font-size: 16.5px; font-weight: 600; line-height: 1.3; letter-spacing: -.01em; }
+.ep-desc { margin: 6px 0 0; max-width: 78ch; color: var(--text-2); font-size: 14px; line-height: 1.5; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.ep.open .ep-desc { display: block; white-space: pre-line; }
+.ep-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin-top: 12px; }
+.pill { display: inline-flex; align-items: center; gap: 7px; height: 30px; padding: 0 14px 0 11px; border: 0; border-radius: 999px; background: var(--accent-soft); color: var(--accent); font-size: 13px; font-weight: 600; font-variant-numeric: tabular-nums; transition: transform .12s; }
+.pill:active { transform: scale(.96); }
+.pill svg { width: 13px; height: 13px; }
+.pill.current { background: var(--accent); color: var(--accent-ink); }
+.pill.done { background: var(--fill); color: var(--text-2); }
+.pill-prog { display: inline-block; width: 28px; height: 4px; border-radius: 2px; background: color-mix(in srgb, currentColor 28%, transparent); overflow: hidden; }
+.pill-prog i { display: block; height: 100%; background: currentColor; }
+.badge { padding: 1px 6px; border: 1.5px solid var(--text-3); border-radius: 5px; color: var(--text-3); font-size: 10.5px; font-weight: 700; letter-spacing: .02em; }
+.more-row { padding: 18px 0; text-align: center; list-style: none; }
+.eq { display: inline-flex; align-items: flex-end; gap: 2px; width: 13px; height: 12px; }
+.eq i { width: 3px; height: 40%; border-radius: 1px; background: currentColor; animation: eq 1s ease-in-out infinite; }
+.eq i:nth-child(2) { animation-delay: -.45s; }
+.eq i:nth-child(3) { animation-delay: -.75s; }
+@keyframes eq { 0%, 100% { height: 30%; } 50% { height: 100%; } }
+body:not(.is-playing) .eq i { animation-play-state: paused; }
+
+/* Up next */
+.up-card { display: grid; grid-template-columns: 84px minmax(0, 1fr); align-items: center; gap: 14px; width: 100%; padding: 12px; border: 0; border-radius: 16px; background: var(--bg-2); text-align: left; scroll-snap-align: start; transition: background .15s; }
+.up-card:hover { background: var(--fill-2); }
+.up-art { width: 84px; border-radius: 10px; box-shadow: 0 6px 16px -8px rgba(0,0,0,.45); }
+.up-text { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.up-show { font-size: 12px; font-weight: 600; color: var(--text-3); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.up-title { font-size: 14.5px; font-weight: 600; line-height: 1.3; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.up-left { display: flex; align-items: center; gap: 8px; margin-top: 6px; font-size: 12.5px; color: var(--text-2); }
+.up-left .pill-prog { width: 64px; color: var(--accent); }
+
+/* Search and forms */
+.big-search { display: flex; align-items: center; gap: 10px; max-width: 640px; height: 48px; margin: 0 0 6px; padding: 0 16px; border-radius: 14px; background: var(--fill); }
+.big-search svg { color: var(--text-3); }
+.big-search input { flex: 1; min-width: 0; border: 0; background: none; outline: none; font-size: 17px; }
+.big-search:focus-within { background: var(--bg); box-shadow: 0 0 0 3px var(--accent-soft), inset 0 0 0 1px color-mix(in srgb, var(--accent) 60%, transparent); }
+.inline-add { display: flex; align-items: center; gap: 8px; }
+.inline-add input { width: min(300px, 60vw); height: 34px; padding: 0 12px; border: 0; border-radius: 10px; background: var(--fill); outline: none; font-size: 13.5px; }
+.inline-add input:focus { box-shadow: 0 0 0 3px var(--accent-soft); }
+
+/* Player bar */
+.bar { position: fixed; z-index: 50; left: calc(var(--side-w) + 16px); right: 16px; bottom: calc(14px + env(safe-area-inset-bottom, 0px)); height: var(--bar-h); display: grid; grid-template-columns: minmax(180px, 1fr) minmax(300px, 1.5fr) minmax(180px, 1fr); align-items: center; gap: 18px; padding: 0 12px 0 10px; border-radius: 18px; background: var(--bar); -webkit-backdrop-filter: saturate(180%) blur(28px); backdrop-filter: saturate(180%) blur(28px); box-shadow: var(--shadow-float); transition: transform .45s cubic-bezier(.2,.8,.2,1), opacity .3s; }
+.bar.idle { transform: translateY(calc(100% + 40px)); opacity: 0; pointer-events: none; }
+.bar-info { display: flex; align-items: center; gap: 12px; min-width: 0; }
+.bar-art { flex: none; width: 52px; height: 52px; padding: 0; border: 0; border-radius: 10px; background: none; box-shadow: 0 6px 14px -6px rgba(0,0,0,.45); }
+.bar-art .art { border-radius: 10px; }
+.bar-meta { display: flex; flex-direction: column; min-width: 0; }
+.bar-title { padding: 0; border: 0; background: none; text-align: left; font-size: 14px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.bar-show { font-size: 12.5px; color: var(--text-2); text-decoration: none; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.bar-show:hover { text-decoration: underline; }
+.bar-center { display: flex; flex-direction: column; align-items: center; min-width: 0; }
+.bar-buttons { display: flex; align-items: center; gap: 12px; }
+.ctl { width: 36px; height: 36px; border: 0; border-radius: 50%; display: grid; place-items: center; background: none; color: var(--text); transition: transform .12s, background .15s; }
+.ctl:hover:not(:disabled) { background: var(--fill); }
+.ctl:active:not(:disabled) { transform: scale(.92); }
+.ctl svg { width: 22px; height: 22px; }
+.ctl.skip svg { width: 25px; height: 25px; }
+.bar .ctl.play { width: 40px; height: 40px; background: var(--text); color: var(--bg); }
+.bar .ctl.play svg { width: 19px; height: 19px; }
+.bar-scrub { display: grid; grid-template-columns: 46px minmax(0, 1fr) 50px; align-items: center; gap: 8px; width: 100%; font-size: 11px; color: var(--text-2); font-variant-numeric: tabular-nums; }
+.bar-scrub span:first-child { text-align: right; }
+.bar-tools { display: flex; align-items: center; justify-content: flex-end; gap: 2px; min-width: 0; }
+.tool { height: 32px; min-width: 32px; padding: 0 7px; border: 0; border-radius: 8px; display: inline-flex; align-items: center; justify-content: center; gap: 5px; background: none; color: var(--text-2); font-size: 12.5px; font-weight: 600; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.tool:hover { background: var(--fill); color: var(--text); }
+.tool[aria-pressed="true"] { color: var(--accent); }
+.tool svg { width: 19px; height: 19px; }
+.tool.speed { min-width: 44px; }
+.vol { display: flex; align-items: center; gap: 2px; }
+.vol .seek { width: 84px; }
+.bar-prog { display: none; position: absolute; left: 14px; right: 14px; bottom: 4px; height: 2.5px; border-radius: 2px; background: var(--fill-2); overflow: hidden; }
+.bar-prog i { display: block; width: 0; height: 100%; background: hsl(var(--th) var(--ts) var(--tl)); }
+.bar .seek { --played: hsl(var(--th) var(--ts) var(--tl)); }
+body.np-open .bar { opacity: 0; pointer-events: none; }
 
 /* Sliders */
-.range { -webkit-appearance: none; appearance: none; width: 100%; height: 22px; margin: 0; background: transparent; cursor: pointer; --fill: 0%; --buf: 0%; }
-.range:disabled { cursor: default; opacity: .55; }
-.range::-webkit-slider-runnable-track { height: 5px; border-radius: 99px; background: linear-gradient(90deg, var(--sun-a), var(--sun-b) 55%, var(--sun-c)) 0 0 / var(--fill) 100% no-repeat, linear-gradient(var(--track-buf), var(--track-buf)) 0 0 / var(--buf) 100% no-repeat, var(--track); }
-.range::-moz-range-track { height: 5px; border-radius: 99px; background: linear-gradient(90deg, var(--sun-a), var(--sun-b) 55%, var(--sun-c)) 0 0 / var(--fill) 100% no-repeat, linear-gradient(var(--track-buf), var(--track-buf)) 0 0 / var(--buf) 100% no-repeat, var(--track); }
-.range::-webkit-slider-thumb { -webkit-appearance: none; width: 15px; height: 15px; margin-top: -5px; border: 0; border-radius: 50%; background: var(--thumb); box-shadow: 0 0 0 3px rgba(242,107,122,.35); }
-.range::-moz-range-thumb { width: 15px; height: 15px; border: 0; border-radius: 50%; background: var(--thumb); box-shadow: 0 0 0 3px rgba(242,107,122,.35); }
-.range:focus-visible { outline: none; }
-.range:focus-visible::-webkit-slider-thumb { box-shadow: 0 0 0 4px var(--sun-a); }
-.range:focus-visible::-moz-range-thumb { box-shadow: 0 0 0 4px var(--sun-a); }
-.range.thin::-webkit-slider-runnable-track { height: 4px; }
-.range.thin::-moz-range-track { height: 4px; }
-.range.thin::-webkit-slider-thumb { width: 13px; height: 13px; margin-top: -4.5px; }
+.seek { -webkit-appearance: none; appearance: none; width: 100%; height: 16px; margin: 0; background: transparent; cursor: pointer; --fill: 0%; --buf: 0%; --track: var(--fill-2); --bufc: color-mix(in srgb, var(--text) 16%, transparent); --played: var(--text-2); }
+.seek:disabled { cursor: default; }
+.seek::-webkit-slider-runnable-track { height: 4px; border-radius: 2px; background: linear-gradient(var(--played), var(--played)) 0 0 / var(--fill) 100% no-repeat, linear-gradient(var(--bufc), var(--bufc)) 0 0 / var(--buf) 100% no-repeat, var(--track); }
+.seek::-moz-range-track { height: 4px; border-radius: 2px; background: linear-gradient(var(--played), var(--played)) 0 0 / var(--fill) 100% no-repeat, linear-gradient(var(--bufc), var(--bufc)) 0 0 / var(--buf) 100% no-repeat, var(--track); }
+.seek::-webkit-slider-thumb { -webkit-appearance: none; width: 12px; height: 12px; margin-top: -4px; border: 0; border-radius: 50%; background: var(--played); opacity: 0; transition: opacity .15s; }
+.seek::-moz-range-thumb { width: 12px; height: 12px; border: 0; border-radius: 50%; background: var(--played); opacity: 0; }
+.seek:hover::-webkit-slider-thumb, .seek:focus-visible::-webkit-slider-thumb, .seek.dragging::-webkit-slider-thumb { opacity: 1; }
+.seek:hover::-moz-range-thumb, .seek:focus-visible::-moz-range-thumb { opacity: 1; }
+.seek:focus-visible { outline: none; }
+
+/* Caption pill over the app */
+.cap-pill { position: fixed; z-index: 45; left: calc(var(--side-w) + 24px); right: 24px; bottom: calc(14px + var(--bar-h) + 14px + env(safe-area-inset-bottom, 0px)); width: fit-content; max-width: 700px; margin-inline: auto; padding: 10px 18px 11px; border-radius: 14px; background: rgba(18,18,22,.8); color: #fff; -webkit-backdrop-filter: blur(20px) saturate(160%); backdrop-filter: blur(20px) saturate(160%); box-shadow: 0 10px 30px -12px rgba(0,0,0,.5); text-align: center; font-size: 16px; font-weight: 600; line-height: 1.4; pointer-events: none; }
+.cap-pill .who { display: block; margin-bottom: 2px; font-size: 11.5px; font-weight: 600; color: hsl(var(--th) 85% 78%); }
+body.np-open .cap-pill { display: none; }
+
+/* Now Playing */
+.np { position: fixed; inset: 0; z-index: 100; display: flex; flex-direction: column; overflow: hidden; color: #fff; background: #0E0E12; transform: translateY(100%); transition: transform .48s cubic-bezier(.2,.8,.2,1); }
+.np.open { transform: none; }
+.np-bg { position: absolute; inset: -18%; z-index: 0; background: radial-gradient(60% 60% at 25% 25%, hsl(var(--th) 70% 45%), transparent 70%), radial-gradient(60% 60% at 80% 80%, hsl(calc(var(--th) + 40) 60% 32%), transparent 70%), #121018; }
+.np-bg img { width: 100%; height: 100%; object-fit: cover; filter: blur(70px) saturate(1.7) brightness(.82); transform: scale(1.15); }
+.np-scrim { position: absolute; inset: 0; z-index: 0; background: linear-gradient(180deg, rgba(0,0,0,.2), rgba(0,0,0,.52)); }
+.np-top { position: relative; z-index: 1; display: flex; align-items: center; justify-content: space-between; padding: calc(14px + env(safe-area-inset-top, 0px)) 20px 0; }
+.np-btn { width: 40px; height: 40px; border: 0; border-radius: 50%; display: grid; place-items: center; background: rgba(255,255,255,.13); color: #fff; }
+.np-btn:hover { background: rgba(255,255,255,.22); }
+.np-btn[aria-pressed="true"] { background: #fff; color: #15121c; }
+.np-label { font-size: 13px; font-weight: 600; color: rgba(255,255,255,.72); }
+.np-body { position: relative; z-index: 1; flex: 1; min-height: 0; width: 100%; max-width: 1360px; margin: 0 auto; display: grid; grid-template-columns: minmax(300px, 430px) minmax(0, 1fr); align-items: center; gap: clamp(32px, 6vw, 96px); padding: 8px clamp(24px, 6vw, 88px) calc(26px + env(safe-area-inset-bottom, 0px)); }
+.np:not(.lyrics-on) .np-body { grid-template-columns: minmax(300px, 430px); justify-content: center; }
+.np:not(.lyrics-on) .np-right { display: none; }
+.np-left { display: flex; flex-direction: column; gap: 16px; min-height: 0; }
+.np-art { width: 100%; border-radius: 14px; overflow: hidden; box-shadow: 0 30px 60px -20px rgba(0,0,0,.75); transition: transform .55s cubic-bezier(.2,.8,.2,1); }
+.np-art .art { border-radius: 14px; }
+.np.paused .np-art { transform: scale(.9); }
+.np-title { margin: 0; font-size: 21px; font-weight: 700; line-height: 1.25; letter-spacing: -.015em; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.np-show { display: inline-block; margin-top: 3px; color: rgba(255,255,255,.72); font-size: 16px; text-decoration: none; }
+.np-show:hover { color: #fff; text-decoration: underline; }
+.np-caption { min-height: 2.9em; margin: 0; font-size: 15px; line-height: 1.45; color: rgba(255,255,255,.88); }
+.np .seek { --track: rgba(255,255,255,.24); --bufc: rgba(255,255,255,.34); --played: #fff; }
+.np-times { display: flex; justify-content: space-between; margin-top: 3px; font-size: 12px; color: rgba(255,255,255,.62); font-variant-numeric: tabular-nums; }
+.np-transport { display: flex; align-items: center; justify-content: space-between; padding: 0 4px; }
+.np .ctl { width: 50px; height: 50px; color: #fff; }
+.np .ctl:hover:not(:disabled) { background: rgba(255,255,255,.12); }
+.np .ctl svg { width: 30px; height: 30px; }
+.np .ctl.skip svg { width: 34px; height: 34px; }
+.np .ctl.play { width: 72px; height: 72px; background: #fff; color: #15121c; }
+.np .ctl.play svg { width: 30px; height: 30px; }
+.np-tools { display: flex; align-items: center; justify-content: space-between; gap: 4px; }
+.np .tool { color: rgba(255,255,255,.75); }
+.np .tool:hover { background: rgba(255,255,255,.12); color: #fff; }
+.np .tool[aria-pressed="true"] { background: rgba(255,255,255,.2); color: #fff; }
+.np .vol .seek { width: 90px; }
+.np-right { position: relative; height: 100%; min-height: 0; align-self: stretch; }
+.lyrics { position: relative; list-style: none; height: 100%; margin: 0; padding: 32vh 0 42vh; overflow-y: auto; scrollbar-width: none; -webkit-mask-image: linear-gradient(transparent, #000 14%, #000 78%, transparent); mask-image: linear-gradient(transparent, #000 14%, #000 78%, transparent); }
+.lyrics::-webkit-scrollbar { display: none; }
+.lyric { margin: 0 0 22px; max-width: 30ch; font-size: clamp(22px, 2.3vw, 32px); font-weight: 700; line-height: 1.26; letter-spacing: -.015em; color: rgba(255,255,255,.32); cursor: pointer; transition: color .35s; }
+.lyric:hover { color: rgba(255,255,255,.58); }
+.lyric.active { color: #fff; }
+.lyric .who { display: block; margin-bottom: 4px; font-size: 13px; font-weight: 600; letter-spacing: .02em; color: rgba(255,255,255,.55); }
+.np-notes { height: 100%; overflow-y: auto; padding: 8vh 0; max-width: 62ch; scrollbar-width: thin; }
+.np-notes h3 { margin: 0 0 12px; font-size: 13px; font-weight: 600; color: rgba(255,255,255,.6); }
+.notes-text { margin: 0; font-size: 16px; line-height: 1.65; color: rgba(255,255,255,.86); white-space: pre-line; }
+.notes-actions { margin-top: 22px; }
+.np-chip { display: inline-flex; align-items: center; gap: 8px; height: 36px; padding: 0 16px; border: 0; border-radius: 999px; background: rgba(255,255,255,.16); color: #fff; font-size: 14px; font-weight: 600; }
+.np-chip:hover { background: rgba(255,255,255,.26); }
+.np-chip svg { width: 17px; height: 17px; }
+
+/* Speed popover */
+.pop { position: fixed; z-index: 130; width: 272px; padding: 14px; border-radius: 16px; background: var(--pop-bg); color: var(--text); box-shadow: var(--shadow-float); }
+.pop.on-dark { background: rgba(40,38,48,.94); color: #fff; -webkit-backdrop-filter: blur(30px); backdrop-filter: blur(30px); box-shadow: 0 18px 50px -12px rgba(0,0,0,.6), 0 0 0 .5px rgba(255,255,255,.12); }
+.pop-row { display: flex; align-items: baseline; justify-content: space-between; margin-bottom: 8px; }
+.pop-val { font-size: 22px; font-weight: 700; font-variant-numeric: tabular-nums; letter-spacing: -.01em; }
+.pop .seek { --played: var(--accent); }
+.pop.on-dark .seek { --played: #fff; --track: rgba(255,255,255,.24); }
+.pop .seek::-webkit-slider-thumb { opacity: 1; }
+.pop .seek::-moz-range-thumb { opacity: 1; }
+.presets { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; margin-top: 12px; }
+.preset { height: 30px; border: 0; border-radius: 8px; background: var(--fill); font-size: 13px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.preset:hover { background: var(--fill-2); }
+.preset[aria-pressed="true"] { background: var(--accent); color: var(--accent-ink); }
+.pop.on-dark .preset { background: rgba(255,255,255,.12); color: #fff; }
+.pop.on-dark .preset[aria-pressed="true"] { background: #fff; color: #15121c; }
 
 /* Toast */
-.toast { position: fixed; left: 50%; bottom: calc(24px + env(safe-area-inset-bottom, 0px)); z-index: 60; max-width: min(92vw, 460px); padding: 10px 16px; border-radius: 10px; background: var(--ink); color: var(--bg); font-size: .86rem; box-shadow: 0 12px 30px -12px rgba(0,0,0,.45); opacity: 0; pointer-events: none; transform: translate(-50%, 16px); transition: opacity .2s, transform .2s; }
+.toast { position: fixed; z-index: 200; top: calc(16px + env(safe-area-inset-top, 0px)); left: 50%; max-width: min(92vw, 520px); padding: 10px 16px; border-radius: 12px; background: var(--pop-bg); color: var(--text); font-size: 14px; font-weight: 500; box-shadow: var(--shadow-float); opacity: 0; pointer-events: none; transform: translate(-50%, -14px); transition: opacity .2s, transform .28s cubic-bezier(.2,.8,.2,1); }
 .toast.show { opacity: 1; transform: translate(-50%, 0); }
-.toast.error { background: var(--accent); color: var(--on-accent); }
+.toast.error { background: var(--accent); color: var(--accent-ink); }
 
-/* Medium screens: library becomes a strip above the episodes */
-@media (max-width: 1179px) {
-  .library { flex-direction: row; flex-wrap: wrap; align-items: center; gap: 10px 16px; padding: 14px 22px; }
-  .brand { order: 0; }
-  .library-foot { order: 1; margin: 0 0 0 auto; padding: 0; border-top: 0; gap: 14px; }
-  .add { order: 2; flex: 1 1 100%; }
-  .results { order: 3; flex: 1 1 100%; }
-  .shows { order: 4; flex: 1 1 100%; flex-direction: row; overflow-x: auto; gap: 4px; padding-bottom: 2px; scrollbar-width: thin; }
-  .library-empty { order: 5; flex: 1 1 100%; }
-  .show-btn { grid-template-columns: 1fr; align-items: start; gap: 6px; width: 78px; padding: 5px; }
-  .show-btn .cover { width: 68px; height: 68px; }
-  .show-author { display: none; }
-  .show-title { font-size: .74rem; font-weight: 500; }
+/* Phone tab bar */
+.tabbar { display: none; }
+
+/* Medium: navigation rail */
+@media (max-width: 1099px) and (min-width: 760px) {
+  :root { --side-w: 84px; }
+  .sidebar { padding: 16px 8px 10px; }
+  .brand { justify-content: center; padding: 2px 0 14px; }
+  .brand-name, .side-search, .nav-head, .side-shows { display: none; }
+  .nav a { flex-direction: column; justify-content: center; height: 60px; gap: 4px; padding: 0; font-size: 10.5px; font-weight: 600; text-align: center; white-space: nowrap; letter-spacing: -.01em; }
+  .nav a svg { width: 22px; height: 22px; }
+  .rail-only { display: block !important; }
+  .side-foot { align-items: center; }
+  .side-tool { justify-content: center; width: 44px; height: 36px; padding: 0; }
+  .side-tool span { display: none; }
+  .bar { grid-template-columns: minmax(150px, 1fr) minmax(260px, 1.4fr) auto; gap: 12px; }
+  .bar .vol .seek { display: none; }
 }
-@media (min-width: 860px) and (max-width: 1179px) {
-  .app { grid-template-columns: minmax(0, 1fr) 360px; grid-template-rows: auto minmax(0, 1fr); }
-  .full { padding-left: 24px; padding-right: 24px; }
-  .chip { padding: 0 10px; gap: 5px; }
-  #speedBtn { min-width: 50px; }
-  .library { grid-column: 1; grid-row: 1; border-right: 0; border-bottom: 1px solid var(--line); overflow: visible; }
-  .episodes { grid-column: 1; grid-row: 2; }
-  .player { grid-column: 2; grid-row: 1 / 3; }
+/* Phones */
+@media (max-width: 759px) {
+  .app { grid-template-columns: minmax(0, 1fr); }
+  .sidebar { display: none; }
+  .view { padding: 22px 18px calc(170px + env(safe-area-inset-bottom, 0px)); }
+  .page-title { font-size: 30px; }
+  .tabbar { position: fixed; z-index: 55; left: 0; right: 0; bottom: 0; display: grid; grid-template-columns: repeat(4, 1fr); padding: 6px 4px calc(4px + env(safe-area-inset-bottom, 0px)); background: var(--bar); -webkit-backdrop-filter: saturate(180%) blur(28px); backdrop-filter: saturate(180%) blur(28px); border-top: .5px solid var(--sep); }
+  .tabbar a { display: flex; flex-direction: column; align-items: center; gap: 2px; padding: 4px 0; font-size: 10.5px; font-weight: 600; color: var(--text-3); text-decoration: none; }
+  .tabbar a svg { width: 24px; height: 24px; }
+  .tabbar a[aria-current="page"] { color: var(--accent); }
+  .bar { left: 8px; right: 8px; bottom: calc(60px + env(safe-area-inset-bottom, 0px)); height: 60px; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; padding: 0 6px 0 6px; border-radius: 14px; }
+  .bar-art { width: 46px; height: 46px; }
+  .bar-scrub, .bar-tools, #barBack { display: none; }
+  .bar-prog { display: block; }
+  .cap-pill { left: 14px; right: 14px; bottom: calc(60px + 60px + 18px + env(safe-area-inset-bottom, 0px)); max-width: none; font-size: 15px; }
+  .hero { grid-template-columns: minmax(0, 1fr); padding: 24px; min-height: 0; }
+  .hero-stack { display: none; }
+  .show-hero { grid-template-columns: minmax(0, 1fr); justify-items: start; margin-top: -22px; padding-top: 28px; }
+  .hero-art { width: min(58vw, 230px); }
+  .row { --card-w: 140px; gap: 14px; }
+  .row.wide { --card-w: 290px; }
+  .grid { grid-template-columns: repeat(auto-fill, minmax(128px, 1fr)); gap: 22px 14px; }
+  .row-nav { display: none; }
+  .page-head .inline-add { width: 100%; }
+  .inline-add input { flex: 1; width: auto; }
 }
-/* Phones: player docks at the bottom and opens as a sheet */
-@media (max-width: 859px) {
-  html, body { height: auto; }
-  .app { display: block; height: auto; }
-  .library { border: 0; padding: 16px 16px 6px; background: var(--bg); }
-  .episodes { overflow: visible; padding: 14px 16px calc(96px + env(safe-area-inset-bottom, 0px)); }
-  .show-head { grid-template-columns: 96px minmax(0, 1fr); gap: 16px; }
-  .cover.big { width: 96px; height: 96px; font-size: 2rem; }
-  .player { position: fixed; left: 0; right: 0; bottom: 0; z-index: 40; overflow: visible; box-shadow: 0 -10px 30px -12px rgba(0,0,0,.35); }
-  .player .full { display: none; }
-  .mini { position: relative; display: grid; grid-template-columns: 44px minmax(0, 1fr) 44px; align-items: center; gap: 12px; padding: 10px 12px calc(10px + env(safe-area-inset-bottom, 0px)) 14px; }
-  .player.expanded { top: 0; overflow: auto; overscroll-behavior: contain; }
-  .player.expanded .mini { display: none; }
-  .player.expanded .full { display: flex; height: 100%; padding: calc(8px + env(safe-area-inset-top, 0px)) 20px calc(20px + env(safe-area-inset-bottom, 0px)); }
-  .art { max-height: 340px; }
-  .full-top { display: flex; }
-  .vol { display: none; }
-  body.sheet-open { overflow: hidden; }
-  .toast { bottom: calc(84px + env(safe-area-inset-bottom, 0px)); }
+/* Now Playing on narrower screens */
+@media (max-width: 899px) {
+  .np-body, .np:not(.lyrics-on) .np-body { display: flex; flex-direction: column; align-items: stretch; gap: 14px; padding: 4px 24px calc(20px + env(safe-area-inset-bottom, 0px)); }
+  .np-left { display: contents; }
+  .np-art { order: 1; flex: 0 1 auto; width: min(100%, 44vh); align-self: center; }
+  .np-meta { order: 2; }
+  .np-caption { order: 3; }
+  .np-right { order: 4; flex: 1; display: none; }
+  .np-scrub { order: 5; }
+  .np-transport { order: 6; }
+  .np-tools { order: 7; }
+  .np.lyrics-on .np-art, .np.lyrics-on .np-caption { display: none; }
+  .np.lyrics-on .np-right { display: block; }
+  .np:not(.lyrics-on) .np-right { display: none; }
+  .lyric { font-size: 24px; }
+  .lyrics { padding: 10vh 0 34vh; }
+  .np .vol { display: none; }
 }
-.mini-meta { display: flex; flex-direction: column; min-width: 0; padding: 0; border: 0; background: none; text-align: left; color: var(--panel-ink); }
-.mini-title { font-weight: 700; font-size: .88rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.mini-show { font-size: .75rem; color: var(--panel-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.mini-progress { position: absolute; left: 0; right: 0; top: 0; height: 2px; background: rgba(255,255,255,.12); }
-.mini-progress span { display: block; width: 0; height: 100%; background: linear-gradient(90deg, var(--sun-a), var(--sun-b)); }
 @media (prefers-reduced-motion: reduce) {
-  *, *::before, *::after { animation: none !important; transition: none !important; }
+  *, *::before, *::after { animation: none !important; transition: none !important; scroll-behavior: auto !important; }
 }
 </style>
 </head>
 <body>
-<svg class="sprite" aria-hidden="true" focusable="false">
-  <defs>
-    <symbol id="i-play" viewBox="0 0 24 24"><path fill="currentColor" d="M8 5.6v12.8a1 1 0 0 0 1.52.85l10.2-6.4a1 1 0 0 0 0-1.7L9.52 4.75A1 1 0 0 0 8 5.6z"/></symbol>
-    <symbol id="i-pause" viewBox="0 0 24 24"><rect fill="currentColor" x="6.5" y="5" width="4" height="14" rx="1.2"/><rect fill="currentColor" x="13.5" y="5" width="4" height="14" rx="1.2"/></symbol>
-    <symbol id="i-prev" viewBox="0 0 24 24"><rect fill="currentColor" x="5" y="6" width="2.2" height="12" rx="1"/><path fill="currentColor" d="M18.5 6.9v10.2a.9.9 0 0 1-1.38.76L9.6 12.76a.9.9 0 0 1 0-1.52l7.52-5.1a.9.9 0 0 1 1.38.76z"/></symbol>
-    <symbol id="i-next" viewBox="0 0 24 24"><rect fill="currentColor" x="16.8" y="6" width="2.2" height="12" rx="1"/><path fill="currentColor" d="M5.5 6.9v10.2a.9.9 0 0 0 1.38.76l7.52-5.1a.9.9 0 0 0 0-1.52L6.88 6.14a.9.9 0 0 0-1.38.76z"/></symbol>
-    <symbol id="i-vol" viewBox="0 0 24 24"><path fill="currentColor" d="M4 9.2h3.3l4.4-3.7a.6.6 0 0 1 1 .46v12.08a.6.6 0 0 1-1 .46L7.3 14.8H4a1 1 0 0 1-1-1v-3.6a1 1 0 0 1 1-1z"/><path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" d="M15.5 9.2a4 4 0 0 1 0 5.6M18.2 6.6a7.6 7.6 0 0 1 0 10.8"/></symbol>
-    <symbol id="i-mute" viewBox="0 0 24 24"><path fill="currentColor" d="M4 9.2h3.3l4.4-3.7a.6.6 0 0 1 1 .46v12.08a.6.6 0 0 1-1 .46L7.3 14.8H4a1 1 0 0 1-1-1v-3.6a1 1 0 0 1 1-1z"/><path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" d="M16 9.5l5 5M21 9.5l-5 5"/></symbol>
-    <symbol id="i-cc" viewBox="0 0 24 24"><rect fill="none" stroke="currentColor" stroke-width="1.7" x="3" y="5.5" width="18" height="13" rx="2.5"/><path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" d="M10.6 10.3a2.1 2.1 0 1 0 0 3.4M16.6 10.3a2.1 2.1 0 1 0 0 3.4"/></symbol>
-    <symbol id="i-lines" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" d="M5 7h14M5 11.5h14M5 16h9"/></symbol>
-    <symbol id="i-moon" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round" d="M19.5 14.6A7.6 7.6 0 0 1 9.4 4.5a7.6 7.6 0 1 0 10.1 10.1z"/></symbol>
-    <symbol id="i-search" viewBox="0 0 24 24"><circle fill="none" stroke="currentColor" stroke-width="1.8" cx="10.5" cy="10.5" r="6"/><path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" d="M15 15l4.5 4.5"/></symbol>
-    <symbol id="i-refresh" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" d="M19.5 12a7.5 7.5 0 1 1-2.2-5.3M19.5 4.5v4.2h-4.2"/></symbol>
-    <symbol id="i-sort" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" d="M8 5v14M5 16l3 3 3-3M16 19V5M13 8l3-3 3 3"/></symbol>
-    <symbol id="i-trash" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" d="M4.5 7h15M10 7V4.8h4V7M6.5 7l.9 12.2h9.2L17.5 7"/></symbol>
-    <symbol id="i-link" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" d="M10 14a4 4 0 0 0 5.66 0l3-3a4 4 0 0 0-5.66-5.66l-1 1M14 10a4 4 0 0 0-5.66 0l-3 3a4 4 0 0 0 5.66 5.66l1-1"/></symbol>
-    <symbol id="i-down" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" d="M6 9l6 6 6-6"/></symbol>
-    <symbol id="i-close" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" d="M6.5 6.5l11 11M17.5 6.5l-11 11"/></symbol>
-    <symbol id="i-theme" viewBox="0 0 24 24"><circle fill="none" stroke="currentColor" stroke-width="1.7" cx="12" cy="12" r="8"/><path fill="currentColor" d="M12 4a8 8 0 0 1 0 16z"/></symbol>
-  </defs>
-</svg>
+<svg class="sprite" aria-hidden="true" focusable="false"><defs>
+  <symbol id="i-play" viewBox="0 0 24 24"><path fill="currentColor" d="M8 5.6v12.8a1 1 0 0 0 1.52.85l10.2-6.4a1 1 0 0 0 0-1.7L9.52 4.75A1 1 0 0 0 8 5.6z"/></symbol>
+  <symbol id="i-pause" viewBox="0 0 24 24"><rect fill="currentColor" x="6.2" y="5" width="4.2" height="14" rx="1.3"/><rect fill="currentColor" x="13.6" y="5" width="4.2" height="14" rx="1.3"/></symbol>
+  <symbol id="i-prev" viewBox="0 0 24 24"><rect fill="currentColor" x="5" y="6" width="2.2" height="12" rx="1"/><path fill="currentColor" d="M18.5 6.9v10.2a.9.9 0 0 1-1.38.76L9.6 12.76a.9.9 0 0 1 0-1.52l7.52-5.1a.9.9 0 0 1 1.38.76z"/></symbol>
+  <symbol id="i-next" viewBox="0 0 24 24"><rect fill="currentColor" x="16.8" y="6" width="2.2" height="12" rx="1"/><path fill="currentColor" d="M5.5 6.9v10.2a.9.9 0 0 0 1.38.76l7.52-5.1a.9.9 0 0 0 0-1.52L6.88 6.14a.9.9 0 0 0-1.38.76z"/></symbol>
+  <symbol id="i-back" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" d="M1 4v6h6M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/><text x="12.6" y="15.3" text-anchor="middle" font-size="7.2" font-weight="700" fill="currentColor" font-family="system-ui, sans-serif">15</text></symbol>
+  <symbol id="i-fwd" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" d="M23 4v6h-6M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/><text x="11.4" y="15.3" text-anchor="middle" font-size="7.2" font-weight="700" fill="currentColor" font-family="system-ui, sans-serif">30</text></symbol>
+  <symbol id="i-vol" viewBox="0 0 24 24"><path fill="currentColor" d="M4 9.2h3.3l4.4-3.7a.6.6 0 0 1 1 .46v12.08a.6.6 0 0 1-1 .46L7.3 14.8H4a1 1 0 0 1-1-1v-3.6a1 1 0 0 1 1-1z"/><path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" d="M15.5 9.2a4 4 0 0 1 0 5.6M18.2 6.6a7.6 7.6 0 0 1 0 10.8"/></symbol>
+  <symbol id="i-mute" viewBox="0 0 24 24"><path fill="currentColor" d="M4 9.2h3.3l4.4-3.7a.6.6 0 0 1 1 .46v12.08a.6.6 0 0 1-1 .46L7.3 14.8H4a1 1 0 0 1-1-1v-3.6a1 1 0 0 1 1-1z"/><path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" d="M16 9.5l5 5M21 9.5l-5 5"/></symbol>
+  <symbol id="i-cc" viewBox="0 0 24 24"><rect fill="none" stroke="currentColor" stroke-width="1.7" x="3" y="5.5" width="18" height="13" rx="2.6"/><path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" d="M10.6 10.3a2.1 2.1 0 1 0 0 3.4M16.6 10.3a2.1 2.1 0 1 0 0 3.4"/></symbol>
+  <symbol id="i-quote" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round" d="M5 4.8h14a1.6 1.6 0 0 1 1.6 1.6v8.2a1.6 1.6 0 0 1-1.6 1.6h-7l-4.6 3.6v-3.6H5a1.6 1.6 0 0 1-1.6-1.6V6.4A1.6 1.6 0 0 1 5 4.8z"/><path fill="currentColor" d="M8.6 8.8h2.6v2.3c0 1.3-.7 2.2-2 2.6l-.4-.8c.6-.3.9-.7.9-1.3H8.6zm4.8 0H16v2.3c0 1.3-.7 2.2-2 2.6l-.4-.8c.6-.3.9-.7.9-1.3h-1.1z"/></symbol>
+  <symbol id="i-moon" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round" d="M19.5 14.6A7.6 7.6 0 0 1 9.4 4.5a7.6 7.6 0 1 0 10.1 10.1z"/></symbol>
+  <symbol id="i-search" viewBox="0 0 24 24"><circle fill="none" stroke="currentColor" stroke-width="2" cx="10.5" cy="10.5" r="6.2"/><path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" d="M15.2 15.2l4.6 4.6"/></symbol>
+  <symbol id="i-home" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round" d="M4 10.6 12 4l8 6.6V19a1 1 0 0 1-1 1h-4.6v-5.6H9.6V20H5a1 1 0 0 1-1-1z"/></symbol>
+  <symbol id="i-sparkle" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round" d="M11 4l1.7 4.6a2 2 0 0 0 1.2 1.2L18.5 11.5l-4.6 1.7a2 2 0 0 0-1.2 1.2L11 19l-1.7-4.6a2 2 0 0 0-1.2-1.2L3.5 11.5l4.6-1.7a2 2 0 0 0 1.2-1.2z"/><path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" d="M19 3v3.4M17.3 4.7h3.4"/></symbol>
+  <symbol id="i-stack" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" d="M5 4.5v15M9.5 4.5v15M13.6 5.4l4.8 14.1"/></symbol>
+  <symbol id="i-refresh" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" d="M19.5 12a7.5 7.5 0 1 1-2.2-5.3M19.5 4.5v4.2h-4.2"/></symbol>
+  <symbol id="i-sort" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" d="M8 5v14M5 16l3 3 3-3M16 19V5M13 8l3-3 3 3"/></symbol>
+  <symbol id="i-trash" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" d="M4.5 7h15M10 7V4.8h4V7M6.5 7l.9 12.2h9.2L17.5 7"/></symbol>
+  <symbol id="i-link" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" d="M10 14a4 4 0 0 0 5.66 0l3-3a4 4 0 0 0-5.66-5.66l-1 1M14 10a4 4 0 0 0-5.66 0l-3 3a4 4 0 0 0 5.66 5.66l1-1"/></symbol>
+  <symbol id="i-plus" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" d="M12 5v14M5 12h14"/></symbol>
+  <symbol id="i-check" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" d="M5 12.5l4.5 4.5L19 7.5"/></symbol>
+  <symbol id="i-chevleft" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" d="M15 5l-7 7 7 7"/></symbol>
+  <symbol id="i-chevright" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" d="M9 5l7 7-7 7"/></symbol>
+  <symbol id="i-chevdown" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" d="M5 9l7 7 7-7"/></symbol>
+  <symbol id="i-expand" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" d="M14 4h6v6M20 4l-6.5 6.5M10 20H4v-6M4 20l6.5-6.5"/></symbol>
+  <symbol id="i-theme" viewBox="0 0 24 24"><circle fill="none" stroke="currentColor" stroke-width="1.7" cx="12" cy="12" r="8"/><path fill="currentColor" d="M12 4a8 8 0 0 1 0 16z"/></symbol>
+  <symbol id="i-import" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" d="M12 4v11M7.5 10.5 12 15l4.5-4.5M5 19.5h14"/></symbol>
+  <symbol id="i-export" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" d="M12 15V4M7.5 8.5 12 4l4.5 4.5M5 19.5h14"/></symbol>
+  <symbol id="i-infinity" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" d="M6.8 9.3a2.7 2.7 0 1 0 0 5.4c2.7 0 7.7-5.4 10.4-5.4a2.7 2.7 0 1 1 0 5.4c-2.7 0-7.7-5.4-10.4-5.4z"/></symbol>
+  <symbol id="i-file" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round" d="M7 3.5h7l4.5 4.5v12.5H7zM14 3.5V8h4.5"/><path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" d="M9.5 13h6M9.5 16.5h4"/></symbol>
+</defs></svg>
 
 <div class="app" id="app">
-  <aside class="library" aria-label="Library">
-    <div class="brand">
-      <h1>夜更かしラジオ</h1>
-      <button class="icon-btn small" id="themeBtn" type="button" aria-label="Theme: follow system" title="Theme: follow system"><svg aria-hidden="true"><use href="#i-theme"/></svg></button>
-    </div>
-    <form class="add" id="addForm" autocomplete="off">
-      <label class="visually-hidden" for="addInput">Search podcasts, or paste a feed or Apple Podcasts link</label>
+  <nav class="sidebar" aria-label="Main">
+    <a class="brand" href="#/home" aria-label="夜更かしラジオ, Listen Now"><span class="brand-sun" aria-hidden="true"></span><span class="brand-name">夜更かしラジオ</span></a>
+    <form class="side-search" id="searchForm" role="search" autocomplete="off">
       <svg aria-hidden="true"><use href="#i-search"/></svg>
-      <input id="addInput" type="text" inputmode="search" enterkeyhint="search" spellcheck="false" placeholder="Name or feed link">
-      <button type="submit" id="addBtn">Search</button>
+      <input id="searchInput" type="search" placeholder="Search or paste a link" aria-label="Search podcasts, or paste a feed or Apple Podcasts link" spellcheck="false" enterkeyhint="search">
     </form>
-    <section class="results" id="results" aria-label="Search results" hidden>
-      <div class="results-head">
-        <p id="resultsTitle"></p>
-        <button class="icon-btn small" id="resultsClose" type="button" aria-label="Close search results"><svg aria-hidden="true"><use href="#i-close"/></svg></button>
-      </div>
-      <ul id="resultsList"></ul>
-    </section>
-    <ul class="shows" id="shows" aria-label="Your shows"></ul>
-    <div class="library-empty" id="libraryEmpty" hidden>
-      <p>Your library is empty. Search for a show by name, or paste its RSS feed or Apple Podcasts link.</p>
-      <p>Try one from your poster:</p>
-      <div class="try" id="tryChips"></div>
+    <ul class="nav">
+      <li><a href="#/home" data-route="home"><svg aria-hidden="true"><use href="#i-home"/></svg><span>Listen Now</span></a></li>
+      <li><a href="#/discover" data-route="discover"><svg aria-hidden="true"><use href="#i-sparkle"/></svg><span>Discover</span></a></li>
+      <li><a href="#/library" data-route="library"><svg aria-hidden="true"><use href="#i-stack"/></svg><span>Library</span></a></li>
+      <li class="rail-only"><a href="#/search" data-route="search"><svg aria-hidden="true"><use href="#i-search"/></svg><span>Search</span></a></li>
+    </ul>
+    <p class="nav-head"><span>Your shows</span><span class="side-progress" id="sideProgress" hidden></span></p>
+    <ul class="side-shows" id="sideShows" aria-label="Your shows"></ul>
+    <div class="side-foot">
+      <button class="side-tool" id="themeBtn" type="button" title="Appearance"><svg aria-hidden="true"><use href="#i-theme"/></svg><span id="themeLabel">Appearance: System</span></button>
+      <button class="side-tool" id="importBtn" type="button" title="Import OPML"><svg aria-hidden="true"><use href="#i-import"/></svg><span>Import OPML</span></button>
+      <button class="side-tool" id="exportBtn" type="button" title="Export OPML"><svg aria-hidden="true"><use href="#i-export"/></svg><span>Export OPML</span></button>
     </div>
-    <div class="library-foot">
-      <button type="button" class="text-btn" id="importBtn">Import OPML</button>
-      <button type="button" class="text-btn" id="exportBtn">Export OPML</button>
-    </div>
-  </aside>
+  </nav>
+  <main class="main" id="main" tabindex="-1"><div class="view" id="view"></div></main>
+</div>
 
-  <main class="episodes" id="episodes" aria-label="Episodes">
-    <div class="welcome" id="welcome">
-      <h2>Choose a show to begin</h2>
-      <p>Search by name or paste a feed link. Episodes appear here, and the player keeps your place, speed and captions for every episode.</p>
-      <dl class="keys">
-        <dt><kbd>Space</kbd></dt><dd>Play or pause</dd>
-        <dt><kbd>←</kbd> <kbd>→</kbd></dt><dd>Back 15 seconds, forward 30 seconds</dd>
-        <dt><kbd>[</kbd> <kbd>]</kbd></dt><dd>Slower, faster</dd>
-        <dt><kbd>C</kbd> <kbd>T</kbd></dt><dd>Captions, transcript</dd>
-        <dt><kbd>M</kbd></dt><dd>Mute</dd>
-        <dt><kbd>Shift</kbd> + <kbd>N</kbd> / <kbd>P</kbd></dt><dd>Next or previous episode</dd>
-      </dl>
-    </div>
-    <header class="show-head" id="showHead" hidden>
-      <div id="showCover"></div>
-      <div>
-        <h2 id="showTitle"></h2>
-        <p class="byline" id="showAuthor"></p>
-        <p class="about" id="showAbout"></p>
-        <div class="head-actions">
-          <button class="pill" id="refreshBtn" type="button"><svg aria-hidden="true"><use href="#i-refresh"/></svg><span>Refresh</span></button>
-          <button class="pill" id="sortBtn" type="button"><svg aria-hidden="true"><use href="#i-sort"/></svg><span>Newest first</span></button>
-          <a class="pill" id="siteLink" href="#" target="_blank" rel="noopener noreferrer" hidden><svg aria-hidden="true"><use href="#i-link"/></svg><span>Website</span></a>
-          <button class="pill danger" id="removeBtn" type="button"><svg aria-hidden="true"><use href="#i-trash"/></svg><span>Remove</span></button>
-        </div>
-      </div>
-    </header>
-    <p class="list-status" id="listStatus" hidden></p>
-    <ol class="episode-list" id="episodeList" aria-label="Episode list"></ol>
-  </main>
+<nav class="tabbar" id="tabbar" aria-label="Sections">
+  <a href="#/home" data-route="home"><svg aria-hidden="true"><use href="#i-home"/></svg><span>Listen Now</span></a>
+  <a href="#/discover" data-route="discover"><svg aria-hidden="true"><use href="#i-sparkle"/></svg><span>Discover</span></a>
+  <a href="#/library" data-route="library"><svg aria-hidden="true"><use href="#i-stack"/></svg><span>Library</span></a>
+  <a href="#/search" data-route="search"><svg aria-hidden="true"><use href="#i-search"/></svg><span>Search</span></a>
+</nav>
 
-  <section class="player" id="player" aria-label="Now playing">
-    <div class="mini" id="mini">
-      <div id="miniCover"></div>
-      <button class="mini-meta" id="miniExpand" type="button" aria-expanded="false" aria-label="Open the player">
-        <span class="mini-title" id="miniTitle">Nothing playing</span>
-        <span class="mini-show" id="miniShow"></span>
-      </button>
-      <button class="icon-btn" id="miniPlay" type="button" aria-label="Play" disabled><svg aria-hidden="true"><use href="#i-play"/></svg></button>
-      <div class="mini-progress" aria-hidden="true"><span id="miniBar"></span></div>
-    </div>
+<div class="cap-pill" id="capPill" aria-hidden="true" hidden><span class="who" id="capWho"></span><span id="capText"></span></div>
 
-    <div class="full" id="full">
-      <div class="full-top">
-        <button class="icon-btn" id="collapseBtn" type="button" aria-label="Close the player"><svg aria-hidden="true"><use href="#i-down"/></svg></button>
-      </div>
-      <div class="np">
-      <div class="art">
-        <img id="pCover" alt="" hidden>
-        <svg class="art-sun" viewBox="0 0 200 200" aria-hidden="true">
-          <defs>
-            <linearGradient id="sunGrad" x1="0" y1="0" x2="0" y2="1">
-              <stop offset="0" stop-color="#FFC15E"/><stop offset=".55" stop-color="#F26B7A"/><stop offset="1" stop-color="#B2418F"/>
-            </linearGradient>
-            <mask id="sunCuts">
-              <rect width="200" height="200" fill="#fff"/>
-              <rect y="112" width="200" height="4" fill="#000"/><rect y="130" width="200" height="6" fill="#000"/>
-              <rect y="150" width="200" height="8" fill="#000"/><rect y="172" width="200" height="10" fill="#000"/>
-            </mask>
-          </defs>
-          <circle cx="100" cy="100" r="92" fill="url(#sunGrad)" mask="url(#sunCuts)"/>
-        </svg>
-      </div>
-      <div class="np-meta">
-        <p class="p-show" id="pShow">Nothing playing</p>
-        <h2 class="p-title" id="pTitle">Pick an episode to start listening.</h2>
-      </div>
-      </div>
-      <div class="caption" id="caption" hidden></div>
-      <div class="scrub">
-        <input type="range" class="range" id="seek" min="0" max="1000" step="1" value="0" aria-label="Position in episode" disabled>
-        <div class="times"><span id="tCur">0:00</span><span id="tLeft">-0:00</span></div>
-      </div>
-      <div class="transport">
-        <button class="icon-btn" id="prevBtn" type="button" aria-label="Previous episode" title="Previous episode (Shift+P)" disabled><svg aria-hidden="true"><use href="#i-prev"/></svg></button>
-        <button class="icon-btn skip" id="backBtn" type="button" aria-label="Back 15 seconds" title="Back 15 seconds (←)" disabled>
-          <svg viewBox="0 0 24 24" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" d="M1 4v6h6M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/><text x="12.6" y="15.3" text-anchor="middle" font-size="7.2" font-weight="700" fill="currentColor" font-family="system-ui, sans-serif">15</text></svg>
-        </button>
-        <button class="play-btn" id="playBtn" type="button" aria-label="Play" title="Play (Space)" disabled><svg aria-hidden="true"><use href="#i-play"/></svg></button>
-        <button class="icon-btn skip" id="fwdBtn" type="button" aria-label="Forward 30 seconds" title="Forward 30 seconds (→)" disabled>
-          <svg viewBox="0 0 24 24" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" d="M23 4v6h-6M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/><text x="11.4" y="15.3" text-anchor="middle" font-size="7.2" font-weight="700" fill="currentColor" font-family="system-ui, sans-serif">30</text></svg>
-        </button>
-        <button class="icon-btn" id="nextBtn" type="button" aria-label="Next episode" title="Next episode (Shift+N)" disabled><svg aria-hidden="true"><use href="#i-next"/></svg></button>
-      </div>
-      <div class="extras">
-        <div class="speed-wrap">
-          <button class="chip" id="speedBtn" type="button" aria-haspopup="dialog" aria-expanded="false" aria-controls="speedPop" title="Playback speed ([ and ])">1×</button>
-          <div class="speed-pop" id="speedPop" role="dialog" aria-label="Playback speed" hidden>
-            <div class="speed-row"><span id="speedVal">1.00×</span><button class="text-btn light" id="speedReset" type="button">Reset to 1×</button></div>
-            <input type="range" class="range thin" id="speedRange" min="0.5" max="3" step="0.05" value="1" aria-label="Playback speed">
-            <div class="speed-presets" id="speedPresets"></div>
-          </div>
-        </div>
-        <button class="chip icon-only" id="ccBtn" type="button" aria-pressed="true" aria-label="Captions" title="Captions (C)"><svg aria-hidden="true"><use href="#i-cc"/></svg></button>
-        <button class="chip" id="trBtn" type="button" aria-pressed="false" aria-label="Transcript" title="Transcript (T)"><svg aria-hidden="true"><use href="#i-lines"/></svg><span>Transcript</span></button>
-        <button class="chip" id="sleepBtn" type="button" aria-pressed="false" title="Sleep timer: press to cycle 15, 30, 45, 60 minutes, end of episode, off"><svg aria-hidden="true"><use href="#i-moon"/></svg><span id="sleepLabel">Sleep</span></button>
-      </div>
-      <div class="vol">
-        <button class="icon-btn small" id="muteBtn" type="button" aria-label="Mute" title="Mute (M)"><svg aria-hidden="true"><use href="#i-vol"/></svg></button>
-        <input type="range" class="range thin" id="volume" min="0" max="1" step="0.01" value="1" aria-label="Volume">
-      </div>
-      <section class="transcript" id="transcript" aria-label="Transcript" hidden>
-        <div class="tr-head"><p id="trTitle">Transcript</p><button class="text-btn light" id="trLoad" type="button">Load a caption file</button></div>
-        <ol id="trList"></ol>
-        <div class="tr-text" id="trText" hidden></div>
-      </section>
-      <div class="p-foot">
-        <label class="switch"><input type="checkbox" id="autoNext"><span>Play the next episode automatically</span></label>
-      </div>
-      <audio id="audio" preload="metadata"></audio>
+<section class="bar idle" id="bar" aria-label="Player">
+  <div class="bar-info">
+    <button class="bar-art" id="barArt" type="button" aria-label="Open Now Playing"></button>
+    <div class="bar-meta">
+      <button class="bar-title" id="barTitle" type="button" title="Open Now Playing"></button>
+      <a class="bar-show" id="barShow" href="#/library"></a>
     </div>
-  </section>
+  </div>
+  <div class="bar-center">
+    <div class="bar-buttons">
+      <button class="ctl skip" id="barBack" type="button" aria-label="Back 15 seconds" title="Back 15 seconds (←)"><svg aria-hidden="true"><use href="#i-back"/></svg></button>
+      <button class="ctl play" id="barPlay" type="button" aria-label="Play" title="Play (Space)"><svg aria-hidden="true"><use href="#i-play"/></svg></button>
+      <button class="ctl skip" id="barFwd" type="button" aria-label="Forward 30 seconds" title="Forward 30 seconds (→)"><svg aria-hidden="true"><use href="#i-fwd"/></svg></button>
+    </div>
+    <div class="bar-scrub"><span id="barCur">0:00</span><input class="seek" id="barSeek" type="range" min="0" max="1000" step="1" value="0" aria-label="Position in episode"><span id="barLeft">-0:00</span></div>
+  </div>
+  <div class="bar-tools">
+    <button class="tool speed" id="barSpeed" type="button" data-speed-btn aria-haspopup="dialog" aria-expanded="false" title="Playback speed ([ and ])">1×</button>
+    <button class="tool" id="barCC" type="button" aria-pressed="true" aria-label="Captions" title="Captions (C)"><svg aria-hidden="true"><use href="#i-cc"/></svg></button>
+    <button class="tool" id="barLyrics" type="button" aria-label="Transcript" title="Transcript (T)"><svg aria-hidden="true"><use href="#i-quote"/></svg></button>
+    <button class="tool" id="barSleep" type="button" aria-pressed="false" aria-label="Sleep timer, off" title="Sleep timer"><svg aria-hidden="true"><use href="#i-moon"/></svg><span class="sleep-label" id="barSleepLabel" hidden></span></button>
+    <div class="vol"><button class="tool" id="barMute" type="button" aria-label="Mute" title="Mute (M)"><svg aria-hidden="true"><use href="#i-vol"/></svg></button><input class="seek" id="barVol" type="range" min="0" max="1" step="0.01" value="1" aria-label="Volume"></div>
+    <button class="tool" id="barExpand" type="button" aria-label="Open Now Playing" title="Now Playing"><svg aria-hidden="true"><use href="#i-expand"/></svg></button>
+  </div>
+  <div class="bar-prog" aria-hidden="true"><i id="barProg"></i></div>
+</section>
+
+<section class="np" id="np" aria-label="Now Playing" hidden>
+  <div class="np-bg" id="npBg"></div>
+  <div class="np-scrim"></div>
+  <header class="np-top">
+    <button class="np-btn" id="npClose" type="button" aria-label="Close Now Playing"><svg aria-hidden="true"><use href="#i-chevdown"/></svg></button>
+    <span class="np-label">Now Playing</span>
+    <button class="np-btn" id="npAuto" type="button" aria-pressed="true" aria-label="Play the next episode automatically" title="Autoplay next episode"><svg aria-hidden="true"><use href="#i-infinity"/></svg></button>
+  </header>
+  <div class="np-body">
+    <div class="np-left">
+      <div class="np-art" id="npArt"></div>
+      <div class="np-meta"><h2 class="np-title" id="npTitle"></h2><a class="np-show" id="npShow" href="#/library"></a></div>
+      <p class="np-caption" id="npCaption" aria-live="off"></p>
+      <div class="np-scrub"><input class="seek" id="npSeek" type="range" min="0" max="1000" step="1" value="0" aria-label="Position in episode"><div class="np-times"><span id="npCur">0:00</span><span id="npLeft">-0:00</span></div></div>
+      <div class="np-transport">
+        <button class="ctl" id="npPrev" type="button" aria-label="Previous episode" title="Previous episode (Shift+P)"><svg aria-hidden="true"><use href="#i-prev"/></svg></button>
+        <button class="ctl skip" id="npBack" type="button" aria-label="Back 15 seconds"><svg aria-hidden="true"><use href="#i-back"/></svg></button>
+        <button class="ctl play" id="npPlay" type="button" aria-label="Play"><svg aria-hidden="true"><use href="#i-play"/></svg></button>
+        <button class="ctl skip" id="npFwd" type="button" aria-label="Forward 30 seconds"><svg aria-hidden="true"><use href="#i-fwd"/></svg></button>
+        <button class="ctl" id="npNext" type="button" aria-label="Next episode" title="Next episode (Shift+N)"><svg aria-hidden="true"><use href="#i-next"/></svg></button>
+      </div>
+      <div class="np-tools">
+        <button class="tool speed" id="npSpeed" type="button" data-speed-btn aria-haspopup="dialog" aria-expanded="false" title="Playback speed">1×</button>
+        <button class="tool" id="npCC" type="button" aria-pressed="true" aria-label="Captions" title="Captions (C)"><svg aria-hidden="true"><use href="#i-cc"/></svg></button>
+        <button class="tool" id="npLyricsBtn" type="button" aria-pressed="true" aria-label="Transcript" title="Transcript (T)"><svg aria-hidden="true"><use href="#i-quote"/></svg></button>
+        <button class="tool" id="npSleep" type="button" aria-pressed="false" aria-label="Sleep timer, off" title="Sleep timer"><svg aria-hidden="true"><use href="#i-moon"/></svg><span class="sleep-label" id="npSleepLabel" hidden></span></button>
+        <div class="vol"><button class="tool" id="npMute" type="button" aria-label="Mute"><svg aria-hidden="true"><use href="#i-vol"/></svg></button><input class="seek" id="npVol" type="range" min="0" max="1" step="0.01" value="1" aria-label="Volume"></div>
+      </div>
+    </div>
+    <div class="np-right" id="npRight">
+      <ol class="lyrics" id="lyrics" aria-label="Transcript"></ol>
+      <div class="np-notes" id="npNotes" hidden></div>
+    </div>
+  </div>
+</section>
+
+<div class="pop" id="speedPop" role="dialog" aria-label="Playback speed" hidden>
+  <div class="pop-row"><span class="pop-val" id="speedVal">1.00×</span><button class="link-btn" id="speedReset" type="button">Reset</button></div>
+  <input class="seek" id="speedRange" type="range" min="0.5" max="3" step="0.05" value="1" aria-label="Playback speed">
+  <div class="presets" id="speedPresets"></div>
 </div>
 <div class="toast" id="toast" role="status" aria-live="polite"></div>
 <input type="file" id="capFile" accept=".vtt,.srt,.json,text/vtt,application/x-subrip,application/json" hidden>
 <input type="file" id="opmlFile" accept=".opml,.xml,text/xml,text/x-opml" hidden>
+<audio id="audio" preload="metadata"></audio>
+
+<script type="application/json" id="catalog">
+{
+  "categories": [
+    {"id": "citypop", "label": "City pop & anime songs", "short": "City pop", "keywords": [["city pop", "us"], ["anime music", "us"], ["シティポップ", "jp"]]},
+    {"id": "jazz", "label": "Jazz, hip-hop & piano", "short": "Jazz & piano", "keywords": [["jazz", "gb"], ["hip hop history", "us"], ["classical piano", "gb"]]},
+    {"id": "tech", "label": "Gadgets & latest tech", "short": "Tech", "keywords": [["gadgets", "gb"], ["tech news", "gb"], ["ガジェット", "jp"]]},
+    {"id": "lit", "label": "Literature & light lit", "short": "Books", "keywords": [["books", "gb"], ["ライトノベル", "jp"], ["读书", "tw"]]},
+    {"id": "mystery", "label": "Mystery novels", "short": "Mystery", "keywords": [["mystery fiction", "gb"], ["ミステリー", "jp"], ["推理", "tw"]]},
+    {"id": "knowledge", "label": "Economics, physics & astronomy", "short": "Knowledge", "keywords": [["astronomy", "gb"], ["physics", "gb"], ["economics", "gb"]]},
+    {"id": "games", "label": "Game industry", "short": "Games", "keywords": [["video game history", "gb"], ["game development", "gb"], ["ゲーム", "jp"]]}
+  ],
+  "langs": {
+    "ja": {"label": "日本語", "keywords": [["シティポップ", "jp"], ["アニソン", "jp"], ["ライトノベル", "jp"], ["ミステリー", "jp"], ["ガジェット", "jp"]]},
+    "zh": {"label": "中文", "keywords": [["推理", "tw"], ["读书", "tw"], ["音乐", "tw"], ["科技", "tw"], ["游戏", "tw"]]}
+  },
+  "presets": [
+    {"key": "primer", "cat": "citypop", "title": "Primer", "author": "Maximum Fun", "artist": "Maximum Fun", "term": "Primer Maximum Fun", "countries": ["us", "gb"], "why": "Japanese city pop, one album per episode."},
+    {"key": "mayonaka", "cat": "citypop", "title": "Mayonaka Hour 真夜中アワー", "match": "Mayonaka Hour", "author": "Yuki Tasaka & Van Paugam", "term": "Mayonaka Hour", "countries": ["us", "gb"], "why": "Profiles of city pop’s big names."},
+    {"key": "linernotes", "cat": "citypop", "title": "Liner Notes", "match": "Liner Notes", "author": "Light in the Attic", "artist": "Light in the Attic", "term": "Light in the Attic Liner Notes", "countries": ["us", "gb"], "why": "Includes the Pacific Breeze city pop episode."},
+    {"key": "heatrocks", "cat": "jazz", "title": "Heat Rocks", "author": "Maximum Fun", "artist": "Maximum Fun", "id": 1290971833, "term": "Heat Rocks", "countries": ["us", "gb"], "why": "Guests on one album: jazz, hip-hop, soul. A finished archive of about 200 episodes."},
+    {"key": "jazznight", "cat": "jazz", "title": "Jazz Night in America", "author": "NPR", "artist": "NPR", "term": "Jazz Night in America", "countries": ["us", "gb"], "why": "Live jazz from NPR and WBGO."},
+    {"key": "takeitpersonal", "cat": "jazz", "title": "Take It Personal", "match": "Take It Personal", "author": "Philaflava", "term": "Take It Personal hip hop", "countries": ["us", "gb"], "why": "Golden-era, boom-bap East Coast hip-hop."},
+    {"key": "composer", "cat": "jazz", "title": "Composer of the Week", "author": "BBC Radio 3", "artist": "BBC", "id": 275377513, "term": "Composer of the Week", "countries": ["gb"], "why": "Portraits of composers, with plenty of piano. The feed is UK-only."},
+    {"key": "songexploder", "cat": "jazz", "title": "Song Exploder", "author": "Hrishikesh Hirway", "artist": "Hrishikesh Hirway", "term": "Song Exploder", "countries": ["gb", "us"], "why": "Artists take their own songs apart."},
+    {"key": "vergecast", "cat": "tech", "title": "The Vergecast", "author": "The Verge", "artist": "The Verge", "term": "The Vergecast", "feed": "https://feeds.megaphone.fm/vergecast", "countries": ["gb", "us"], "why": "Weekly gadget and tech news."},
+    {"key": "upgrade", "cat": "tech", "title": "Upgrade", "match": "Upgrade", "author": "Relay", "artist": "Relay", "term": "Upgrade Relay FM", "feed": "https://www.relay.fm/upgrade/feed", "countries": ["gb", "us"], "why": "Relaxed Apple and tech conversation."},
+    {"key": "hardfork", "cat": "tech", "title": "Hard Fork", "author": "The New York Times", "artist": "New York Times", "term": "Hard Fork", "feed": "https://feeds.simplecast.com/l2i9YnTd", "countries": ["gb", "us"], "why": "AI and the week in tech."},
+    {"key": "darknet", "cat": "tech", "title": "Darknet Diaries", "author": "Jack Rhysider", "artist": "Jack Rhysider", "term": "Darknet Diaries", "feed": "https://feeds.megaphone.fm/darknetdiaries", "countries": ["gb", "us"], "why": "True stories from the security world."},
+    {"key": "rebuild", "cat": "tech", "title": "Rebuild", "match": "Rebuild", "author": "Tatsuhiko Miyagawa", "artist": "Miyagawa", "term": "Rebuild.fm", "feed": "https://feeds.rebuild.fm/rebuildfm", "countries": ["jp", "us"], "lang": "ja", "why": "Long-running Japanese tech talk."},
+    {"key": "inourtime", "cat": "lit", "title": "In Our Time", "author": "BBC Radio 4", "artist": "BBC", "term": "In Our Time", "feed": "https://podcasts.files.bbci.co.uk/b006qykl.rss", "countries": ["gb"], "why": "Literature, science and history with academics."},
+    {"key": "backlisted", "cat": "lit", "title": "Backlisted", "match": "Backlisted", "author": "Unbound", "term": "Backlisted podcast", "countries": ["gb", "us"], "why": "Forgotten and classic books, warmly discussed."},
+    {"key": "nyfiction", "cat": "lit", "title": "The New Yorker: Fiction", "author": "The New Yorker", "artist": "New Yorker", "term": "The New Yorker Fiction", "countries": ["us", "gb"], "why": "Authors read and discuss short stories."},
+    {"key": "suiji", "cat": "lit", "title": "随机波动", "author": "随机波动", "term": "随机波动", "countries": ["tw", "us"], "lang": "zh", "why": "Culture, books and society, with scholars as guests."},
+    {"key": "yurugengo", "cat": "lit", "title": "ゆる言語学ラジオ", "author": "Yuru Gengogaku Radio", "term": "ゆる言語学ラジオ", "countries": ["jp"], "lang": "ja", "why": "Light, funny linguistics."},
+    {"key": "shedunnit", "cat": "mystery", "title": "Shedunnit", "author": "Caroline Crampton", "artist": "Caroline Crampton", "term": "Shedunnit", "countries": ["gb", "us"], "why": "The history of Golden Age detective fiction."},
+    {"key": "sherlock", "cat": "mystery", "title": "I Hear of Sherlock Everywhere", "author": "Scott Monty & Burt Wolder", "term": "I Hear of Sherlock Everywhere", "countries": ["us", "gb"], "why": "Sherlock Holmes, in depth."},
+    {"key": "poirot", "cat": "mystery", "title": "波罗咖啡馆", "author": "机核", "term": "波罗咖啡馆", "countries": ["tw", "us"], "lang": "zh", "why": "Chinese mystery chat, including Japanese writers."},
+    {"key": "planetmoney", "cat": "knowledge", "title": "Planet Money", "author": "NPR", "artist": "NPR", "term": "Planet Money", "feed": "https://feeds.npr.org/510289/podcast.xml", "countries": ["gb", "us"], "why": "Friendly stories about how money works."},
+    {"key": "indicator", "cat": "knowledge", "title": "The Indicator from Planet Money", "author": "NPR", "artist": "NPR", "term": "The Indicator from Planet Money", "feed": "https://feeds.npr.org/510325/podcast.xml", "countries": ["gb", "us"], "why": "Short daily economics."},
+    {"key": "econtalk", "cat": "knowledge", "title": "EconTalk", "author": "Russ Roberts", "term": "EconTalk", "countries": ["gb", "us"], "why": "Long, thoughtful conversations about economics."},
+    {"key": "oddlots", "cat": "knowledge", "title": "Odd Lots", "match": "Odd Lots", "author": "Bloomberg", "artist": "Bloomberg", "term": "Odd Lots Bloomberg", "countries": ["gb", "us"], "why": "Markets and finance with a curious streak."},
+    {"key": "mindscape", "cat": "knowledge", "title": "Sean Carroll’s Mindscape", "match": "Mindscape", "author": "Sean Carroll", "artist": "Sean Carroll", "term": "Sean Carroll Mindscape", "feed": "https://rss.art19.com/sean-carrolls-mindscape", "countries": ["gb", "us"], "why": "Physics and the big questions."},
+    {"key": "monkeycage", "cat": "knowledge", "title": "The Infinite Monkey Cage", "author": "BBC Radio 4", "artist": "BBC", "term": "The Infinite Monkey Cage", "feed": "https://podcasts.files.bbci.co.uk/b00snr0w.rss", "countries": ["gb"], "why": "Science with comedians."},
+    {"key": "radiolab", "cat": "knowledge", "title": "Radiolab", "author": "WNYC Studios", "artist": "WNYC", "term": "Radiolab", "countries": ["gb", "us"], "why": "Atmospheric science storytelling."},
+    {"key": "retronauts", "cat": "games", "title": "Retronauts", "author": "Retronauts", "term": "Retronauts", "countries": ["gb", "us"], "why": "Retro games, with plenty of Japanese game history."},
+    {"key": "vghh", "cat": "games", "title": "Video Game History Hour", "author": "Video Game History Foundation", "term": "Video Game History Hour", "countries": ["us", "gb"], "why": "Developers and historians, every other week."}
+  ],
+  "extras": [
+    {"key": "x-switchedonpop", "cat": "citypop", "title": "Switched On Pop", "artist": "Vox", "term": "Switched On Pop", "why": "How pop songs work, including a city pop episode."},
+    {"key": "x-strongsongs", "cat": "citypop", "title": "Strong Songs", "match": "Strong Songs", "artist": "Kirk Hamilton", "term": "Strong Songs Kirk Hamilton", "why": "One song per episode, taken apart with love."},
+    {"key": "x-anncast", "cat": "citypop", "title": "ANNCast", "match": "ANNCast", "term": "ANNCast Anime News Network", "why": "Anime industry talk, music included."},
+    {"key": "x-questlove", "cat": "jazz", "title": "Questlove Supreme", "term": "Questlove Supreme", "why": "Music history with the people who made it."},
+    {"key": "x-stickynotes", "cat": "jazz", "title": "Sticky Notes", "match": "Sticky Notes", "artist": "Joshua Weilerstein", "term": "Sticky Notes classical music podcast", "why": "A conductor explains classical pieces warmly."},
+    {"key": "x-desertisland", "cat": "jazz", "title": "Desert Island Discs", "artist": "BBC", "term": "Desert Island Discs", "countries": ["gb"], "why": "Lives told through eight favourite records."},
+    {"key": "x-waveform", "cat": "tech", "title": "Waveform: The MKBHD Podcast", "match": "Waveform", "term": "Waveform MKBHD", "why": "Gadget reviews and tech news with Marques Brownlee."},
+    {"key": "x-atp", "cat": "tech", "title": "Accidental Tech Podcast", "term": "Accidental Tech Podcast", "why": "Three developers on Apple and technology."},
+    {"key": "x-decoder", "cat": "tech", "title": "Decoder with Nilay Patel", "match": "Decoder", "artist": "The Verge", "term": "Decoder with Nilay Patel", "why": "Big ideas in tech, from The Verge."},
+    {"key": "x-bookreview", "cat": "lit", "title": "The Book Review", "match": "The Book Review", "artist": "New York Times", "term": "The Book Review New York Times", "why": "New books and the people who write them."},
+    {"key": "x-lrb", "cat": "lit", "title": "LRB Podcast", "artist": "London Review of Books", "term": "LRB Podcast", "countries": ["gb"], "why": "Essays and books from the London Review of Books."},
+    {"key": "x-ritan", "cat": "lit", "title": "日谈公园", "term": "日谈公园", "countries": ["tw", "us"], "lang": "zh", "why": "Chinese chat on anime, games, books and culture."},
+    {"key": "x-sherlockco", "cat": "mystery", "title": "Sherlock & Co.", "match": "Sherlock & Co", "term": "Sherlock & Co.", "why": "Sherlock Holmes reimagined as an audio drama."},
+    {"key": "x-magnus", "cat": "mystery", "title": "The Magnus Archives", "artist": "Rusty Quill", "term": "The Magnus Archives", "why": "A slow-burn horror mystery in audio."},
+    {"key": "x-nightvale", "cat": "mystery", "title": "Welcome to Night Vale", "term": "Welcome to Night Vale", "why": "Strange, gentle mystery fiction."},
+    {"key": "x-freakonomics", "cat": "knowledge", "title": "Freakonomics Radio", "term": "Freakonomics Radio", "why": "The hidden side of everything, through economics."},
+    {"key": "x-startalk", "cat": "knowledge", "title": "StarTalk Radio", "artist": "Neil deGrasse Tyson", "term": "StarTalk Radio", "why": "Astrophysics with Neil deGrasse Tyson."},
+    {"key": "x-coten", "cat": "knowledge", "title": "コテンラジオ", "match": "コテンラジオ", "term": "コテンラジオ", "countries": ["jp"], "lang": "ja", "why": "Japanese history told as long, lively stories."},
+    {"key": "x-besties", "cat": "games", "title": "The Besties", "match": "The Besties", "term": "The Besties podcast", "why": "Friends talking games, warmly and funnily."},
+    {"key": "x-insertcredit", "cat": "games", "title": "Insert Credit", "match": "Insert Credit", "term": "Insert Credit Show", "why": "Thoughtful game talk with industry veterans."},
+    {"key": "x-retrohour", "cat": "games", "title": "The Retro Hour", "term": "The Retro Hour", "why": "Interviews with the people who made classic games."}
+  ]
+}
+</script>
 
 <script>
 (() => {
 'use strict';
 
-/* ---------- helpers ---------- */
+/* ---------- basics ---------- */
 const $ = id => document.getElementById(id);
 const audio = $('audio');
+const view = $('view');
+const CATALOG = JSON.parse($('catalog').textContent);
+const CATS = CATALOG.categories;
+const CAT = Object.fromEntries(CATS.map(c => [c.id, c]));
+const PRESET = Object.fromEntries(CATALOG.presets.map(p => [p.key, p]));
 const reduceMotion = matchMedia('(prefers-reduced-motion: reduce)').matches;
-const isNarrow = () => matchMedia('(max-width: 859px)').matches;
+const VIA_HELPER = location.protocol === 'http:' || location.protocol === 'https:';
+const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 const store = {
   get(k, d) { try { const v = localStorage.getItem(k); return v == null ? d : JSON.parse(v); } catch { return d; } },
   set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); return true; } catch { return false; } },
   del(k) { try { localStorage.removeItem(k); } catch {} }
 };
+const idb = (() => {
+  let dbp = null;
+  const open = () => dbp || (dbp = new Promise((resolve, reject) => {
+    const r = indexedDB.open('afterhours', 1);
+    r.onupgradeneeded = () => r.result.createObjectStore('kv');
+    r.onsuccess = () => resolve(r.result);
+    r.onerror = () => reject(r.error);
+  }));
+  const run = async (mode, fn) => {
+    const db = await open();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction('kv', mode);
+      const req = fn(tx.objectStore('kv'));
+      tx.oncomplete = () => resolve(req ? req.result : undefined);
+      tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error);
+    });
+  };
+  return {
+    get: k => run('readonly', s => s.get(k)).catch(() => undefined),
+    set: (k, v) => run('readwrite', s => s.put(v, k)).catch(() => {}),
+    del: k => run('readwrite', s => s.delete(k)).catch(() => {})
+  };
+})();
 function fnv(str) { let h = 0x811c9dc5; for (let i = 0; i < str.length; i++) { h ^= str.charCodeAt(i); h = Math.imul(h, 0x01000193); } return (h >>> 0).toString(36); }
-const KEY = {
-  shows: 'ah.shows', settings: 'ah.settings', progress: 'ah.progress', last: 'ah.last',
-  cache: u => 'ah.cache.' + fnv(u), cap: id => 'ah.cap.' + fnv(id)
-};
+const norm = s => String(s || '').normalize('NFKC').toLowerCase().replace(/[\s\p{P}\p{S}]+/gu, '');
+const KEY = { library: 'ah.library', settings: 'ah.settings', progress: 'ah.progress', last: 'ah.last', recent: 'ah.recent', resolved: 'ah.resolved', dir: 'ah.dir', colors: 'ah.colors', cap: id => 'ah.cap.' + fnv(id) };
 
 function el(tag, props = {}, ...kids) {
   const n = document.createElement(tag);
@@ -708,25 +1097,28 @@ function el(tag, props = {}, ...kids) {
   for (const c of kids.flat()) if (c != null && c !== false) n.append(c);
   return n;
 }
+const SVGNS = 'http://www.w3.org/2000/svg';
 function icon(name) {
-  const s = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+  const s = document.createElementNS(SVGNS, 'svg');
   s.setAttribute('aria-hidden', 'true');
-  const u = document.createElementNS('http://www.w3.org/2000/svg', 'use');
+  const u = document.createElementNS(SVGNS, 'use');
   u.setAttribute('href', '#i-' + name);
   s.append(u);
   return s;
 }
 function setIcon(btn, name) { const u = btn && btn.querySelector('use'); if (u) u.setAttribute('href', '#i-' + name); }
-const firstChar = t => (Array.from((t || '').trim())[0] || '♪').toUpperCase();
-function cover(src, title, cls = 'cover') {
-  const wrap = el('span', { class: cls });
-  const fallback = () => { wrap.replaceChildren(el('span', { text: firstChar(title) })); wrap.classList.add('fallback'); };
+const firstChar = t => (Array.from(String(t || '').trim())[0] || '♪').toUpperCase();
+function art(src, title, opts = {}) {
+  const w = el('span', { class: 'art' + (opts.cls ? ' ' + opts.cls : '') + (opts.pending ? ' shimmer' : '') });
+  w.style.setProperty('--mh', parseInt(fnv(String(title || '?')), 36) % 360);
+  w.append(el('span', { class: 'mono', 'aria-hidden': 'true', text: firstChar(title) }));
   if (src) {
-    const img = el('img', { src, alt: '', loading: 'lazy', decoding: 'async' });
-    img.addEventListener('error', fallback, { once: true });
-    wrap.append(img);
-  } else fallback();
-  return wrap;
+    const img = el('img', { alt: '', decoding: 'async', loading: opts.eager ? 'eager' : 'lazy', src });
+    img.addEventListener('load', () => img.classList.add('ok'), { once: true });
+    img.addEventListener('error', () => img.remove(), { once: true });
+    w.append(img);
+  }
+  return w;
 }
 function fmtTime(s) {
   s = Math.max(0, Math.floor(s || 0));
@@ -742,11 +1134,16 @@ function fmtDur(s) {
 }
 const dShort = new Intl.DateTimeFormat(undefined, { day: 'numeric', month: 'short' });
 const dLong = new Intl.DateTimeFormat(undefined, { day: 'numeric', month: 'short', year: 'numeric' });
-const fmtDate = ms => !ms ? '' : (new Date(ms).getFullYear() === new Date().getFullYear() ? dShort : dLong).format(ms);
+function fmtDate(ms) {
+  if (!ms) return '';
+  const days = Math.floor((Date.now() - ms) / 864e5);
+  if (days >= 0 && days < 1 && new Date(ms).getDate() === new Date().getDate()) return 'Today';
+  if (days >= 0 && days < 7) return new Intl.DateTimeFormat(undefined, { weekday: 'long' }).format(ms);
+  return (new Date(ms).getFullYear() === new Date().getFullYear() ? dShort : dLong).format(ms);
+}
 const fmtSpeed = v => (Math.round(v * 100) / 100).toString() + '×';
 const clip = (s, n) => s.length > n ? s.slice(0, n).replace(/\s+\S*$/, '') + '…' : s;
 function abs(u, base) { if (!u) return ''; try { return new URL(u, base).href; } catch { return u; } }
-
 let toastTimer;
 function toast(msg, isError) {
   const t = $('toast');
@@ -754,28 +1151,41 @@ function toast(msg, isError) {
   t.classList.toggle('error', !!isError);
   t.classList.add('show');
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => t.classList.remove('show'), isError ? 6500 : 3200);
+  toastTimer = setTimeout(() => t.classList.remove('show'), isError ? 6000 : 3000);
 }
 
 /* ---------- state ---------- */
 const DEFAULTS = { speed: 1, volume: 1, muted: false, captions: true, autoNext: true, theme: 'system', sort: 'newest' };
 const settings = Object.assign({}, DEFAULTS, store.get(KEY.settings, {}));
-let shows = store.get(KEY.shows, []);
+const saveSettings = () => store.set(KEY.settings, settings);
+let library = store.get(KEY.library, null);
 let progress = store.get(KEY.progress, {});
+let recent = store.get(KEY.recent, []);
+const resolved = store.get(KEY.resolved, {});
+const transient = new Map();
+let route = { name: 'home', arg: '' };
 const S = {
-  showUrl: null, episodes: [], view: [], shown: 80, refreshing: null,
-  queue: [], current: null, pendingSeek: null,
-  cues: [], untimed: '', cueIdx: -2, capLoading: false, capError: '', activeCue: null,
-  dragging: false, lastSecond: -1, raf: 0, lastUserScroll: 0,
+  current: null, queue: [], pendingSeek: null,
+  cues: [], untimed: '', cueIdx: -2, capLoading: false, capError: '', activeLyric: null,
+  dragging: false, lastSecond: -1, raf: 0, lastUserScroll: 0, npOpen: false, lyricsOn: true,
   sleep: { mode: 'off', endsAt: 0, timer: 0, fadeBase: null }
 };
-const saveSettings = () => store.set(KEY.settings, settings);
-const saveShows = () => store.set(KEY.shows, shows);
-const currentShow = () => shows.find(s => s.feedUrl === S.showUrl) || null;
-const sortList = eps => settings.sort === 'oldest' ? [...eps].reverse() : [...eps];
+const saveLibrary = () => store.set(KEY.library, library);
+const showBySid = sid => library.find(s => s.sid === sid) || transient.get(sid) || null;
+const showByFeed = url => (url && library.find(s => s.feedUrl === url)) || null;
+const snap = s => ({ sid: s.sid, title: s.title, author: s.author || '', image: s.image || '', feedUrl: s.feedUrl, cat: s.cat });
 
-/* ---------- network (through the local helper, which avoids browser CORS limits) ---------- */
-const VIA_HELPER = location.protocol === 'http:' || location.protocol === 'https:';
+function seedLibrary() {
+  if (Array.isArray(library)) return;
+  library = CATALOG.presets.map(p => ({ sid: 'p-' + p.key, preset: p.key, cat: p.cat, title: p.title, author: p.author || '', image: '', feedUrl: '', status: 'pending', addedAt: Date.now() }));
+  for (const s of store.get('ah.shows', [])) {   // shows added in version 1
+    if (s.feedUrl && !library.some(x => x.feedUrl === s.feedUrl)) library.push({ sid: 'u-' + fnv(s.feedUrl), preset: null, cat: 'mine', title: s.title, author: s.author || '', image: s.image || '', feedUrl: s.feedUrl, status: 'ready', description: s.description || '', link: s.link || '', addedAt: s.addedAt || Date.now() });
+  }
+  try { for (const k of Object.keys(localStorage)) if (k.startsWith('ah.cache.')) localStorage.removeItem(k); } catch {}
+  saveLibrary();
+}
+
+/* ---------- network ---------- */
 function decodeBytes(buf, type) {
   const head = new TextDecoder('latin1').decode(new Uint8Array(buf, 0, Math.min(buf.byteLength, 300)));
   const xmlEnc = (head.match(/<\?xml[^>]*encoding=["']([^"']+)["']/i) || [])[1];
@@ -783,40 +1193,37 @@ function decodeBytes(buf, type) {
   const enc = (xmlEnc || httpEnc || 'utf-8').trim().toLowerCase();
   try { return new TextDecoder(enc).decode(buf); } catch { return new TextDecoder('utf-8').decode(buf); }
 }
+async function getJSON(path) {
+  let res;
+  try { res = await fetch(path, { cache: 'no-store' }); }
+  catch { const e = new Error('The player’s helper isn’t answering. Is afterhours.py still running?'); e.status = 0; throw e; }
+  let data = null;
+  try { data = await res.json(); } catch {}
+  if (!res.ok) { const e = new Error((data && data.error) || `Something went wrong (${res.status}).`); e.status = res.status; throw e; }
+  return data;
+}
 async function fetchText(url) {
   let res;
   try { res = await fetch(VIA_HELPER ? '/api/fetch?url=' + encodeURIComponent(url) : url, { cache: 'no-store' }); }
-  catch { throw new Error(VIA_HELPER ? 'The player’s helper isn’t answering. Is afterhours.py still running?' : 'The browser blocked that request. Open the player by running afterhours.py.'); }
-  if (!res.ok) {
-    let msg = '';
-    try { msg = (await res.json()).error || ''; } catch {}
-    throw new Error(msg || `The site answered with an error (${res.status}).`);
-  }
+  catch { throw new Error(VIA_HELPER ? 'The player’s helper isn’t answering. Is afterhours.py still running?' : 'Open the player by running afterhours.py.'); }
+  if (!res.ok) { let msg = ''; try { msg = (await res.json()).error || ''; } catch {} throw new Error(msg || `The site answered with an error (${res.status}).`); }
   const type = res.headers.get('Content-Type') || '';
   return { text: decodeBytes(await res.arrayBuffer(), type), type };
 }
+const feedInfo = url => getJSON('/api/feedinfo?url=' + encodeURIComponent(url));
 
 /* ---------- feed parsing ---------- */
-const NS = {
-  itunes: ['itunes.com'], podcast: ['podcastindex'], content: ['purl.org/rss/1.0/modules/content'],
-  media: ['search.yahoo.com/mrss'], dc: ['purl.org/dc/elements']
-};
+const NS = { itunes: ['itunes.com'], podcast: ['podcastindex'], content: ['purl.org/rss/1.0/modules/content'], media: ['search.yahoo.com/mrss'], dc: ['purl.org/dc/elements'] };
 function inNS(n, key) {
   if (!key) return !n.prefix;
   if ((n.prefix || '').toLowerCase() === key) return true;
   const uri = (n.namespaceURI || '').toLowerCase();
   return NS[key].some(s => uri.includes(s));
 }
-function kidsNamed(parent, local, ns) {
-  const out = [];
-  if (!parent) return out;
-  for (const n of parent.children) if (n.localName === local && inNS(n, ns)) out.push(n);
-  return out;
-}
+function kidsNamed(parent, local, ns) { const out = []; if (!parent) return out; for (const n of parent.children) if (n.localName === local && inNS(n, ns)) out.push(n); return out; }
 const kid = (p, local, ns) => kidsNamed(p, local, ns)[0] || null;
 const txt = n => n ? n.textContent.trim() : '';
 const attr = (n, a) => n ? (n.getAttribute(a) || '').trim() : '';
-
 const ENTITIES = { nbsp: 160, mdash: 8212, ndash: 8211, hellip: 8230, rsquo: 8217, lsquo: 8216, rdquo: 8221, ldquo: 8220, copy: 169, reg: 174, trade: 8482, middot: 183, bull: 8226, eacute: 233, egrave: 232, aacute: 225, agrave: 224, ccedil: 231, uuml: 252, ouml: 246, auml: 228, szlig: 223 };
 function parseXML(text) {
   const parser = new DOMParser();
@@ -864,10 +1271,7 @@ function parseFeed(text, feedUrl) {
   for (const item of kidsNamed(channel, 'item')) {
     const enc = kid(item, 'enclosure');
     let url = attr(enc, 'url'), type = attr(enc, 'type');
-    if (!url) {
-      const mc = kidsNamed(item, 'content', 'media').find(m => /audio|video/i.test(attr(m, 'type') + attr(m, 'medium')));
-      url = attr(mc, 'url'); type = attr(mc, 'type');
-    }
+    if (!url) { const mc = kidsNamed(item, 'content', 'media').find(m => /audio|video/i.test(attr(m, 'type') + attr(m, 'medium'))); url = attr(mc, 'url'); type = attr(mc, 'type'); }
     if (!url) continue;
     url = abs(url, feedUrl);
     const id = prefix + (txt(kid(item, 'guid')) || url);
@@ -881,23 +1285,16 @@ function parseFeed(text, feedUrl) {
       duration: parseDuration(txt(kid(item, 'duration', 'itunes'))),
       image: img && img !== showImage ? img : '',
       number: txt(kid(item, 'episode', 'itunes')),
-      desc: clip(htmlToText(txt(kid(item, 'encoded', 'content')) || txt(kid(item, 'description')) || txt(kid(item, 'summary', 'itunes'))), 2400),
-      transcripts: kidsNamed(item, 'transcript', 'podcast')
-        .map(t => ({ url: abs(attr(t, 'url'), feedUrl), type: attr(t, 'type').toLowerCase(), lang: attr(t, 'language') }))
-        .filter(t => t.url)
+      desc: clip(htmlToText(txt(kid(item, 'encoded', 'content')) || txt(kid(item, 'description')) || txt(kid(item, 'summary', 'itunes'))), 1600),
+      transcripts: kidsNamed(item, 'transcript', 'podcast').map(t => ({ url: abs(attr(t, 'url'), feedUrl), type: attr(t, 'type').toLowerCase(), lang: attr(t, 'language') })).filter(t => t.url)
     });
   }
   episodes.sort((a, b) => b.date - a.date);
   return { show, episodes };
 }
 
-/* ---------- captions and transcripts ---------- */
-function parseClock(s) {
-  const parts = String(s).trim().replace(',', '.').split(':');
-  let sec = 0;
-  for (const p of parts) sec = sec * 60 + parseFloat(p);
-  return sec;
-}
+/* ---------- captions ---------- */
+function parseClock(s) { let sec = 0; for (const p of String(s).trim().replace(',', '.').split(':')) sec = sec * 60 + parseFloat(p); return sec; }
 function parseCues(text) {
   const cues = [];
   for (const block of text.replace(/\r\n?/g, '\n').split(/\n{2,}/)) {
@@ -944,14 +1341,7 @@ function applyTranscript(text, type) {
 }
 function pickTranscript(list) {
   if (!list || !list.length) return null;
-  const score = t => {
-    const u = t.url.toLowerCase().split('?')[0], ty = t.type;
-    if (ty.includes('vtt') || u.endsWith('.vtt')) return 5;
-    if (ty.includes('srt') || ty.includes('subrip') || u.endsWith('.srt')) return 4;
-    if (ty.includes('json') || u.endsWith('.json')) return 3;
-    if (ty.includes('html') || u.endsWith('.html')) return 2;
-    return 1;
-  };
+  const score = t => { const u = t.url.toLowerCase().split('?')[0], ty = t.type; if (ty.includes('vtt') || u.endsWith('.vtt')) return 5; if (ty.includes('srt') || ty.includes('subrip') || u.endsWith('.srt')) return 4; if (ty.includes('json') || u.endsWith('.json')) return 3; if (ty.includes('html') || u.endsWith('.html')) return 2; return 1; };
   return [...list].sort((a, b) => score(b) - score(a))[0];
 }
 async function loadCaptions(ep) {
@@ -962,375 +1352,742 @@ async function loadCaptions(ep) {
     const t = pickTranscript(ep.transcripts);
     if (t) {
       S.capLoading = true;
-      renderTranscript(); renderCaption(true);
+      renderLyrics(); renderCaptions(true);
       try {
         const res = await fetchText(t.url);
         if (!S.current || S.current.ep.id !== ep.id) return;
         applyTranscript(res.text, t.type || res.type);
-      } catch {
-        if (S.current && S.current.ep.id === ep.id) S.capError = 'This episode’s captions couldn’t be loaded.';
-      }
+      } catch { if (S.current && S.current.ep.id === ep.id) S.capError = 'This episode’s captions couldn’t be loaded.'; }
       if (!S.current || S.current.ep.id !== ep.id) return;
       S.capLoading = false;
     }
   }
-  renderTranscript();
-  renderCaption(true);
+  renderLyrics();
+  renderCaptions(true);
 }
-function findCue(t) {
-  const c = S.cues;
-  let lo = 0, hi = c.length - 1, ans = -1;
-  while (lo <= hi) { const mid = (lo + hi) >> 1; if (c[mid].start <= t) { ans = mid; lo = mid + 1; } else hi = mid - 1; }
-  return ans;
-}
+function findCue(t) { const c = S.cues; let lo = 0, hi = c.length - 1, ans = -1; while (lo <= hi) { const mid = (lo + hi) >> 1; if (c[mid].start <= t) { ans = mid; lo = mid + 1; } else hi = mid - 1; } return ans; }
+const lyricsVisible = () => S.npOpen && S.lyricsOn;
 function captionHint() {
-  if (S.capLoading) return el('p', { class: 'hint', text: 'Loading captions…' });
-  const msg = S.capError || (S.untimed ? 'This transcript isn’t timed, so it appears in the transcript panel.' : 'No captions for this episode.');
-  return el('p', { class: 'hint' }, msg + ' ', S.untimed ? null : el('button', { class: 'text-btn light', type: 'button', text: 'Load a .vtt or .srt file', onclick: () => $('capFile').click() }));
+  if (S.capLoading) return 'Loading captions…';
+  return S.capError || (S.untimed ? 'This transcript isn’t timed. Open the transcript to read it.' : 'No captions for this episode.');
 }
-function renderCaption(force) {
-  const box = $('caption');
-  if (!S.current || !settings.captions) { box.hidden = true; return; }
-  box.hidden = false;
-  if (!S.cues.length) { if (force) box.replaceChildren(captionHint()); return; }
+function renderCaptions(force) {
   const t = S.pendingSeek != null ? S.pendingSeek : audio.currentTime;
-  const found = findCue(t);
-  let i = found;
-  if (i >= 0 && t > S.cues[i].end + 1.2) i = -1;
-  if (i === S.cueIdx && !force) return;
+  let i = -1;
+  if (S.cues.length) { i = findCue(t); if (i >= 0 && t > S.cues[i].end + 1.2) i = -1; }
+  const changed = i !== S.cueIdx;
+  if (!changed && !force) return;
   S.cueIdx = i;
   const cur = i >= 0 ? S.cues[i] : null;
-  const next = S.cues[(i >= 0 ? i : found) + 1];
-  box.replaceChildren(
-    cur && cur.speaker ? el('span', { class: 'speaker', text: cur.speaker }) : null,
-    el('p', { class: cur ? 'line' : 'line idle', text: cur ? cur.text : '…' }),
-    next ? el('p', { class: 'next', text: next.text }) : null
-  );
-  highlightCue(i);
+  const pill = $('capPill');
+  pill.hidden = !(settings.captions && S.current && cur && !S.npOpen);
+  if (cur) { $('capWho').textContent = cur.speaker || ''; $('capWho').hidden = !cur.speaker; $('capText').textContent = cur.text; }
+  const line = $('npCaption');
+  line.hidden = !settings.captions || lyricsVisible() || !S.current;
+  line.textContent = cur ? cur.text : (S.cues.length ? '' : captionHint());
+  highlightLyric(i);
 }
-function renderTranscript() {
-  const list = $('trList'), box = $('trText');
+function renderLyrics() {
+  const list = $('lyrics'), notes = $('npNotes');
   list.replaceChildren();
-  box.hidden = true;
-  S.activeCue = null;
-  if (S.cues.length) {
-    list.hidden = false;
+  S.activeLyric = null;
+  const has = S.cues.length > 0;
+  list.hidden = !has;
+  notes.hidden = has;
+  if (has) {
+    let prev = '';
     const frag = document.createDocumentFragment();
-    let prevSpeaker = '';
     S.cues.forEach((c, i) => {
-      const who = c.speaker && c.speaker !== prevSpeaker ? el('b', { text: c.speaker + '  ' }) : null;
-      prevSpeaker = c.speaker || prevSpeaker;
-      frag.append(el('li', { class: 'cue', dataset: { i } }, el('time', { text: fmtTime(c.start) }), el('span', {}, who, c.text)));
+      const who = c.speaker && c.speaker !== prev ? el('span', { class: 'who', text: c.speaker }) : null;
+      prev = c.speaker || prev;
+      frag.append(el('li', { class: 'lyric', dataset: { i } }, who, c.text));
     });
     list.append(frag);
-    $('trTitle').textContent = `Transcript, ${S.cues.length} lines`;
-  } else if (S.untimed) {
-    list.hidden = true;
-    box.hidden = false;
-    box.textContent = S.untimed;
-    $('trTitle').textContent = 'Transcript';
   } else {
-    list.hidden = false;
-    list.append(el('li', { class: 'cue-empty', text: !S.current ? 'Play an episode to see its transcript.' : S.capLoading ? 'Loading…' : 'No transcript for this episode. You can load your own caption file.' }));
-    $('trTitle').textContent = 'Transcript';
+    const c = S.current;
+    notes.replaceChildren(
+      el('h3', { text: S.untimed ? 'Transcript' : 'About this episode' }),
+      el('p', { class: 'notes-text', text: S.untimed || (c && c.ep.desc) || 'No notes for this episode.' }),
+      el('div', { class: 'notes-actions' }, S.capLoading ? el('p', { class: 'np-label', text: 'Loading captions…' }) :
+        el('button', { class: 'np-chip', type: 'button', onclick: () => $('capFile').click() }, icon('file'), el('span', { text: 'Load a caption file' })))
+    );
   }
-  if (S.cueIdx >= 0) highlightCue(S.cueIdx);
+  if (S.cueIdx >= 0) highlightLyric(S.cueIdx);
 }
-function highlightCue(i) {
-  if (S.activeCue) S.activeCue.classList.remove('active');
-  S.activeCue = null;
+function highlightLyric(i) {
+  if (S.activeLyric) S.activeLyric.classList.remove('active');
+  S.activeLyric = null;
   if (i < 0) return;
-  const li = $('trList').children[i];
-  if (!li || !li.classList.contains('cue')) return;
+  const li = $('lyrics').children[i];
+  if (!li) return;
   li.classList.add('active');
-  S.activeCue = li;
-  if (!$('transcript').hidden && Date.now() - S.lastUserScroll > 4000) {
-    const list = $('trList');
-    list.scrollTo({ top: li.offsetTop - list.clientHeight / 2 + li.clientHeight / 2, behavior: reduceMotion ? 'auto' : 'smooth' });
+  S.activeLyric = li;
+  if (lyricsVisible() && Date.now() - S.lastUserScroll > 3500) {
+    const box = $('lyrics');
+    box.scrollTo({ top: li.offsetTop - box.clientHeight * 0.36, behavior: reduceMotion ? 'auto' : 'smooth' });
   }
 }
 
-/* ---------- library ---------- */
-function cacheEpisodes(feedUrl, eps) {
-  const data = { fetchedAt: Date.now(), episodes: eps.slice(0, 500) };
-  if (store.set(KEY.cache(feedUrl), data)) return;
-  data.episodes = eps.slice(0, 120).map(e => Object.assign({}, e, { desc: clip(e.desc, 400) }));
-  if (store.set(KEY.cache(feedUrl), data)) return;
-  for (const s of shows) if (s.feedUrl !== feedUrl) store.del(KEY.cache(s.feedUrl));
-  store.set(KEY.cache(feedUrl), data);
+/* ---------- Apple Podcasts directory (paced by the helper) ---------- */
+const Q = { jobs: [], busy: false };
+function dirJob(fn, pri) { return new Promise((resolve, reject) => { Q.jobs.push({ fn, pri, resolve, reject }); Q.jobs.sort((a, b) => a.pri - b.pri); pumpQ(); }); }
+async function pumpQ() {
+  if (Q.busy) return;
+  const job = Q.jobs.shift();
+  if (!job) return;
+  Q.busy = true;
+  try { job.resolve(await job.fn()); } catch (e) { job.reject(e); } finally { Q.busy = false; pumpQ(); }
 }
-let busyCount = 0;
-function addLabel() {
-  $('addBtn').disabled = busyCount > 0;
-  $('addBtn').textContent = busyCount > 0 ? 'Loading…' : (looksLikeLink($('addInput').value.trim()) ? 'Add' : 'Search');
+const dirCache = store.get(KEY.dir, {});
+function dirCacheSet(k, r) {
+  dirCache[k] = { t: Date.now(), r };
+  const keys = Object.keys(dirCache);
+  if (keys.length > 300) keys.sort((a, b) => dirCache[a].t - dirCache[b].t).slice(0, keys.length - 250).forEach(x => delete dirCache[x]);
+  store.set(KEY.dir, dirCache);
 }
-function busy(on) {
-  busyCount = Math.max(0, busyCount + (on ? 1 : -1));
-  addLabel();
+const slim = it => ({ appleId: it.collectionId, title: it.collectionName || it.trackName || '', author: it.artistName || '', feedUrl: it.feedUrl || '', image: it.artworkUrl600 || it.artworkUrl100 || '', genre: it.primaryGenreName || '' });
+async function dirSearch(term, country = 'gb', pri = 5, limit = 20) {
+  const k = `s:${country}:${limit}:${term.toLowerCase()}`;
+  const hit = dirCache[k];
+  if (hit && Date.now() - hit.t < 7 * 864e5) return hit.r;
+  if (!VIA_HELPER) throw new Error('Search needs the player’s helper. Open the player by running afterhours.py.');
+  const data = await dirJob(() => getJSON(`/api/search?term=${encodeURIComponent(term)}&country=${country}&limit=${limit}`), pri);
+  const r = (data.results || []).filter(x => x.feedUrl).map(slim);
+  dirCacheSet(k, r);
+  return r;
 }
-async function subscribe(feedUrl, opts = {}) {
-  const existing = shows.find(s => s.feedUrl === feedUrl);
-  if (existing) { if (!opts.quiet) { selectShow(feedUrl); toast('That show is already in your library.'); } return true; }
-  busy(true);
-  try {
-    const { text } = await fetchText(feedUrl);
-    const parsed = parseFeed(text, feedUrl);
-    const show = Object.assign({ feedUrl, addedAt: Date.now() }, parsed.show);
-    if (!show.image && opts.image) show.image = opts.image;
-    shows.unshift(show);
-    saveShows();
-    cacheEpisodes(feedUrl, parsed.episodes);
-    if (opts.quiet) renderShows();
-    else { selectShow(feedUrl, { episodes: parsed.episodes }); toast(`Added ${show.title}.`); }
-    return true;
-  } catch (e) {
-    if (!opts.quiet) toast(`Couldn’t add that show. ${e.message}`, true);
-    return false;
-  } finally { busy(false); }
+async function dirLookup(ids, country = 'gb', pri = 3) {
+  const data = await dirJob(() => getJSON(`/api/lookup?id=${ids.join(',')}&country=${country}`), pri);
+  return (data.results || []).filter(x => x.feedUrl).map(slim);
 }
-function renderShows() {
-  const ul = $('shows');
-  ul.replaceChildren();
-  $('libraryEmpty').hidden = shows.length > 0;
-  for (const s of shows) {
-    ul.append(el('li', {}, el('button', {
-      class: 'show-btn', type: 'button', title: s.title,
-      'aria-current': s.feedUrl === S.showUrl ? 'true' : 'false',
-      onclick: () => selectShow(s.feedUrl)
-    }, cover(s.image, s.title), el('span', { class: 'show-text' }, el('span', { class: 'show-title', text: s.title }), el('span', { class: 'show-author', text: s.author || '' })))));
+const resolving = new Map();
+function titleOk(found, item) { const a = norm(found), b = norm(item.match || item.title); return !!a && !!b && (a.includes(b) || b.includes(a)); }
+function bestMatch(results, item) {
+  const want = norm(item.match || item.title), artist = norm(item.artist || '');
+  let best = null, top = 0;
+  for (const r of results) {
+    const t = norm(r.title), a = norm(r.author);
+    let sc = 0;
+    if (t === want) sc += 6;
+    else if (t.includes(want) || (want.includes(t) && t.length >= 4)) sc += 3;
+    if (artist) sc += a.includes(artist) ? 3 : (sc < 6 ? -2 : 0);
+    if (sc > top) { top = sc; best = r; }
   }
+  return top >= 3 ? best : null;
 }
-function selectShow(feedUrl, opts = {}) {
-  const changed = S.showUrl !== feedUrl;
-  S.showUrl = feedUrl;
-  if (changed) S.shown = 80;
-  const cached = store.get(KEY.cache(feedUrl), null);
-  S.episodes = opts.episodes || (cached && cached.episodes) || [];
-  store.set(KEY.last, Object.assign(store.get(KEY.last, {}), { showUrl: feedUrl }));
-  renderShows(); renderShowHead(); renderEpisodes();
-  if (changed) { $('episodes').scrollTop = 0; if (isNarrow()) $('showHead').scrollIntoView({ block: 'start' }); }
-  if (!opts.episodes && (!cached || Date.now() - cached.fetchedAt > 30 * 60 * 1000)) refreshShow(feedUrl, true);
+function resolveItem(item, pri = 5) {
+  if (resolved[item.key]) return Promise.resolve(resolved[item.key]);
+  if (resolving.has(item.key)) return resolving.get(item.key);
+  const p = (async () => {
+    let r = null;
+    const countries = item.countries || ['gb', 'us'];
+    if (item.id) { try { r = (await dirLookup([item.id], countries[0], pri))[0] || null; } catch (e) { if (e.status === 429) throw e; } }
+    if (!r && item.feed && VIA_HELPER) { try { const info = await feedInfo(item.feed); if (info && titleOk(info.title, item)) r = { title: info.title, author: info.author || '', feedUrl: item.feed, image: info.image || '', genre: '' }; } catch {} }
+    if (!r) for (const c of countries) { r = bestMatch(await dirSearch(item.term || item.title, c, pri, 10), item); if (r) break; }
+    if (r) { resolved[item.key] = r; store.set(KEY.resolved, resolved); }
+    return r;
+  })();
+  resolving.set(item.key, p);
+  p.then(() => resolving.delete(item.key), () => resolving.delete(item.key));
+  return p;
 }
-async function refreshShow(feedUrl, quiet) {
-  S.refreshing = feedUrl;
-  $('refreshBtn').classList.add('spin');
-  if (!S.episodes.length) renderEpisodes();
+
+/* ---------- first-run setup: find feeds for the pre-added shows ---------- */
+const Setup = { running: false, msg: '' };
+function setupCounts() { const ps = library.filter(s => s.preset); return { total: ps.length, done: ps.filter(s => s.status !== 'pending').length }; }
+async function runSetup() {
+  if (Setup.running || !VIA_HELPER) return;
+  const pending = library.filter(s => s.status === 'pending' && s.preset);
+  if (!pending.length) return;
+  Setup.running = true;
+  updateSetupUI();
   try {
-    const { text } = await fetchText(feedUrl);
-    const { show: meta, episodes } = parseFeed(text, feedUrl);
-    const s = shows.find(x => x.feedUrl === feedUrl);
-    if (s) { Object.assign(s, { title: meta.title, author: meta.author, image: meta.image || s.image, description: meta.description, link: meta.link }); saveShows(); }
-    cacheEpisodes(feedUrl, episodes);
-    if (S.showUrl === feedUrl) { S.episodes = episodes; renderShows(); renderShowHead(); renderEpisodes(); }
-    if (!quiet) toast('This show is up to date.');
-  } catch (e) {
-    toast(`Couldn’t refresh. ${e.message}`, true);
-  } finally {
-    if (S.refreshing === feedUrl) S.refreshing = null;
-    $('refreshBtn').classList.remove('spin');
-    if (S.showUrl === feedUrl && !S.episodes.length) renderEpisodes();
+    const withId = pending.filter(s => !resolved[s.preset] && PRESET[s.preset] && PRESET[s.preset].id);
+    if (withId.length) {
+      try {
+        for (const r of await dirLookup(withId.map(s => PRESET[s.preset].id), 'gb', 2)) {
+          const s = withId.find(x => String(PRESET[x.preset].id) === String(r.appleId));
+          if (s) resolved[s.preset] = r;
+        }
+        store.set(KEY.resolved, resolved);
+      } catch {}
+    }
+    for (const s of pending) {
+      if (s.status !== 'pending' || !library.includes(s)) continue;
+      let r = null;
+      for (let attempt = 0; attempt < 3; attempt++) {
+        try { r = await resolveItem(PRESET[s.preset], 2); break; }
+        catch (e) {
+          if (e.status === 429) { Setup.msg = 'Apple’s directory asked for a short pause. Carrying on in a moment…'; updateSetupUI(); await sleep(30000); Setup.msg = ''; continue; }
+          break;
+        }
+      }
+      applyResolved(s, r);
+      updateSetupUI();
+    }
+  } finally { Setup.running = false; updateSetupUI(); }
+  refreshAllFeeds();
+}
+function applyResolved(s, r) {
+  if (r && r.feedUrl) {
+    if (library.some(x => x !== s && x.feedUrl === r.feedUrl)) { library = library.filter(x => x !== s); saveLibrary(); renderSidebar(); return; }
+    Object.assign(s, { feedUrl: r.feedUrl, author: r.author || s.author, image: r.image || s.image, appleId: r.appleId || null, genre: r.genre || '', status: 'ready' });
+  } else s.status = 'missing';
+  saveLibrary();
+  renderSidebar();
+  for (const n of view.querySelectorAll(`.tile[data-sid="${s.sid}"]`)) n.replaceWith(showTile(s));
+}
+function updateSetupUI() {
+  const { total, done } = setupCounts();
+  const active = Setup.running && done < total;
+  const sp = $('sideProgress');
+  sp.hidden = !active;
+  sp.textContent = active ? `${done} of ${total}` : '';
+  const b = $('setupBanner');
+  if (!b) return;
+  if (!active) { b.replaceChildren(); return; }
+  b.replaceChildren(el('div', { class: 'banner' },
+    el('div', { class: 'banner-text' }, el('strong', { text: 'Setting up your shelf' }), el('span', { text: Setup.msg || `Finding the ${total} shows from your poster. ${done} of ${total} ready. Apple’s directory is queried gently, so this takes about a minute the first time.` })),
+    el('div', { class: 'meter', role: 'progressbar', 'aria-valuemin': '0', 'aria-valuemax': String(total), 'aria-valuenow': String(done) }, el('i', { style: `width:${Math.round(done / Math.max(1, total) * 100)}%` }))));
+}
+
+/* ---------- feeds (cached in IndexedDB) ---------- */
+const Feeds = {
+  inflight: new Map(),
+  async cached(show) { if (!show || !show.feedUrl) return null; return (await idb.get('eps:' + show.feedUrl)) || null; },
+  refresh(show) {
+    const url = show.feedUrl;
+    if (this.inflight.has(url)) return this.inflight.get(url);
+    const p = (async () => {
+      const { text } = await fetchText(url);
+      const parsed = parseFeed(text, url);
+      noteFeedMeta(show, parsed.show);
+      const eps = parsed.episodes.slice(0, 300);
+      await idb.set('eps:' + url, { t: Date.now(), eps });
+      return eps;
+    })();
+    this.inflight.set(url, p);
+    p.then(() => this.inflight.delete(url), () => this.inflight.delete(url));
+    return p;
   }
+};
+function noteFeedMeta(show, meta) {
+  const s = showByFeed(show.feedUrl) || transient.get(show.sid);
+  if (!s) return;
+  let changed = false;
+  for (const [k, v] of [['image', meta.image], ['author', meta.author]]) if (!s[k] && v) { s[k] = v; changed = true; }
+  for (const [k, v] of [['description', meta.description], ['link', meta.link]]) if (v && s[k] !== v) { s[k] = v; changed = true; }
+  if (changed && library.includes(s)) saveLibrary();
 }
-function renderShowHead() {
-  const show = currentShow();
-  $('welcome').hidden = !!show;
-  $('showHead').hidden = !show;
-  if (!show) { $('episodeList').replaceChildren(); $('listStatus').hidden = true; return; }
-  $('showCover').replaceChildren(cover(show.image, show.title, 'cover big'));
-  $('showTitle').textContent = show.title;
-  $('showAuthor').textContent = show.author || '';
-  $('showAbout').textContent = show.description || '';
-  $('sortBtn').querySelector('span').textContent = settings.sort === 'oldest' ? 'Oldest first' : 'Newest first';
-  const site = $('siteLink');
-  site.hidden = !/^https?:\/\//i.test(show.link || '');
-  if (!site.hidden) site.href = show.link;
+async function pool(items, n, fn) {
+  const q = [...items];
+  await Promise.all(Array.from({ length: Math.min(n, q.length) }, async () => { while (q.length) { const it = q.shift(); try { await fn(it); } catch {} } }));
 }
-function stateText(pr) {
-  if (!pr) return '';
-  if (pr.done) return 'Played';
-  if (pr.p > 30 && pr.d) return `${fmtDur(pr.d - pr.p)} left`;
-  return '';
+let refreshingAll = false, latestTimer = 0;
+async function refreshAllFeeds() {
+  if (refreshingAll || !VIA_HELPER) return;
+  refreshingAll = true;
+  try {
+    const stale = [];
+    for (const s of library.filter(x => x.status === 'ready' && x.feedUrl)) { const c = await Feeds.cached(s); if (!c || Date.now() - c.t > 6 * 3600e3) stale.push(s); }
+    let done = 0;
+    if (stale.length) feedStatus(`Checking ${stale.length} shows for new episodes…`);
+    await pool(stale, 3, async s => { try { await Feeds.refresh(s); } finally { done++; feedStatus(`Checking for new episodes… ${done} of ${stale.length}`); scheduleLatest(); } });
+    feedStatus('');
+  } finally { refreshingAll = false; scheduleLatest(); }
 }
-function setBar(bar, pr) {
-  const pct = pr && !pr.done && pr.d ? Math.min(100, pr.p / pr.d * 100) : 0;
-  bar.style.width = pct + '%';
-  bar.hidden = pct < 0.5;
+function feedStatus(t) { const n = $('feedStatus'); if (n) n.textContent = t; }
+function scheduleLatest() { clearTimeout(latestTimer); latestTimer = setTimeout(() => { if (route.name === 'home') fillLatest(); }, 500); }
+
+/* ---------- colour from artwork ---------- */
+const colors = store.get(KEY.colors, {});
+function rgbToHsl(r, g, b) {
+  r /= 255; g /= 255; b /= 255;
+  const max = Math.max(r, g, b), min = Math.min(r, g, b), l = (max + min) / 2;
+  if (max === min) return [0, 0, l];
+  const d = max - min, s = l > .5 ? d / (2 - max - min) : d / (max + min);
+  const h = max === r ? (g - b) / d + (g < b ? 6 : 0) : max === g ? (b - r) / d + 2 : (r - g) / d + 4;
+  return [h * 60, s, l];
 }
-function episodeRow(ep, i) {
-  const pr = progress[ep.id];
-  const li = el('li', { class: 'ep', dataset: { id: ep.id, i, done: pr && pr.done ? 'true' : 'false' } });
-  const bar = el('span', { class: 'ep-bar', 'aria-hidden': 'true' });
-  setBar(bar, pr);
-  li.append(
-    el('button', { class: 'ep-play', type: 'button', 'aria-label': `Play ${ep.title}` }, icon('play')),
-    el('div', { class: 'ep-body' },
-      el('h3', { class: 'ep-title', text: ep.title }),
-      el('p', { class: 'ep-meta' },
-        el('span', { text: fmtDate(ep.date) }),
-        el('span', { text: ep.number ? `Episode ${ep.number}` : '' }),
-        el('span', { text: fmtDur(ep.duration) }),
-        ep.transcripts && ep.transcripts.length ? el('span', { class: 'badge', title: 'Has captions', text: 'CC' }) : null,
-        el('span', { class: 'ep-state', text: stateText(pr) })
-      ),
-      ep.desc ? el('p', { class: 'ep-desc', text: ep.desc }) : null,
-      ep.desc && ep.desc.length > 150 ? el('button', { class: 'text-btn ep-more', type: 'button', 'aria-expanded': 'false', text: 'More' }) : null
-    ),
-    bar
-  );
+function vibrant(d) {
+  const buckets = new Map();
+  for (let i = 0; i < d.length; i += 4) {
+    if (d[i + 3] < 200) continue;
+    const [h, s, l] = rgbToHsl(d[i], d[i + 1], d[i + 2]);
+    if (l < .12 || l > .92 || s < .12) continue;
+    const k = Math.round(h / 24) % 15;
+    const b = buckets.get(k) || { n: 0, h: 0, s: 0, l: 0 };
+    b.n++; b.h += h; b.s += s; b.l += l;
+    buckets.set(k, b);
+  }
+  let best = null, top = -1;
+  for (const b of buckets.values()) {
+    const s = b.s / b.n, l = b.l / b.n, score = b.n * (.35 + s) * (1 - Math.abs(l - .5));
+    if (score > top) { top = score; best = { h: Math.round(b.h / b.n), s: Math.round(s * 100), l: Math.round(l * 100) }; }
+  }
+  return best;
+}
+const smallArt = u => u.replace(/\/\d+x\d+(bb|cc|sr)?\.(jpg|jpeg|png|webp)(\?.*)?$/i, '/120x120bb.$2');
+function artColor(url) {
+  if (!url || !VIA_HELPER) return Promise.resolve(null);
+  if (colors[url]) return Promise.resolve(colors[url]);
+  return new Promise(resolve => {
+    const img = new Image();
+    img.onload = () => {
+      try {
+        const c = document.createElement('canvas');
+        c.width = c.height = 24;
+        const g = c.getContext('2d', { willReadFrequently: true });
+        g.drawImage(img, 0, 0, 24, 24);
+        const hsl = vibrant(g.getImageData(0, 0, 24, 24).data);
+        if (hsl) { colors[url] = hsl; const keys = Object.keys(colors); if (keys.length > 400) delete colors[keys[0]]; store.set(KEY.colors, colors); }
+        resolve(hsl);
+      } catch { resolve(null); }
+    };
+    img.onerror = () => resolve(null);
+    img.src = '/api/image?url=' + encodeURIComponent(smallArt(url));
+  });
+}
+function applyTint(node, hsl) {
+  if (!node || !hsl) return;
+  node.style.setProperty('--th', hsl.h);
+  node.style.setProperty('--ts', Math.max(38, Math.min(82, hsl.s)) + '%');
+  node.style.setProperty('--tl', Math.max(42, Math.min(60, hsl.l)) + '%');
+}
+
+/* ---------- building blocks ---------- */
+function pageHead(title, sub, extra) { return el('header', { class: 'page-head' }, el('div', {}, el('h1', { class: 'page-title', text: title }), sub ? el('p', { class: 'page-sub', text: sub }) : null), extra || null); }
+function section(title, sub, body, opts = {}) {
+  const tools = el('div', { class: 'section-tools' });
+  if (opts.link) tools.append(el('a', { class: 'see-all', href: opts.link[1], text: opts.link[0] }));
+  if (body.classList.contains('row')) {
+    const by = dir => () => body.scrollBy({ left: dir * body.clientWidth * 0.9, behavior: reduceMotion ? 'auto' : 'smooth' });
+    tools.append(el('button', { class: 'row-nav', type: 'button', 'aria-label': `Scroll ${title} left`, onclick: by(-1) }, icon('chevleft')), el('button', { class: 'row-nav', type: 'button', 'aria-label': `Scroll ${title} right`, onclick: by(1) }, icon('chevright')));
+  }
+  return el('section', { class: 'section' }, el('div', { class: 'section-head' }, el('div', {}, el('h2', { class: 'section-title', text: title }), sub ? el('p', { class: 'section-sub', text: sub }) : null), tools), body);
+}
+const skeletonCards = n => Array.from({ length: n }, () => el('div', { class: 'card skeleton', 'aria-hidden': 'true' }, el('span', { class: 'art shimmer' }), el('span', { class: 'sk' }), el('span', { class: 'sk short' })));
+const skeletonRows = n => Array.from({ length: n }, () => el('li', { class: 'sk-row', 'aria-hidden': 'true' }));
+function emptyState(title, text, label, href) { return el('div', { class: 'empty' }, el('h2', { text: title }), el('p', { text }), label ? el('a', { class: 'btn primary', href, text: label }) : null); }
+function iconBtn(name, label, fn) { const b = el('button', { class: 'icon-round', type: 'button', 'aria-label': label, title: label }, icon(name)); b.addEventListener('click', () => fn(b)); return b; }
+function eq() { return el('span', { class: 'eq', 'aria-hidden': 'true' }, el('i'), el('i'), el('i')); }
+const playingFeed = () => S.current ? S.current.show.feedUrl : null;
+
+/* candidates: shows that could be added (curated picks or directory results) */
+function candFromItem(item) {
+  const r = resolved[item.key];
+  return { key: item.key, item, title: item.title, author: (r && r.author) || item.author || '', why: item.why || '', image: (r && r.image) || '', feedUrl: (r && r.feedUrl) || '', appleId: r && r.appleId, genre: r && r.genre, cat: item.cat, preset: PRESET[item.key] ? item.key : null };
+}
+const candFromResult = (r, cat) => ({ key: 'f-' + fnv(r.feedUrl), title: r.title, author: r.author, why: r.genre || '', image: r.image, feedUrl: r.feedUrl, appleId: r.appleId, genre: r.genre, cat: cat || 'mine', preset: null });
+const candFromShow = s => ({ key: 'l-' + s.sid, title: s.title, author: s.author, why: '', image: s.image, feedUrl: s.feedUrl, cat: s.cat, preset: s.preset, sid: s.sid });
+const libFor = c => (c.feedUrl && showByFeed(c.feedUrl)) || (c.preset && library.find(s => s.preset === c.preset)) || null;
+async function ensureFeed(c, pri) {
+  if (c.feedUrl) return true;
+  if (!c.item) return false;
+  try {
+    const r = await resolveItem(c.item, pri);
+    if (r && r.feedUrl) { Object.assign(c, { feedUrl: r.feedUrl, image: r.image || c.image, author: r.author || c.author, appleId: r.appleId, genre: r.genre }); return true; }
+  } catch (e) { if (e.status === 429) toast(e.message, true); }
+  return false;
+}
+let io = null;
+function observe(node) {
+  if (!('IntersectionObserver' in window)) { const f = node._resolve; node._resolve = null; if (f) f(); return; }
+  if (!io) io = new IntersectionObserver(entries => {
+    for (const e of entries) if (e.isIntersecting) { io.unobserve(e.target); const f = e.target._resolve; e.target._resolve = null; if (f) f(); }
+  }, { root: $('main'), rootMargin: '160px' });
+  io.observe(node);
+}
+function card(c) {
+  const node = el('div', { class: 'card', dataset: { key: c.key } });
+  const body = el('button', { class: 'card-body', type: 'button', 'aria-label': `Open ${c.title}` },
+    art(c.image, c.title, { pending: !!c.item && !c.feedUrl && !c.failed }),
+    el('span', { class: 'card-title', text: c.title }),
+    el('span', { class: 'card-sub', text: c.author || '\u00a0' }),
+    c.why ? el('span', { class: 'card-why', text: c.why }) : null);
+  body.addEventListener('click', () => openCandidate(c));
+  const add = el('button', { class: 'add-btn', type: 'button' });
+  const sync = () => {
+    const has = !!libFor(c);
+    add.classList.toggle('added', has);
+    add.replaceChildren(icon(has ? 'check' : 'plus'));
+    add.setAttribute('aria-label', has ? `${c.title} is in your library` : `Add ${c.title} to your library`);
+    add.title = has ? 'In your library' : 'Add to library';
+  };
+  sync();
+  node._sync = sync;
+  add.addEventListener('click', async e => {
+    e.stopPropagation();
+    const lib = libFor(c);
+    if (lib) { go('show/' + lib.sid); return; }
+    add.classList.add('busy');
+    const ok = await ensureFeed(c, 1);
+    add.classList.remove('busy');
+    if (!ok) { toast(`Couldn’t find a public feed for ${c.title}.`, true); return; }
+    addShow(c);
+  });
+  node.append(body, add);
+  if (c.item && !c.feedUrl && !c.failed) {
+    node._resolve = () => ensureFeed(c, 5).then(ok => {
+      if (!node.isConnected) return;
+      if (ok) node.replaceWith(card(c));
+      else { c.failed = true; node.classList.add('unavailable'); const a = node.querySelector('.art'); if (a) a.classList.remove('shimmer'); }
+    });
+    observe(node);
+  }
+  return node;
+}
+const cardRow = cands => el('div', { class: 'row' }, cands.map(card));
+async function openCandidate(c) {
+  const lib = libFor(c);
+  if (lib) { go('show/' + lib.sid); return; }
+  if (!(await ensureFeed(c, 1))) { toast(`Couldn’t find a public feed for ${c.title}.`, true); return; }
+  const again = libFor(c);
+  if (again) { go('show/' + again.sid); return; }
+  const sid = 't-' + fnv(c.feedUrl);
+  transient.set(sid, { sid, preset: c.preset, cat: c.cat || 'mine', title: c.title, author: c.author, image: c.image, feedUrl: c.feedUrl, status: 'ready', appleId: c.appleId, genre: c.genre, why: c.why, transient: true });
+  go('show/' + sid);
+}
+function addShow(c, quiet) {
+  const existing = libFor(c);
+  if (existing) return existing;
+  const sidWanted = c.preset ? 'p-' + c.preset : 'u-' + fnv(c.feedUrl);
+  const s = { sid: library.some(x => x.sid === sidWanted) ? 'u-' + fnv(c.feedUrl) : sidWanted, preset: c.preset || null, cat: c.cat || 'mine', title: c.title, author: c.author || '', image: c.image || '', feedUrl: c.feedUrl, status: 'ready', appleId: c.appleId || null, genre: c.genre || '', description: c.description || '', link: c.link || '', addedAt: Date.now() };
+  library.push(s);
+  saveLibrary();
+  renderSidebar();
+  for (const n of document.querySelectorAll('.card')) if (n._sync) n._sync();
+  if (!quiet) toast(`Added ${s.title} to your library.`);
+  return s;
+}
+function removeShow(s) {
+  if (!confirm(`Remove “${s.title}” from your library?`)) return;
+  library = library.filter(x => x !== s);
+  saveLibrary();
+  idb.del('eps:' + s.feedUrl);
+  renderSidebar();
+  toast(`Removed ${s.title}.`);
+  go('library');
+}
+function showTile(s) {
+  const status = s.status === 'missing' ? 'Not found automatically' : s.status === 'pending' ? 'Finding feed…' : (s.author || '');
+  const t = el('div', { class: 'tile' + (s.status === 'missing' ? ' missing' : ''), dataset: { sid: s.sid } },
+    el('a', { class: 'tile-link', href: '#/show/' + s.sid }, art(s.image, s.title, { pending: s.status === 'pending' }), el('span', { class: 'card-title', text: s.title }), el('span', { class: 'card-sub', text: status })));
+  if (s.feedUrl && s.feedUrl === playingFeed()) t.append(el('span', { class: 'tile-eq' }, eq()));
+  return t;
+}
+
+/* episodes */
+function playFrom(ep, show, queue) {
+  if (S.current && S.current.ep.id === ep.id) { togglePlay(); return; }
+  loadEpisode(ep, show, queue, true);
+}
+function paintPill(p) {
+  const ep = p._ep, pr = progress[ep.id], isCur = !!(S.current && S.current.ep.id === ep.id), playing = isCur && !audio.paused;
+  p.className = 'pill' + (isCur ? ' current' : pr && pr.done ? ' done' : '');
+  const kids = [];
+  if (playing) { kids.push(eq(), el('span', { text: 'Playing' })); p.setAttribute('aria-label', `Pause ${ep.title}`); }
+  else if (pr && pr.done && !isCur) { kids.push(icon('check'), el('span', { text: 'Played' })); p.setAttribute('aria-label', `Play ${ep.title} again`); }
+  else {
+    kids.push(icon('play'));
+    const left = pr && pr.p > 30 && pr.d ? pr.d - pr.p : 0;
+    if (left) kids.push(el('span', { text: `${fmtDur(left)} left` }), el('span', { class: 'pill-prog' }, el('i', { style: `width:${Math.min(100, pr.p / pr.d * 100)}%` })));
+    else kids.push(el('span', { text: isCur ? 'Resume' : (fmtDur(ep.duration) || 'Play') }));
+    p.setAttribute('aria-label', `Play ${ep.title}`);
+  }
+  p.replaceChildren(...kids);
+}
+function paintAllPills() { for (const p of document.querySelectorAll('.pill')) if (p._ep) paintPill(p); }
+function episodeRow(ep, show, queue, opts = {}) {
+  const li = el('li', { class: 'ep' + (opts.rich ? ' rich' : ''), dataset: { id: ep.id } });
+  const pill = el('button', { class: 'pill', type: 'button' });
+  pill._ep = ep;
+  paintPill(pill);
+  pill.addEventListener('click', e => { e.stopPropagation(); playFrom(ep, show, queue); });
+  const more = ep.desc && ep.desc.length > 180 ? el('button', { class: 'link-btn', type: 'button', text: 'More' }) : null;
+  if (more) more.addEventListener('click', e => { e.stopPropagation(); more.textContent = li.classList.toggle('open') ? 'Less' : 'More'; });
+  if (opts.rich) li.append(art(ep.image || show.image, show.title, { cls: 'ep-art' }));
+  li.append(el('div', { class: 'ep-body' },
+    el('p', { class: 'ep-date' },
+      opts.rich ? el('a', { class: 'ep-show', href: '#/show/' + ((showByFeed(show.feedUrl) || show).sid), text: show.title }) : null,
+      el('span', { text: fmtDate(ep.date) }),
+      ep.number && !opts.rich ? el('span', { text: `Episode ${ep.number}` }) : null),
+    el('h3', { class: 'ep-title', text: ep.title }),
+    ep.desc ? el('p', { class: 'ep-desc', text: ep.desc }) : null,
+    el('div', { class: 'ep-actions' }, pill, ep.transcripts && ep.transcripts.length ? el('span', { class: 'badge', title: 'Captions available', text: 'CC' }) : null, more)));
+  li.addEventListener('click', e => { if (e.target.closest('a, button') || String(getSelection())) return; playFrom(ep, show, queue); });
   return li;
 }
-function renderEpisodes() {
-  const ol = $('episodeList');
-  ol.replaceChildren();
-  const show = currentShow();
-  if (!show) return;
-  S.view = sortList(S.episodes);
-  const status = $('listStatus');
-  if (!S.view.length) {
-    status.hidden = false;
-    status.textContent = S.refreshing === show.feedUrl ? 'Loading episodes…' : 'This feed has no playable episodes.';
-    return;
-  }
-  status.hidden = true;
-  appendRows(0, Math.min(S.view.length, S.shown));
-}
-function appendRows(from, to) {
-  const ol = $('episodeList');
-  const frag = document.createDocumentFragment();
-  for (let i = from; i < to; i++) frag.append(episodeRow(S.view[i], i));
-  const more = ol.querySelector('.more-row');
-  if (more) more.remove();
-  ol.append(frag);
-  if (to < S.view.length) {
-    const left = S.view.length - to;
-    ol.append(el('li', { class: 'more-row' }, el('button', {
-      class: 'pill', type: 'button', text: `Show ${Math.min(80, left)} more of ${left}`,
-      onclick: () => { S.shown = to + 80; appendRows(to, Math.min(S.view.length, S.shown)); }
-    })));
-  }
-  markPlayingRow();
-}
-function markPlayingRow() {
-  const id = S.current && S.current.ep.id;
-  const playing = !audio.paused;
-  for (const li of $('episodeList').children) {
-    if (!li.dataset.id) continue;
-    const on = li.dataset.id === id;
-    li.dataset.current = on ? 'true' : 'false';
-    const b = li.querySelector('.ep-play');
-    setIcon(b, on && playing ? 'pause' : 'play');
-    b.setAttribute('aria-label', `${on && playing ? 'Pause' : 'Play'} ${li.querySelector('.ep-title').textContent}`);
-  }
-}
-function updateRow(id) {
-  for (const li of $('episodeList').children) {
-    if (li.dataset.id !== id) continue;
-    const pr = progress[id];
-    li.dataset.done = pr && pr.done ? 'true' : 'false';
-    li.querySelector('.ep-state').textContent = stateText(pr);
-    setBar(li.querySelector('.ep-bar'), pr);
-  }
+function upNextCard(r, queue) {
+  const pr = progress[r.ep.id];
+  const pct = pr && pr.d ? Math.min(100, pr.p / pr.d * 100) : 0;
+  const b = el('button', { class: 'up-card', type: 'button', 'aria-label': `Resume ${r.ep.title}` },
+    art(r.ep.image || r.show.image, r.show.title, { cls: 'up-art' }),
+    el('span', { class: 'up-text' }, el('span', { class: 'up-show', text: r.show.title }), el('span', { class: 'up-title', text: r.ep.title }),
+      el('span', { class: 'up-left' }, el('span', { class: 'pill-prog' }, el('i', { style: `width:${pct}%` })), el('span', { text: pr && pr.d ? `${fmtDur(pr.d - pr.p)} left` : fmtDur(r.ep.duration) }))));
+  b.addEventListener('click', () => playFrom(r.ep, r.show, queue));
+  return b;
 }
 
-/* ---------- search ---------- */
-const looksLikeLink = v => /^(https?|feed|pcast|podcast|itpc):\/\//i.test(v) || /^www\./i.test(v) || /podcasts\.apple\.com/i.test(v) || /\.(xml|rss)(\?|$)/i.test(v);
-async function searchPodcasts(term) {
+/* ---------- routing ---------- */
+function parseRoute() { const h = location.hash.replace(/^#\/?/, ''); const [name, ...rest] = h.split('/'); return { name: name || 'home', arg: decodeURIComponent(rest.join('/')) }; }
+function go(path) { if (location.hash === '#/' + path) render(); else location.hash = '#/' + path; }
+function render() {
+  route = parseRoute();
+  closeSpeed();
+  if (S.npOpen) closeNp();
+  view.replaceChildren();
+  view.style.animation = 'none'; void view.offsetWidth; view.style.animation = '';
+  const fn = { home: renderHome, discover: renderDiscover, library: renderLibrary, show: renderShow, search: renderSearch }[route.name] || renderHome;
+  fn(route.arg);
+  $('main').scrollTop = 0;
+  markNav();
+}
+function markNav() {
+  const top = route.name === 'show' ? '' : route.name;
+  for (const a of document.querySelectorAll('[data-route]')) a.setAttribute('aria-current', a.dataset.route === top ? 'page' : 'false');
+  renderSidebar();
+}
+function renderSidebar() {
+  const ul = $('sideShows');
+  const cur = route.name === 'show' ? route.arg : null;
+  const playing = playingFeed();
+  ul.replaceChildren(...library.map(s => el('li', {}, el('a', { href: '#/show/' + s.sid, 'aria-current': s.sid === cur ? 'page' : null, class: s.status !== 'ready' ? 'dim' : null, title: s.title },
+    art(s.image, s.title, { cls: 'side-art', eager: true }), el('span', { class: 't', text: s.title }), s.feedUrl && s.feedUrl === playing ? eq() : null))));
+}
+
+/* ---------- views ---------- */
+function renderHome() {
+  const h = new Date().getHours();
+  const greet = h < 5 ? 'Up late' : h < 12 ? 'Good morning' : h < 18 ? 'Good afternoon' : 'Good evening';
+  view.append(pageHead('Listen Now', `${greet}. Here’s what’s new on your shelf.`));
+  view.append(el('div', { id: 'setupBanner' }));
+  updateSetupUI();
+  const up = recent.filter(r => { const p = progress[r.ep.id]; return p && !p.done && p.p > 10; }).slice(0, 12);
+  if (up.length) {
+    const q = up.map(r => ({ ep: r.ep, show: r.show }));
+    view.append(section('Up Next', 'Pick up where you left off.', el('div', { class: 'row wide' }, up.map(r => upNextCard(r, q)))));
+  }
+  view.append(section('Latest episodes', 'New from the shows on your shelf.', el('div', {}, el('p', { class: 'feed-status', id: 'feedStatus' }), el('ol', { class: 'eps', id: 'homeLatest' }, skeletonRows(3)))));
+  fillLatest();
+  const picks = CATS.map(c => CATALOG.extras.find(x => x.cat === c.id)).filter(Boolean);
+  view.append(section('Picked for you', 'Related shows that sit well next to your shelf.', cardRow(picks.map(candFromItem)), { link: ['See all', '#/discover'] }));
+  if (!Setup.running) refreshAllFeeds();
+}
+async function fillLatest() {
+  const box = $('homeLatest');
+  if (!box) return;
+  const shows = library.filter(s => s.status === 'ready' && s.feedUrl);
+  const lists = await Promise.all(shows.map(async s => ({ s, c: await Feeds.cached(s) })));
+  if (!box.isConnected) return;
+  const all = [];
+  for (const { s, c } of lists) if (c) for (const ep of c.eps.slice(0, 3)) all.push({ ep, show: snap(s) });
+  all.sort((a, b) => b.ep.date - a.ep.date);
+  const top = all.slice(0, 24);
+  if (!top.length) {
+    if (!box.querySelector('.sk-row')) box.replaceChildren(el('li', { class: 'list-note', text: Setup.running || refreshingAll ? 'Gathering the latest episodes…' : 'No episodes yet. Open a show to load it.' }));
+    return;
+  }
+  box.replaceChildren(...top.map(x => episodeRow(x.ep, x.show, top, { rich: true })));
+}
+function favouriteCats(n) {
+  const counts = new Map();
+  for (const id of Object.keys(progress)) { const pre = id.split(':')[0]; counts.set(pre, (counts.get(pre) || 0) + 1); }
+  const ranked = library.filter(s => s.feedUrl && counts.get(fnv(s.feedUrl))).sort((a, b) => counts.get(fnv(b.feedUrl)) - counts.get(fnv(a.feedUrl)));
+  const out = [];
+  for (const s of ranked) if (CAT[s.cat] && !out.some(o => o.cat === s.cat)) { out.push({ cat: s.cat, show: s }); if (out.length >= n) return out; }
+  for (const cat of ['citypop', 'mystery', 'knowledge']) if (!out.some(o => o.cat === cat)) { out.push({ cat, show: null }); if (out.length >= n) break; }
+  return out;
+}
+function searchRow(term, country, cat) {
+  const row = el('div', { class: 'row' }, skeletonCards(6));
+  dirSearch(term, country, 4, 20).then(rs => {
+    if (!row.isConnected) return;
+    const list = rs.filter(r => !showByFeed(r.feedUrl)).slice(0, 14).map(r => card(candFromResult(r, cat)));
+    row.replaceChildren(...(list.length ? list : [el('p', { class: 'row-empty', text: 'Nothing new here right now.' })]));
+  }).catch(e => {
+    if (!row.isConnected) return;
+    row.replaceChildren(el('p', { class: 'row-empty' }, e.message + ' ', el('button', { class: 'link-btn', type: 'button', text: 'Try again', onclick: () => row.replaceWith(searchRow(term, country, cat)) })));
+  });
+  return row;
+}
+function renderDiscover(tab) {
+  tab = tab || 'for-you';
+  view.append(pageHead('Discover', 'Related shows, picked around what you love.'));
+  const tabs = [['for-you', 'For you'], ...CATS.map(c => [c.id, c.short]), ['ja', '日本語'], ['zh', '中文']];
+  view.append(el('div', { class: 'chips', role: 'tablist', 'aria-label': 'Topics' }, tabs.map(([id, label]) => el('a', { class: 'chip', role: 'tab', href: '#/discover/' + id, 'aria-selected': String(id === tab), text: label }))));
+  const items = [...CATALOG.presets, ...CATALOG.extras];
+  if (tab === 'for-you') {
+    const arts = library.filter(s => s.image).slice(0, 3);
+    view.append(el('div', { class: 'hero' },
+      el('div', {}, el('p', { class: 'hero-kicker', text: 'Made for your evenings' }), el('h2', { class: 'hero-title', text: 'City pop, slow jazz, good books and big ideas' }), el('p', { class: 'hero-sub', text: 'Related shows for everything on your shelf. Press + to add one, or open it to preview its episodes first.' })),
+      el('div', { class: 'hero-stack', 'aria-hidden': 'true' }, arts.map((s, i) => art(s.image, s.title, { cls: 's' + i, eager: true })))));
+    for (const f of favouriteCats(2)) {
+      const [term, country] = CAT[f.cat].keywords[0];
+      view.append(section(f.show ? `Because you listen to ${f.show.title}` : `Because you like ${CAT[f.cat].short.toLowerCase()}`, f.show ? `More about ${term}.` : 'From the interests you told me about.', searchRow(term, country, f.cat)));
+    }
+    for (const c of CATS) view.append(section(`More ${c.label.charAt(0).toLowerCase() + c.label.slice(1)}`, null, cardRow(CATALOG.extras.filter(x => x.cat === c.id).map(candFromItem)), { link: ['See all', '#/discover/' + c.id] }));
+    const removed = CATALOG.presets.filter(p => !library.some(s => s.preset === p.key));
+    if (removed.length) view.append(section('From your poster', 'Shows you removed from your library.', cardRow(removed.map(candFromItem))));
+    return;
+  }
+  if (tab === 'ja' || tab === 'zh') {
+    const picks = items.filter(x => x.lang === tab);
+    if (picks.length) view.append(section(tab === 'ja' ? 'Japanese picks' : 'Chinese picks', null, cardRow(picks.map(p => { const lib = library.find(s => s.preset === p.key); return lib ? candFromShow(lib) : candFromItem(p); }))));
+    for (const [term, country] of CATALOG.langs[tab].keywords) view.append(section(term, null, searchRow(term, country, 'mine')));
+    return;
+  }
+  const c = CAT[tab];
+  if (!c) { go('discover'); return; }
+  view.append(section(c.label, 'Hand-picked to sit next to your shelf.', cardRow(CATALOG.extras.filter(x => x.cat === c.id).map(candFromItem))));
+  const shelf = library.filter(s => s.cat === c.id && s.status === 'ready');
+  if (shelf.length) view.append(section('Already on your shelf', null, cardRow(shelf.map(candFromShow))));
+  for (const [term, country] of c.keywords) view.append(section(`Shows about “${term}”`, null, searchRow(term, country, c.id)));
+}
+function renderLibrary() {
+  const input = el('input', { type: 'text', placeholder: 'Paste a feed or Apple Podcasts link', 'aria-label': 'Add a show by link', spellcheck: 'false' });
+  const form = el('form', { class: 'inline-add', autocomplete: 'off' }, input, el('button', { class: 'btn tonal small', type: 'submit', text: 'Add' }));
+  form.addEventListener('submit', e => { e.preventDefault(); if (input.value.trim()) handleQuery(input.value.trim()); });
+  view.append(pageHead('Library', `${library.length} shows`, form));
+  if (!library.length) { view.append(emptyState('Your library is empty', 'Find shows in Discover, or search by name.', 'Open Discover', '#/discover')); return; }
+  for (const c of [...CATS, { id: 'mine', label: 'Your additions' }]) {
+    const shows = library.filter(s => s.cat === c.id);
+    if (shows.length) view.append(section(c.label, null, el('div', { class: 'grid' }, shows.map(showTile))));
+  }
+}
+async function renderShow(sid) {
+  const show = showBySid(sid);
+  if (!show) { view.append(emptyState('This show isn’t in your library', 'It may have been removed.', 'Open Library', '#/library')); return; }
+  const inLib = library.includes(show);
+  const preset = show.preset ? PRESET[show.preset] : null;
+  const actions = el('div', { class: 'show-actions' });
+  const about = el('p', { class: 'show-about', text: show.description || show.why || (preset && preset.why) || '' });
+  const hero = el('header', { class: 'show-hero' },
+    art(show.image, show.title, { cls: 'hero-art', pending: show.status === 'pending', eager: true }),
+    el('div', { class: 'show-info' },
+      el('p', { class: 'show-kicker', text: (CAT[show.cat] && CAT[show.cat].label) || (show.transient ? 'Preview' : 'Your additions') }),
+      el('h1', { class: 'show-title', text: show.title }),
+      show.author ? el('p', { class: 'show-author', text: show.author }) : null,
+      about, actions));
+  view.append(hero);
+  artColor(show.image).then(c => applyTint(hero, c));
+  const list = el('ol', { class: 'eps' });
+  const note = el('p', { class: 'list-note', hidden: true });
+  const sortLabel = () => settings.sort === 'oldest' ? 'Oldest first' : 'Newest first';
+  let eps = [], shown = 60;
+  const still = () => route.name === 'show' && route.arg === sid && list.isConnected;
+  const paint = () => {
+    const sorted = settings.sort === 'oldest' ? [...eps].reverse() : eps;
+    const sh = snap(show);
+    const queue = sorted.map(e => ({ ep: e, show: sh }));
+    list.replaceChildren(...sorted.slice(0, shown).map(e => episodeRow(e, sh, queue)));
+    if (sorted.length > shown) list.append(el('li', { class: 'more-row' }, el('button', { class: 'btn tonal', type: 'button', text: `Show more episodes (${sorted.length - shown})`, onclick: () => { shown += 60; paint(); } })));
+    note.hidden = sorted.length > 0;
+    if (!sorted.length) note.textContent = 'This feed has no playable episodes.';
+  };
+  const sortBtn = el('button', { class: 'btn tonal small', type: 'button' }, icon('sort'), el('span', { text: sortLabel() }));
+  sortBtn.addEventListener('click', () => { settings.sort = settings.sort === 'oldest' ? 'newest' : 'oldest'; saveSettings(); sortBtn.lastChild.textContent = sortLabel(); paint(); });
+  view.append(el('div', { class: 'eps-head' }, el('h2', { class: 'section-title', text: 'Episodes' }), sortBtn), note, list);
+
+  const playLatest = el('button', { class: inLib ? 'btn primary' : 'btn tonal', type: 'button' }, icon('play'), el('span', { text: 'Latest episode' }));
+  playLatest.addEventListener('click', () => { if (eps.length) { const sh = snap(show); playFrom(eps[0], sh, eps.map(e => ({ ep: e, show: sh }))); } });
+  if (inLib) {
+    actions.append(playLatest, iconBtn('refresh', 'Check for new episodes', async b => {
+      b.classList.add('spin');
+      try { eps = await Feeds.refresh(show); if (still()) paint(); toast('This show is up to date.'); } catch (e) { toast(`Couldn’t refresh. ${e.message}`, true); }
+      b.classList.remove('spin');
+    }));
+    if (/^https?:\/\//i.test(show.link || '')) actions.append(el('a', { class: 'icon-round', href: show.link, target: '_blank', rel: 'noopener noreferrer', 'aria-label': 'Website', title: 'Website' }, icon('link')));
+    actions.append(iconBtn('trash', 'Remove from library', () => removeShow(show)));
+  } else {
+    const addBtn = el('button', { class: 'btn primary', type: 'button' }, icon('plus'), el('span', { text: 'Add to Library' }));
+    addBtn.addEventListener('click', () => { const s = addShow(show); transient.delete(sid); history.replaceState(null, '', '#/show/' + s.sid); render(); });
+    actions.append(addBtn, playLatest);
+  }
+  if (show.status === 'pending') {
+    note.hidden = false;
+    note.textContent = 'Finding this show’s feed…';
+    list.append(...skeletonRows(4));
+    const wait = setInterval(() => { if (!still()) { clearInterval(wait); return; } if (show.status !== 'pending') { clearInterval(wait); render(); } }, 800);
+    return;
+  }
+  if (show.status === 'missing') {
+    note.hidden = false;
+    note.replaceChildren('Couldn’t find a public feed for this show automatically. ',
+      el('a', { class: 'link-btn', href: '#/search/' + encodeURIComponent(show.title), text: 'Search for it' }), ', or ',
+      el('button', { class: 'link-btn', type: 'button', text: 'try again', onclick: () => { show.status = 'pending'; saveLibrary(); runSetup(); render(); } }), '.');
+    return;
+  }
+  list.append(...skeletonRows(5));
+  const cached = await Feeds.cached(show);
+  if (cached && still()) { eps = cached.eps; paint(); }
+  if (!cached || Date.now() - cached.t > 30 * 60e3) {
+    try { eps = await Feeds.refresh(show); if (still()) paint(); }
+    catch (e) { if (still() && !eps.length) { list.replaceChildren(); note.hidden = false; note.textContent = `Couldn’t load episodes. ${e.message}`; } }
+  }
+  if (still() && !about.textContent && show.description) about.textContent = show.description;
+}
+function renderSearch(term) {
+  const input = el('input', { type: 'search', value: term || '', placeholder: 'Shows, topics, or a feed link', 'aria-label': 'Search podcasts', enterkeyhint: 'search', autocomplete: 'off', spellcheck: 'false' });
+  const form = el('form', { class: 'big-search' }, icon('search'), input);
+  form.addEventListener('submit', e => { e.preventDefault(); if (input.value.trim()) handleQuery(input.value.trim()); });
+  view.append(pageHead('Search', null), form);
+  if (!term) {
+    setTimeout(() => input.focus(), 60);
+    const topics = [...CATS.map(c => c.keywords[0]), CATALOG.langs.ja.keywords[1], CATALOG.langs.zh.keywords[0]];
+    view.append(section('Try a topic', null, el('div', { class: 'chips wrap' }, topics.map(([t]) => el('a', { class: 'chip', href: '#/search/' + encodeURIComponent(t), text: t })))));
+    return;
+  }
+  if (looksLikeLink(term)) { handleLink(term); return; }
+  const grid = el('div', { class: 'grid' }, skeletonCards(8));
+  view.append(section(`Results for “${term}”`, null, grid));
+  searchAll(term).then(rs => {
+    if (!grid.isConnected) return;
+    grid.replaceChildren(...(rs.length ? rs.map(r => card(candFromResult(r, 'mine'))) : [el('p', { class: 'row-empty', text: 'No shows found. Try fewer words, or paste the feed link.' })]));
+  }).catch(e => { if (grid.isConnected) grid.replaceChildren(el('p', { class: 'row-empty', text: e.message })); });
+}
+async function searchAll(term) {
   const kana = /[\u3040-\u30ff]/.test(term), han = /[\u3400-\u9fff]/.test(term);
-  const countries = kana ? ['jp', 'us'] : han ? ['tw', 'jp', 'us'] : ['gb', 'us'];
-  const settled = await Promise.allSettled(countries.map(c =>
-    fetchText(`https://itunes.apple.com/search?media=podcast&entity=podcast&limit=15&country=${c}&term=${encodeURIComponent(term)}`)
-      .then(r => JSON.parse(r.text).results || [])));
-  if (settled.every(r => r.status === 'rejected')) throw settled[0].reason;
   const out = new Map();
-  for (const r of settled) if (r.status === 'fulfilled') for (const it of r.value) if (it.feedUrl && !out.has(it.collectionId)) out.set(it.collectionId, it);
+  let err = null;
+  for (const c of kana ? ['jp'] : han ? ['tw', 'jp'] : ['gb', 'us']) {
+    try { for (const r of await dirSearch(term, c, 0, 25)) if (!out.has(r.feedUrl)) out.set(r.feedUrl, r); } catch (e) { err = e; }
+  }
+  if (!out.size && err) throw err;
   return [...out.values()];
 }
-function showResults(title, items) {
-  $('results').hidden = false;
-  $('resultsTitle').textContent = title;
-  const ul = $('resultsList');
-  ul.replaceChildren();
-  for (const it of items) {
-    const inLib = shows.some(s => s.feedUrl === it.feedUrl);
-    ul.append(el('li', { class: 'result' },
-      cover(it.artworkUrl600 || it.artworkUrl100, it.collectionName),
-      el('span', { class: 'show-text' }, el('span', { class: 'show-title', text: it.collectionName }), el('span', { class: 'show-author', text: it.artistName || '' })),
-      el('button', {
-        class: 'pill small', type: 'button', disabled: inLib, text: inLib ? 'Added' : 'Add',
-        onclick: async e => {
-          const btn = e.currentTarget;
-          btn.disabled = true; btn.textContent = 'Adding…';
-          const ok = await subscribe(it.feedUrl, { image: it.artworkUrl600 });
-          btn.textContent = ok ? 'Added' : 'Add';
-          btn.disabled = ok;
-        }
-      })));
-  }
-}
-async function runSearch(term) {
-  showResults(`Searching for “${term}”…`, []);
-  busy(true);
-  try {
-    const items = await searchPodcasts(term);
-    showResults(items.length ? `Results for “${term}”` : `No shows found for “${term}”. Try fewer words, or paste the feed link.`, items);
-  } catch (e) {
-    showResults(`Search didn’t work. ${e.message}`, []);
-  } finally { busy(false); }
-}
-async function handleAdd(value) {
-  const v = value.trim();
-  if (!v) return;
+const looksLikeLink = v => /^(https?|feed|pcast|podcast|itpc):\/\//i.test(v) || /^www\./i.test(v) || /podcasts\.apple\.com/i.test(v) || /\.(xml|rss)(\?|$)/i.test(v);
+function handleQuery(v) { if (looksLikeLink(v)) handleLink(v); else go('search/' + encodeURIComponent(v)); }
+async function handleLink(v) {
   const apple = v.match(/podcasts\.apple\.com\/.*?\bid(\d+)/i);
-  if (apple) {
-    busy(true);
-    try {
-      const r = await fetchText(`https://itunes.apple.com/lookup?id=${apple[1]}&entity=podcast`);
-      const it = (JSON.parse(r.text).results || []).find(x => x.feedUrl);
-      if (!it) throw new Error('Apple doesn’t list a public feed for that show.');
-      if (await subscribe(it.feedUrl, { image: it.artworkUrl600 })) { $('addInput').value = ''; addLabel(); }
-    } catch (e) { toast(`Couldn’t add that show. ${e.message}`, true); }
-    finally { busy(false); }
-    return;
-  }
-  if (looksLikeLink(v)) {
-    let url = v.replace(/^(feed|pcast|podcast|itpc):\/\//i, 'https://');
-    if (!/^https?:\/\//i.test(url)) url = 'https://' + url;
-    if (await subscribe(url)) { $('addInput').value = ''; addLabel(); }
-    return;
-  }
-  runSearch(v);
-}
-
-/* ---------- OPML ---------- */
-function exportOPML() {
-  if (!shows.length) { toast('Your library is empty, so there’s nothing to export yet.'); return; }
-  const esc = s => String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;');
-  const body = shows.map(s => `    <outline type="rss" text="${esc(s.title)}" title="${esc(s.title)}" xmlUrl="${esc(s.feedUrl)}"/>`).join('\n');
-  const xml = `<?xml version="1.0" encoding="UTF-8"?>\n<opml version="2.0">\n  <head><title>夜更かしラジオ subscriptions</title></head>\n  <body>\n${body}\n  </body>\n</opml>\n`;
-  const a = el('a', { href: URL.createObjectURL(new Blob([xml], { type: 'text/x-opml' })), download: 'afterhours-subscriptions.opml' });
-  document.body.append(a);
-  a.click();
-  setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 1500);
-}
-async function importOPML(file) {
-  const doc = parseXML(await file.text());
-  if (!doc) { toast('That file isn’t valid OPML.', true); return; }
-  const urls = [...new Set([...doc.getElementsByTagName('outline')].map(o => o.getAttribute('xmlUrl')).filter(Boolean))];
-  const fresh = urls.filter(u => !shows.some(s => s.feedUrl === u));
-  if (!fresh.length) { toast('No new shows in that file.'); return; }
-  toast(`Importing ${fresh.length} shows…`);
-  let ok = 0;
-  for (const u of fresh) if (await subscribe(u, { quiet: true })) ok++;
-  if (!S.showUrl && shows.length) selectShow(shows[0].feedUrl);
-  toast(`Imported ${ok} of ${fresh.length} shows.`, ok < fresh.length);
+  try {
+    let info;
+    if (apple) {
+      const rs = await dirLookup([apple[1]], 'gb', 0);
+      if (!rs[0]) throw new Error('Apple doesn’t list a public feed for that show.');
+      info = rs[0];
+    } else {
+      let url = v.replace(/^(feed|pcast|podcast|itpc):\/\//i, 'https://');
+      if (!/^https?:\/\//i.test(url)) url = 'https://' + url;
+      toast('Loading that feed…');
+      const { text } = await fetchText(url);
+      const parsed = parseFeed(text, url);
+      info = { feedUrl: url, title: parsed.show.title, author: parsed.show.author, image: parsed.show.image, description: parsed.show.description, link: parsed.show.link };
+      await idb.set('eps:' + url, { t: Date.now(), eps: parsed.episodes.slice(0, 300) });
+    }
+    const s = addShow(Object.assign({ cat: 'mine' }, info));
+    $('searchInput').value = '';
+    go('show/' + s.sid);
+  } catch (e) { toast(`Couldn’t add that show. ${e.message}`, true); }
 }
 
 /* ---------- playback ---------- */
 const curDur = () => { const d = audio.duration; return isFinite(d) && d > 0 ? d : (S.current ? S.current.ep.duration || 0 : 0); };
+const slimEp = ep => ({ id: ep.id, url: ep.url, type: ep.type, title: ep.title, date: ep.date, duration: ep.duration, image: ep.image, number: ep.number, desc: clip(ep.desc || '', 1600), transcripts: ep.transcripts || [] });
 function loadEpisode(ep, show, queue, autoplay) {
   saveProgress(true);
   S.current = { ep, show };
-  S.queue = queue && queue.length ? queue : [ep];
+  S.queue = queue && queue.length ? queue : [{ ep, show }];
   S.lastSecond = -1;
   const saved = progress[ep.id];
   S.pendingSeek = saved && !saved.done && saved.p > 10 ? Math.max(0, saved.p - 3) : null;
@@ -1338,58 +2095,60 @@ function loadEpisode(ep, show, queue, autoplay) {
   audio.defaultPlaybackRate = settings.speed;
   audio.playbackRate = settings.speed;
   try { audio.preservesPitch = true; audio.mozPreservesPitch = true; audio.webkitPreservesPitch = true; } catch {}
-  $('seek').style.setProperty('--buf', '0%');
+  for (const id of ['barSeek', 'npSeek']) $(id).style.setProperty('--buf', '0%');
+  recent = [{ ep: slimEp(ep), show, t: Date.now() }, ...recent.filter(r => r.ep.id !== ep.id)].slice(0, 40);
+  store.set(KEY.recent, recent);
+  store.set(KEY.last, { epId: ep.id });
   updateNowPlaying();
   updateTimes(true);
-  store.set(KEY.last, Object.assign(store.get(KEY.last, {}), { playShow: show.feedUrl, epId: ep.id }));
   loadCaptions(ep);
   if (autoplay) audio.play().catch(err => { if (err && err.name === 'NotAllowedError') toast('Press play to start listening.'); });
-  markPlayingRow();
+  paintAllPills();
+  renderSidebar();
 }
 function updateNowPlaying() {
   const c = S.current;
-  const img = c ? (c.ep.image || c.show.image) : '';
-  $('pShow').textContent = c ? c.show.title : 'Nothing playing';
-  $('pTitle').textContent = c ? c.ep.title : 'Pick an episode to start listening.';
-  $('miniTitle').textContent = c ? c.ep.title : 'Nothing playing';
-  $('miniShow').textContent = c ? c.show.title : '';
-  const pc = $('pCover');
-  if (img) { pc.hidden = false; pc.src = img; } else { pc.hidden = true; pc.removeAttribute('src'); }
-  $('miniCover').replaceChildren(cover(img, c ? c.show.title : ''));
-  for (const id of ['seek', 'playBtn', 'backBtn', 'fwdBtn', 'prevBtn', 'nextBtn', 'miniPlay']) $(id).disabled = !c;
-  document.title = c ? `${c.ep.title} | 夜更かしラジオ` : '夜更かしラジオ';
-  if ('mediaSession' in navigator && c) {
-    try {
-      navigator.mediaSession.metadata = new MediaMetadata({
-        title: c.ep.title, artist: c.show.author || c.show.title, album: c.show.title,
-        artwork: img ? [{ src: img, sizes: '512x512' }] : []
-      });
-    } catch {}
+  $('bar').classList.toggle('idle', !c);
+  if (!c) return;
+  const img = c.ep.image || c.show.image;
+  const lib = showByFeed(c.show.feedUrl);
+  const href = '#/show/' + (lib ? lib.sid : c.show.sid);
+  $('barTitle').textContent = c.ep.title;
+  $('barShow').textContent = c.show.title;
+  $('barShow').href = href;
+  $('barArt').replaceChildren(art(img, c.show.title, { eager: true }));
+  $('npTitle').textContent = c.ep.title;
+  $('npShow').textContent = c.show.title;
+  $('npShow').href = href;
+  $('npArt').replaceChildren(art(img, c.show.title, { eager: true }));
+  const bg = $('npBg');
+  bg.replaceChildren();
+  if (img) { const i = el('img', { alt: '', src: img }); i.addEventListener('error', () => i.remove(), { once: true }); bg.append(i); }
+  document.title = `${c.ep.title} | 夜更かしラジオ`;
+  artColor(img).then(hsl => { if (S.current === c && hsl) for (const id of ['bar', 'np', 'capPill']) applyTint($(id), hsl); });
+  if ('mediaSession' in navigator) {
+    try { navigator.mediaSession.metadata = new MediaMetadata({ title: c.ep.title, artist: c.show.author || c.show.title, album: c.show.title, artwork: img ? [{ src: img, sizes: '512x512' }] : [] }); } catch {}
   }
 }
 function setPlaying(playing) {
-  for (const id of ['playBtn', 'miniPlay']) {
-    setIcon($(id), playing ? 'pause' : 'play');
-    $(id).setAttribute('aria-label', playing ? 'Pause' : 'Play');
-  }
-  $('playBtn').title = playing ? 'Pause (Space)' : 'Play (Space)';
+  for (const id of ['barPlay', 'npPlay']) { setIcon($(id), playing ? 'pause' : 'play'); $(id).setAttribute('aria-label', playing ? 'Pause' : 'Play'); }
+  $('barPlay').title = playing ? 'Pause (Space)' : 'Play (Space)';
+  $('np').classList.toggle('paused', !playing);
+  document.body.classList.toggle('is-playing', playing);
   if ('mediaSession' in navigator) navigator.mediaSession.playbackState = playing ? 'playing' : 'paused';
-  markPlayingRow();
+  paintAllPills();
 }
 function updateTimes(force) {
   const d = curDur();
   const t = S.pendingSeek != null ? S.pendingSeek : (audio.currentTime || 0);
   const pct = d ? Math.min(100, t / d * 100) : 0;
-  if (!S.dragging) { $('seek').value = Math.round(pct * 10); $('seek').style.setProperty('--fill', pct + '%'); }
-  $('miniBar').style.width = pct + '%';
+  if (!S.dragging) for (const id of ['barSeek', 'npSeek']) { $(id).value = Math.round(pct * 10); $(id).style.setProperty('--fill', pct + '%'); }
+  $('barProg').style.width = pct + '%';
   const sec = Math.floor(t);
   if (force || sec !== S.lastSecond) {
     S.lastSecond = sec;
-    if (!S.dragging) {
-      $('tCur').textContent = fmtTime(t);
-      $('tLeft').textContent = '-' + fmtTime(Math.max(0, d - t));
-    }
-    $('seek').setAttribute('aria-valuetext', `${fmtTime(t)} of ${fmtTime(d)}`);
+    if (!S.dragging) { const a = fmtTime(t), b = '-' + fmtTime(Math.max(0, d - t)); $('barCur').textContent = a; $('npCur').textContent = a; $('barLeft').textContent = b; $('npLeft').textContent = b; }
+    for (const id of ['barSeek', 'npSeek']) $(id).setAttribute('aria-valuetext', `${fmtTime(t)} of ${fmtTime(d)}`);
   }
 }
 function updateBuffered() {
@@ -1397,7 +2156,7 @@ function updateBuffered() {
   if (!d || !audio.buffered.length) return;
   let end = 0;
   for (let i = 0; i < audio.buffered.length; i++) if (audio.buffered.start(i) <= audio.currentTime + 1) end = Math.max(end, audio.buffered.end(i));
-  $('seek').style.setProperty('--buf', Math.min(100, end / d * 100) + '%');
+  for (const id of ['barSeek', 'npSeek']) $(id).style.setProperty('--buf', Math.min(100, end / d * 100) + '%');
 }
 function updatePosState() {
   if (!('mediaSession' in navigator) || !navigator.mediaSession.setPositionState) return;
@@ -1405,7 +2164,7 @@ function updatePosState() {
   if (!isFinite(d) || d <= 0) return;
   try { navigator.mediaSession.setPositionState({ duration: d, playbackRate: audio.playbackRate, position: Math.min(audio.currentTime, d) }); } catch {}
 }
-function loop() { updateTimes(); renderCaption(); S.raf = requestAnimationFrame(loop); }
+function loop() { updateTimes(); renderCaptions(); S.raf = requestAnimationFrame(loop); }
 function togglePlay() {
   if (!S.current) return;
   if (audio.paused) audio.play().catch(() => toast('This episode couldn’t start. Try again in a moment.', true));
@@ -1417,14 +2176,14 @@ function skip(sec) {
   const d = curDur();
   audio.currentTime = Math.max(0, Math.min(d ? d - 0.5 : Infinity, audio.currentTime + sec));
   updateTimes(true);
-  renderCaption(true);
+  renderCaptions(true);
 }
 function step(dir) {
   if (!S.current) return;
   if (dir < 0 && audio.currentTime > 5) { audio.currentTime = 0; return; }
-  const i = S.queue.findIndex(e => e.id === S.current.ep.id);
-  const target = S.queue[i + dir];
-  if (target) loadEpisode(target, S.current.show, S.queue, true);
+  const i = S.queue.findIndex(x => x.ep.id === S.current.ep.id);
+  const t = S.queue[i + dir];
+  if (t) loadEpisode(t.ep, t.show, S.queue, true);
   else toast(dir > 0 ? 'That’s the last episode in this list.' : 'That’s the first episode in this list.');
 }
 let lastSave = 0;
@@ -1439,20 +2198,52 @@ function saveProgress(force) {
   const d = curDur(), p = audio.currentTime || 0;
   if (!d || p < 1) return;
   progress[c.ep.id] = { p: Math.floor(p), d: Math.round(d), done: d - p < Math.min(45, d * 0.04), t: Date.now() };
-  if (force || Date.now() - lastSave > 5000) { lastSave = Date.now(); persistProgress(); updateRow(c.ep.id); }
+  if (force || Date.now() - lastSave > 5000) { lastSave = Date.now(); persistProgress(); paintAllPills(); }
 }
 function onEnded() {
   const c = S.current;
   if (!c) return;
   progress[c.ep.id] = { p: 0, d: Math.round(curDur()), done: true, t: Date.now() };
   persistProgress();
-  updateRow(c.ep.id);
+  paintAllPills();
   if (S.sleep.mode === 'end') { setSleep('off', true); toast('Sleep timer stopped at the end of the episode. Good night.'); return; }
   if (settings.autoNext) {
-    const i = S.queue.findIndex(e => e.id === c.ep.id);
+    const i = S.queue.findIndex(x => x.ep.id === c.ep.id);
     const n = S.queue[i + 1];
-    if (n) loadEpisode(n, c.show, S.queue, true);
+    if (n) loadEpisode(n.ep, n.show, S.queue, true);
   }
+}
+
+/* ---------- Now Playing ---------- */
+function openNp(withLyrics) {
+  if (!S.current) return;
+  if (withLyrics == null && matchMedia('(max-width: 899px)').matches) withLyrics = false;
+  if (withLyrics != null) setLyrics(withLyrics);
+  S.npOpen = true;
+  const np = $('np');
+  np.hidden = false;
+  void np.offsetWidth;
+  np.classList.add('open');
+  document.body.classList.add('np-open');
+  renderLyrics();
+  renderCaptions(true);
+  S.lastUserScroll = 0;
+  setTimeout(() => { if (S.cueIdx >= 0) highlightLyric(S.cueIdx); $('npClose').focus(); }, 60);
+}
+function closeNp() {
+  S.npOpen = false;
+  $('np').classList.remove('open');
+  document.body.classList.remove('np-open');
+  closeSpeed();
+  setTimeout(() => { if (!S.npOpen) $('np').hidden = true; }, reduceMotion ? 0 : 480);
+  renderCaptions(true);
+}
+function setLyrics(on) {
+  S.lyricsOn = on;
+  $('np').classList.toggle('lyrics-on', on);
+  $('npLyricsBtn').setAttribute('aria-pressed', String(on));
+  renderCaptions(true);
+  if (on && S.cueIdx >= 0) { S.lastUserScroll = 0; setTimeout(() => highlightLyric(S.cueIdx), 30); }
 }
 
 /* ---------- speed, captions, sleep, volume ---------- */
@@ -1463,34 +2254,37 @@ function setSpeed(v, announce) {
   saveSettings();
   audio.defaultPlaybackRate = v;
   audio.playbackRate = v;
-  $('speedBtn').textContent = fmtSpeed(v);
+  for (const id of ['barSpeed', 'npSpeed']) $(id).textContent = fmtSpeed(v);
   $('speedVal').textContent = v.toFixed(2) + '×';
   $('speedRange').value = v;
   $('speedRange').style.setProperty('--fill', ((v - 0.5) / 2.5 * 100) + '%');
   for (const b of $('speedPresets').children) b.setAttribute('aria-pressed', String(Math.abs(+b.dataset.v - v) < 0.001));
   if (announce) toast(`Speed ${fmtSpeed(v)}`);
 }
-function openSpeed(open) {
-  $('speedPop').hidden = !open;
-  $('speedBtn').setAttribute('aria-expanded', String(open));
-  if (open) $('speedRange').focus();
+let popAnchor = null;
+function openSpeed(anchor) {
+  const pop = $('speedPop');
+  if (!pop.hidden && popAnchor === anchor) { closeSpeed(); return; }
+  popAnchor = anchor;
+  pop.hidden = false;
+  pop.classList.toggle('on-dark', !!anchor.closest('.np'));
+  const r = anchor.getBoundingClientRect(), w = pop.offsetWidth, h = pop.offsetHeight;
+  const left = Math.min(innerWidth - w - 12, Math.max(12, r.left + r.width / 2 - w / 2));
+  let top = r.top - h - 10;
+  if (top < 12) top = r.bottom + 10;
+  pop.style.left = left + 'px';
+  pop.style.top = top + 'px';
+  for (const b of document.querySelectorAll('[data-speed-btn]')) b.setAttribute('aria-expanded', String(b === anchor));
+  $('speedRange').focus();
 }
-function toggleCaptions() {
-  settings.captions = !settings.captions;
-  saveSettings();
-  $('ccBtn').setAttribute('aria-pressed', String(settings.captions));
-  S.cueIdx = -2;
-  renderCaption(true);
-  toast(settings.captions ? 'Captions on.' : 'Captions off.');
+function closeSpeed() {
+  $('speedPop').hidden = true;
+  popAnchor = null;
+  for (const b of document.querySelectorAll('[data-speed-btn]')) b.setAttribute('aria-expanded', 'false');
 }
-function toggleTranscript(force) {
-  const panel = $('transcript');
-  const open = force != null ? force : panel.hidden;
-  panel.hidden = !open;
-  $('player').classList.toggle('tr-open', open);
-  $('trBtn').setAttribute('aria-pressed', String(open));
-  if (open) { S.lastUserScroll = 0; if (S.cueIdx >= 0) highlightCue(S.cueIdx); }
-}
+function syncCC() { for (const id of ['barCC', 'npCC']) $(id).setAttribute('aria-pressed', String(settings.captions)); }
+function toggleCaptions() { settings.captions = !settings.captions; saveSettings(); syncCC(); renderCaptions(true); toast(settings.captions ? 'Captions on.' : 'Captions off.'); }
+function toggleTranscript() { if (!S.current) return; if (!S.npOpen) openNp(true); else setLyrics(!S.lyricsOn); }
 const SLEEP_STEPS = ['off', 15, 30, 45, 60, 'end'];
 function setSleep(mode, quiet) {
   if (S.sleep.fadeBase != null) { audio.volume = S.sleep.fadeBase; S.sleep.fadeBase = null; }
@@ -1503,18 +2297,19 @@ function setSleep(mode, quiet) {
 function sleepTick() {
   const left = S.sleep.endsAt - Date.now();
   if (left <= 0) { audio.pause(); setSleep('off', true); toast('Sleep timer paused playback. Good night.'); return; }
-  if (left < 10000 && !audio.paused) {
-    if (S.sleep.fadeBase == null) S.sleep.fadeBase = audio.volume;
-    audio.volume = S.sleep.fadeBase * (left / 10000);
-  }
+  if (left < 10000 && !audio.paused) { if (S.sleep.fadeBase == null) S.sleep.fadeBase = audio.volume; audio.volume = S.sleep.fadeBase * (left / 10000); }
   updateSleepLabel();
 }
 function updateSleepLabel() {
   const m = S.sleep.mode;
   const mins = typeof m === 'number' ? Math.max(1, Math.ceil((S.sleep.endsAt - Date.now()) / 60000)) : 0;
-  $('sleepLabel').textContent = mins ? `${mins} min` : m === 'end' ? 'Ep. end' : 'Sleep';
-  $('sleepBtn').setAttribute('aria-pressed', String(m !== 'off'));
-  $('sleepBtn').setAttribute('aria-label', mins ? `Sleep timer, ${mins} minutes left` : m === 'end' ? 'Sleep timer, stops at the end of this episode' : 'Sleep timer, off');
+  const label = mins ? `${mins} min` : m === 'end' ? 'Ep. end' : '';
+  for (const [b, l] of [['barSleep', 'barSleepLabel'], ['npSleep', 'npSleepLabel']]) {
+    $(l).textContent = label;
+    $(l).hidden = !label;
+    $(b).setAttribute('aria-pressed', String(m !== 'off'));
+    $(b).setAttribute('aria-label', mins ? `Sleep timer, ${mins} minutes left` : m === 'end' ? 'Sleep timer, stops at the end of this episode' : 'Sleep timer, off');
+  }
 }
 function syncVolumeUI() {
   const v = audio.muted ? 0 : audio.volume;
@@ -1522,200 +2317,166 @@ function syncVolumeUI() {
     settings.volume = audio.volume;
     settings.muted = audio.muted;
     saveSettings();
-    $('volume').value = v;
-    $('volume').style.setProperty('--fill', v * 100 + '%');
+    for (const id of ['barVol', 'npVol']) { $(id).value = v; $(id).style.setProperty('--fill', v * 100 + '%'); }
   }
-  setIcon($('muteBtn'), audio.muted || audio.volume === 0 ? 'mute' : 'vol');
-  $('muteBtn').setAttribute('aria-label', audio.muted ? 'Unmute' : 'Mute');
+  for (const id of ['barMute', 'npMute']) { setIcon($(id), audio.muted || audio.volume === 0 ? 'mute' : 'vol'); $(id).setAttribute('aria-label', audio.muted ? 'Unmute' : 'Mute'); }
 }
 
-/* ---------- theme ---------- */
+/* ---------- theme, OPML ---------- */
 const THEMES = ['system', 'light', 'dark'];
-const THEME_LABEL = { system: 'Theme: follow system', light: 'Theme: light', dark: 'Theme: dark' };
+const THEME_LABEL = { system: 'Appearance: System', light: 'Appearance: Light', dark: 'Appearance: Dark' };
 function applyTheme() {
   if (settings.theme === 'system') delete document.documentElement.dataset.theme;
   else document.documentElement.dataset.theme = settings.theme;
-  $('themeBtn').setAttribute('aria-label', THEME_LABEL[settings.theme]);
+  $('themeLabel').textContent = THEME_LABEL[settings.theme];
   $('themeBtn').title = THEME_LABEL[settings.theme];
 }
-
-/* ---------- mobile sheet ---------- */
-function setExpanded(on) {
-  $('player').classList.toggle('expanded', on);
-  document.body.classList.toggle('sheet-open', on);
-  $('miniExpand').setAttribute('aria-expanded', String(on));
-  if (on) $('collapseBtn').focus();
+function exportOPML() {
+  const ready = library.filter(s => s.feedUrl);
+  if (!ready.length) { toast('There’s nothing to export yet.'); return; }
+  const esc = s => String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;');
+  const body = ready.map(s => `    <outline type="rss" text="${esc(s.title)}" title="${esc(s.title)}" xmlUrl="${esc(s.feedUrl)}"/>`).join('\n');
+  const xml = `<?xml version="1.0" encoding="UTF-8"?>\n<opml version="2.0">\n  <head><title>夜更かしラジオ subscriptions</title></head>\n  <body>\n${body}\n  </body>\n</opml>\n`;
+  const a = el('a', { href: URL.createObjectURL(new Blob([xml], { type: 'text/x-opml' })), download: 'afterhours-subscriptions.opml' });
+  document.body.append(a);
+  a.click();
+  setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 1500);
+}
+async function importOPML(file) {
+  const doc = parseXML(await file.text());
+  if (!doc) { toast('That file isn’t valid OPML.', true); return; }
+  const outlines = [...doc.getElementsByTagName('outline')].filter(o => o.getAttribute('xmlUrl'));
+  const fresh = outlines.filter(o => !showByFeed(o.getAttribute('xmlUrl')));
+  if (!fresh.length) { toast('No new shows in that file.'); return; }
+  for (const o of fresh) addShow({ feedUrl: o.getAttribute('xmlUrl'), title: o.getAttribute('title') || o.getAttribute('text') || o.getAttribute('xmlUrl'), cat: 'mine' }, true);
+  toast(`Imported ${fresh.length} shows.`);
+  if (route.name === 'library') render();
+  refreshAllFeeds();
 }
 
 /* ---------- wiring ---------- */
+function wireSeek(id) {
+  const s = $(id);
+  s.addEventListener('input', () => {
+    S.dragging = true;
+    s.classList.add('dragging');
+    const d = curDur(), t = s.value / 1000 * d;
+    for (const x of ['barCur', 'npCur']) $(x).textContent = fmtTime(t);
+    for (const x of ['barLeft', 'npLeft']) $(x).textContent = '-' + fmtTime(Math.max(0, d - t));
+    for (const x of ['barSeek', 'npSeek']) { $(x).style.setProperty('--fill', s.value / 10 + '%'); if (x !== id) $(x).value = s.value; }
+  });
+  s.addEventListener('change', () => {
+    const d = curDur(), t = s.value / 1000 * d;
+    S.dragging = false;
+    s.classList.remove('dragging');
+    if (!d) return;
+    if (S.pendingSeek != null) S.pendingSeek = t; else audio.currentTime = t;
+    updateTimes(true);
+    renderCaptions(true);
+  });
+}
 function wire() {
-  $('addInput').addEventListener('input', addLabel);
-  $('addForm').addEventListener('submit', e => { e.preventDefault(); handleAdd($('addInput').value); });
-  $('resultsClose').addEventListener('click', () => { $('results').hidden = true; });
+  window.addEventListener('hashchange', render);
+  $('searchForm').addEventListener('submit', e => { e.preventDefault(); const v = $('searchInput').value.trim(); if (v) handleQuery(v); });
+  $('themeBtn').addEventListener('click', () => { settings.theme = THEMES[(THEMES.indexOf(settings.theme) + 1) % THEMES.length]; saveSettings(); applyTheme(); toast(THEME_LABEL[settings.theme] + '.'); });
   $('importBtn').addEventListener('click', () => $('opmlFile').click());
   $('exportBtn').addEventListener('click', exportOPML);
   $('opmlFile').addEventListener('change', e => { const f = e.target.files[0]; e.target.value = ''; if (f) importOPML(f); });
-  $('themeBtn').addEventListener('click', () => {
-    settings.theme = THEMES[(THEMES.indexOf(settings.theme) + 1) % THEMES.length];
-    saveSettings(); applyTheme(); toast(THEME_LABEL[settings.theme] + '.');
-  });
-
-  $('refreshBtn').addEventListener('click', () => { if (S.showUrl) refreshShow(S.showUrl, false); });
-  $('sortBtn').addEventListener('click', () => { settings.sort = settings.sort === 'oldest' ? 'newest' : 'oldest'; saveSettings(); renderShowHead(); renderEpisodes(); });
-  $('removeBtn').addEventListener('click', () => {
-    const s = currentShow();
-    if (!s || !confirm(`Remove “${s.title}” from your library?`)) return;
-    shows = shows.filter(x => x.feedUrl !== s.feedUrl);
-    saveShows();
-    store.del(KEY.cache(s.feedUrl));
-    S.showUrl = null;
-    if (shows.length) selectShow(shows[0].feedUrl);
-    else { S.episodes = []; renderShows(); renderShowHead(); }
-    toast(`Removed ${s.title}.`);
-  });
-
-  $('episodeList').addEventListener('click', e => {
-    const li = e.target.closest('.ep');
-    if (!li) return;
-    const more = e.target.closest('.ep-more');
-    if (more) {
-      const open = li.classList.toggle('open');
-      more.textContent = open ? 'Less' : 'More';
-      more.setAttribute('aria-expanded', String(open));
-      return;
-    }
-    if (!e.target.closest('.ep-play') && String(window.getSelection())) return;
-    const ep = S.view[+li.dataset.i];
-    if (!ep) return;
-    if (S.current && S.current.ep.id === ep.id) { togglePlay(); return; }
-    loadEpisode(ep, currentShow(), S.view, true);
-  });
 
   audio.addEventListener('loadedmetadata', () => {
-    if (S.pendingSeek != null) {
-      const target = Math.min(S.pendingSeek, Math.max(0, audio.duration - 5));
-      S.pendingSeek = null;
-      try { audio.currentTime = target; } catch {}
-    }
+    if (S.pendingSeek != null) { const target = Math.min(S.pendingSeek, Math.max(0, audio.duration - 5)); S.pendingSeek = null; try { audio.currentTime = target; } catch {} }
     audio.playbackRate = settings.speed;
     updateTimes(true);
     updatePosState();
   });
-  audio.addEventListener('play', () => { setPlaying(true); cancelAnimationFrame(S.raf); S.raf = requestAnimationFrame(loop); });
+  audio.addEventListener('play', () => { setPlaying(true); cancelAnimationFrame(S.raf); S.raf = requestAnimationFrame(loop); renderSidebar(); });
   audio.addEventListener('pause', () => { setPlaying(false); cancelAnimationFrame(S.raf); saveProgress(true); updateTimes(true); updatePosState(); });
   audio.addEventListener('ended', onEnded);
-  audio.addEventListener('timeupdate', () => { if (audio.paused) { updateTimes(); renderCaption(); } saveProgress(false); });
-  audio.addEventListener('seeked', () => { updateTimes(true); renderCaption(); updatePosState(); });
+  audio.addEventListener('timeupdate', () => { if (audio.paused) { updateTimes(); renderCaptions(); } saveProgress(false); });
+  audio.addEventListener('seeked', () => { updateTimes(true); renderCaptions(); updatePosState(); });
   audio.addEventListener('progress', updateBuffered);
   audio.addEventListener('ratechange', updatePosState);
-  audio.addEventListener('waiting', () => $('player').classList.add('buffering'));
-  audio.addEventListener('playing', () => $('player').classList.remove('buffering'));
   audio.addEventListener('volumechange', syncVolumeUI);
   audio.addEventListener('error', () => {
     if (!S.current || !audio.getAttribute('src')) return;
-    $('player').classList.remove('buffering');
     setPlaying(false);
     toast('This episode’s audio couldn’t be played. The link may have changed, so try refreshing the show.', true);
   });
+  wireSeek('barSeek');
+  wireSeek('npSeek');
 
-  const seek = $('seek');
-  seek.addEventListener('input', () => {
-    S.dragging = true;
-    const d = curDur(), t = seek.value / 1000 * d;
-    $('tCur').textContent = fmtTime(t);
-    $('tLeft').textContent = '-' + fmtTime(Math.max(0, d - t));
-    seek.style.setProperty('--fill', seek.value / 10 + '%');
-  });
-  seek.addEventListener('change', () => {
-    const d = curDur();
-    const t = seek.value / 1000 * d;
-    S.dragging = false;
-    if (!d) return;
-    if (S.pendingSeek != null) S.pendingSeek = t; else audio.currentTime = t;
-    updateTimes(true);
-    renderCaption(true);
-  });
-
-  $('playBtn').addEventListener('click', togglePlay);
-  $('miniPlay').addEventListener('click', togglePlay);
-  $('backBtn').addEventListener('click', () => skip(-15));
-  $('fwdBtn').addEventListener('click', () => skip(30));
-  $('prevBtn').addEventListener('click', () => step(-1));
-  $('nextBtn').addEventListener('click', () => step(1));
-  $('miniExpand').addEventListener('click', () => setExpanded(true));
-  $('collapseBtn').addEventListener('click', () => setExpanded(false));
-
+  for (const id of ['barPlay', 'npPlay']) $(id).addEventListener('click', togglePlay);
+  for (const id of ['barBack', 'npBack']) $(id).addEventListener('click', () => skip(-15));
+  for (const id of ['barFwd', 'npFwd']) $(id).addEventListener('click', () => skip(30));
+  $('npPrev').addEventListener('click', () => step(-1));
+  $('npNext').addEventListener('click', () => step(1));
+  for (const id of ['barArt', 'barTitle', 'barExpand']) $(id).addEventListener('click', () => openNp());
+  $('barLyrics').addEventListener('click', () => openNp(true));
+  $('npClose').addEventListener('click', closeNp);
+  $('npShow').addEventListener('click', () => closeNp());
+  $('npAuto').addEventListener('click', () => { settings.autoNext = !settings.autoNext; saveSettings(); $('npAuto').setAttribute('aria-pressed', String(settings.autoNext)); toast(settings.autoNext ? 'The next episode will play automatically.' : 'Autoplay off.'); });
+  $('npLyricsBtn').addEventListener('click', () => setLyrics(!S.lyricsOn));
+  for (const id of ['barCC', 'npCC']) $(id).addEventListener('click', toggleCaptions);
+  for (const id of ['barSleep', 'npSleep']) $(id).addEventListener('click', () => setSleep(SLEEP_STEPS[(SLEEP_STEPS.indexOf(S.sleep.mode) + 1) % SLEEP_STEPS.length]));
+  for (const id of ['barSpeed', 'npSpeed']) $(id).addEventListener('click', e => openSpeed(e.currentTarget));
   for (const v of PRESETS) $('speedPresets').append(el('button', { class: 'preset', type: 'button', dataset: { v }, text: fmtSpeed(v), onclick: () => setSpeed(v) }));
-  $('speedBtn').addEventListener('click', () => openSpeed($('speedPop').hidden));
   $('speedRange').addEventListener('input', e => setSpeed(+e.target.value));
   $('speedReset').addEventListener('click', () => setSpeed(1));
-  document.addEventListener('pointerdown', e => { if (!$('speedPop').hidden && !e.target.closest('.speed-wrap')) openSpeed(false); });
+  document.addEventListener('pointerdown', e => { if (!$('speedPop').hidden && !e.target.closest('#speedPop, [data-speed-btn]')) closeSpeed(); });
+  for (const id of ['barVol', 'npVol']) $(id).addEventListener('input', e => { S.sleep.fadeBase = null; audio.volume = +e.target.value; audio.muted = audio.volume === 0; });
+  for (const id of ['barMute', 'npMute']) $(id).addEventListener('click', () => { audio.muted = !audio.muted; if (!audio.muted && audio.volume === 0) audio.volume = 0.6; });
 
-  $('ccBtn').addEventListener('click', toggleCaptions);
-  $('trBtn').addEventListener('click', () => toggleTranscript());
-  $('trLoad').addEventListener('click', () => $('capFile').click());
-  $('sleepBtn').addEventListener('click', () => setSleep(SLEEP_STEPS[(SLEEP_STEPS.indexOf(S.sleep.mode) + 1) % SLEEP_STEPS.length]));
-  $('volume').addEventListener('input', e => { S.sleep.fadeBase = null; audio.volume = +e.target.value; audio.muted = audio.volume === 0; });
-  $('muteBtn').addEventListener('click', () => { audio.muted = !audio.muted; if (!audio.muted && audio.volume === 0) audio.volume = 0.6; });
-  $('autoNext').addEventListener('change', e => { settings.autoNext = e.target.checked; saveSettings(); });
-
-  const tr = $('trList');
-  for (const ev of ['wheel', 'touchmove', 'keydown']) tr.addEventListener(ev, () => { S.lastUserScroll = Date.now(); }, { passive: true });
-  tr.addEventListener('click', e => {
-    const li = e.target.closest('.cue');
-    if (!li || li.dataset.i == null || !S.current) return;
+  const ly = $('lyrics');
+  for (const ev of ['wheel', 'touchmove', 'keydown']) ly.addEventListener(ev, () => { S.lastUserScroll = Date.now(); }, { passive: true });
+  ly.addEventListener('click', e => {
+    const li = e.target.closest('.lyric');
+    if (!li || !S.current) return;
     const c = S.cues[+li.dataset.i];
     if (!c) return;
     S.lastUserScroll = 0;
     if (S.pendingSeek != null) S.pendingSeek = c.start; else audio.currentTime = c.start;
     if (audio.paused) audio.play().catch(() => {});
-    renderCaption(true);
+    renderCaptions(true);
   });
-
   $('capFile').addEventListener('change', async e => {
     const f = e.target.files[0];
     e.target.value = '';
     if (!f) return;
     if (!S.current) { toast('Start an episode first, then load its caption file.'); return; }
-    const text = await f.text();
-    const name = f.name.toLowerCase();
+    const text = await f.text(), name = f.name.toLowerCase();
     const type = name.endsWith('.srt') ? 'srt' : name.endsWith('.vtt') ? 'vtt' : name.endsWith('.json') ? 'json' : '';
     applyTranscript(text, type);
     if (!S.cues.length) { toast('That file has no timed captions I can read.', true); loadCaptions(S.current.ep); return; }
     if (text.length < 600000) store.set(KEY.cap(S.current.ep.id), { name: f.name, type, text });
-    S.capLoading = false; S.capError = '';
-    renderTranscript();
-    renderCaption(true);
+    S.capLoading = false;
+    S.capError = '';
+    renderLyrics();
+    renderCaptions(true);
     toast(`Loaded captions from ${f.name}.`);
   });
 
   document.addEventListener('keydown', e => {
     if (e.defaultPrevented || e.metaKey || e.ctrlKey || e.altKey) return;
     const t = e.target;
-    if (t.closest && t.closest('input:not([type=range]):not([type=checkbox]), textarea, select, [contenteditable="true"]')) {
-      if (e.key === 'Escape') t.blur();
-      return;
-    }
+    if (t.closest && t.closest('input:not([type=range]):not([type=checkbox]), textarea, select, [contenteditable="true"]')) { if (e.key === 'Escape') t.blur(); return; }
     const onRange = t.type === 'range';
     switch (e.key) {
-      case 'Escape': openSpeed(false); if (isNarrow()) setExpanded(false); break;
-      case ' ': case 'k': case 'K':
-        if (e.key === ' ' && t.closest && t.closest('button, a, input')) return;
-        e.preventDefault(); togglePlay(); break;
+      case 'Escape': if (!$('speedPop').hidden) closeSpeed(); else if (S.npOpen) closeNp(); break;
+      case '/': e.preventDefault(); if (getComputedStyle($('searchForm')).display !== 'none') $('searchInput').focus(); else go('search'); break;
+      case ' ': case 'k': case 'K': if (e.key === ' ' && t.closest && t.closest('button, a, input')) return; e.preventDefault(); togglePlay(); break;
       case 'ArrowLeft': case 'j': case 'J': if (onRange) return; e.preventDefault(); skip(-15); break;
       case 'ArrowRight': case 'l': case 'L': if (onRange) return; e.preventDefault(); skip(30); break;
       case '[': setSpeed(settings.speed - 0.1, true); break;
       case ']': setSpeed(settings.speed + 0.1, true); break;
-      case 'c': case 'C': toggleCaptions(); break;
+      case 'c': case 'C': if (S.current) toggleCaptions(); break;
       case 't': case 'T': toggleTranscript(); break;
       case 'm': case 'M': audio.muted = !audio.muted; break;
       case 'N': if (e.shiftKey) step(1); break;
       case 'P': if (e.shiftKey) step(-1); break;
     }
   });
-
   if ('mediaSession' in navigator) {
-    const set = (action, fn) => { try { navigator.mediaSession.setActionHandler(action, fn); } catch {} };
+    const set = (a, fn) => { try { navigator.mediaSession.setActionHandler(a, fn); } catch {} };
     set('play', () => audio.play());
     set('pause', () => audio.pause());
     set('seekbackward', d => skip(-((d && d.seekOffset) || 15)));
@@ -1725,44 +2486,32 @@ function wire() {
     set('nexttrack', () => step(1));
     set('stop', () => audio.pause());
   }
-
   window.addEventListener('pagehide', () => saveProgress(true));
   document.addEventListener('visibilitychange', () => { if (document.hidden) saveProgress(true); });
-  $('pCover').addEventListener('error', () => { $('pCover').hidden = true; });
 }
 
-const TRY = [
-  ['Primer', 'Primer Maximum Fun'], ['Composer of the Week', 'Composer of the Week'], ['In Our Time', 'In Our Time BBC'],
-  ['Shedunnit', 'Shedunnit'], ['Mindscape', 'Sean Carroll Mindscape'], ['Jazz Night in America', 'Jazz Night in America'],
-  ['Rebuild', 'Rebuild.fm'], ['ゆる言語学ラジオ', 'ゆる言語学ラジオ']
-];
-
 function init() {
+  seedLibrary();
   applyTheme();
   wire();
   audio.volume = settings.volume;
   audio.muted = settings.muted;
   syncVolumeUI();
   setSpeed(settings.speed);
-  $('ccBtn').setAttribute('aria-pressed', String(settings.captions));
-  $('autoNext').checked = settings.autoNext;
-  for (const [label, term] of TRY) $('tryChips').append(el('button', { type: 'button', text: label, onclick: () => { $('addInput').value = term; runSearch(term); } }));
-
-  renderShows();
+  syncCC();
+  $('npAuto').setAttribute('aria-pressed', String(settings.autoNext));
+  setLyrics(true);
+  if (!location.hash || location.hash === '#') history.replaceState(null, '', '#/home');
+  render();
   const last = store.get(KEY.last, {});
-  const start = shows.some(s => s.feedUrl === last.showUrl) ? last.showUrl : (shows[0] && shows[0].feedUrl);
-  if (start) selectShow(start); else renderShowHead();
-
-  if (last.epId && last.playShow) {
-    const show = shows.find(s => s.feedUrl === last.playShow);
-    const cached = store.get(KEY.cache(last.playShow), null);
-    const ep = cached && cached.episodes.find(e => e.id === last.epId);
-    if (show && ep) loadEpisode(ep, show, sortList(cached.episodes), false);
+  const r = last.epId && recent.find(x => x.ep.id === last.epId);
+  if (r) {
+    loadEpisode(r.ep, r.show, [{ ep: r.ep, show: r.show }], false);
+    Feeds.cached(r.show).then(c => { if (c && S.current && S.current.ep.id === r.ep.id) { const sorted = settings.sort === 'oldest' ? [...c.eps].reverse() : c.eps; if (sorted.some(e => e.id === r.ep.id)) S.queue = sorted.map(e => ({ ep: e, show: r.show })); } });
   }
-  updateNowPlaying();
   setPlaying(false);
-  renderTranscript();
-  renderCaption(true);
+  updateSleepLabel();
+  runSetup();
 }
 init();
 })();
