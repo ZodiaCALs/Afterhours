@@ -1,34 +1,43 @@
 #!/usr/bin/env python3
 """
-夜更かしラジオ (After Hours) 2.0: a small, private podcast player.
+Afterhours 3.0: a small, private podcast player.
 
 Run it:    python3 afterhours.py        (Windows: py afterhours.py)
 It opens:  http://127.0.0.1:8765  in your browser
 
-Needs only Python 3.8 or newer, with nothing extra to install.
+Needs only Python 3.8 or newer. Optional: to caption episodes that have no
+captions, install the free speech-recognition add-on once with
+    python3 afterhours.py --setup-captions
 
 Why a script and not just a web page: podcast sites don't let a web page read
 their feeds directly (browsers block it, a rule called CORS). This script serves
-the player and fetches feeds, transcripts, cover art and Apple Podcasts directory
-results on its behalf. It only listens on your own computer, and your library,
-progress and settings stay in your browser on this machine.
+the player and fetches feeds, websites, cover art and Apple Podcasts directory
+results on its behalf. It only listens on your own computer.
 
 Options:
-  --port 8765      use a different port (each port keeps its own library)
-  --no-browser     don't open the browser automatically
-  --verbose        log every request
+  --port 8765        use a different port (each port keeps its own library)
+  --no-browser       don't open the browser automatically
+  --setup-captions   install the caption recognition add-on, then exit
+  --verbose          log every request
+See README.md for details.
 """
 
 import argparse
 import collections
+import concurrent.futures
+import email.utils
 import gzip
+import hashlib
 import html
 import http.server
+import importlib.util
 import json
 import os
+import queue
 import re
 import socket
 import ssl
+import subprocess
 import sys
 import threading
 import time
@@ -37,23 +46,32 @@ import urllib.parse
 import urllib.request
 import webbrowser
 import zlib
+from datetime import datetime, timezone
+from html.parser import HTMLParser
+from pathlib import Path
 
+APP_NAME = "Afterhours"
 APP_ID = "afterhours"
-VERSION = "2.0"
+VERSION = "3.0.0"
 DEFAULT_PORT = 8765
 MAX_BYTES = 25 * 1024 * 1024
+MAX_AUDIO = 1536 * 1024 * 1024
 TIMEOUT = 25
-USER_AGENT = "Mozilla/5.0 (compatible; AfterHours/%s; personal podcast player)" % VERSION
+DATA_DIR = Path(os.environ.get("AFTERHOURS_DATA") or (Path.home() / ".afterhours"))
+APP_UA = "Mozilla/5.0 (compatible; Afterhours/%s; personal podcast player)" % VERSION
+BROWSER_UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36")
 ACCEPT = ("application/rss+xml, application/xml;q=0.9, text/xml;q=0.9, application/json;q=0.8, "
           "text/vtt;q=0.8, text/plain;q=0.6, */*;q=0.5")
-# Apple's public podcast directory. It allows roughly 20 requests a minute, so requests are paced.
+HTML_ACCEPT = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+RETRY_STATUS = (403, 405, 406, 429, 451, 503)
+# Apple's public podcast directory allows roughly 20 requests a minute, so requests are paced.
 APPLE_BASE = os.environ.get("AFTERHOURS_APPLE_BASE", "https://itunes.apple.com").rstrip("/")
 APPLE_INTERVAL = float(os.environ.get("AFTERHOURS_APPLE_INTERVAL", "3.1"))
 
 CERT_HELP = ("A secure connection couldn't be checked. On a Mac with Python from python.org, open "
-             "Applications > Python and run “Install Certificates.command”, then restart the player.")
-RATE_HELP = "Apple’s podcast directory asked the player to slow down. Try again in a minute."
-
+             "Applications > Python and run “Install Certificates.command”, then restart Afterhours.")
+RATE_HELP = "Apple’s podcast directory asked Afterhours to slow down. Try again in a minute."
 PAGE_CSP = ("default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; "
             "img-src * data: blob:; media-src * data: blob:; font-src 'self' data:; connect-src 'self'; "
             "frame-ancestors 'none'; base-uri 'none'; form-action 'none'")
@@ -80,33 +98,58 @@ class FetchError(Exception):
         self.upstream = upstream
 
 
-def fetch_url(url, max_bytes=MAX_BYTES, accept=ACCEPT, partial=False):
-    """Fetch a URL and return (bytes, content_type, final_url). With partial=True, keep the first max_bytes."""
+def _as_fetch_error(e):
+    if isinstance(e, FetchError):
+        return e
+    if isinstance(e, urllib.error.HTTPError):
+        return FetchError(502, "The site answered with an error (%s)." % e.code, upstream=e.code)
+    if isinstance(e, urllib.error.URLError):
+        reason = e.reason
+        if isinstance(reason, ssl.SSLCertVerificationError) or "CERTIFICATE_VERIFY_FAILED" in str(reason):
+            return FetchError(502, CERT_HELP)
+        if isinstance(reason, socket.timeout) or "timed out" in str(reason):
+            return FetchError(504, "The site took too long to answer.")
+        return FetchError(502, "Couldn't reach the site (%s)." % reason)
+    if isinstance(e, (socket.timeout, TimeoutError)):
+        return FetchError(504, "The site took too long to answer.")
+    return FetchError(502, "Couldn't load that address (%s)." % e.__class__.__name__)
+
+
+def open_url(url, accept=ACCEPT, timeout=TIMEOUT):
+    """Open a URL. If the site turns Afterhours away, try once more the way a browser would."""
     parts = urllib.parse.urlsplit(url)
     if parts.scheme not in ("http", "https") or not parts.netloc:
-        raise FetchError(400, "That isn't a web address the player can open.")
-    request = urllib.request.Request(url, headers={
-        "User-Agent": USER_AGENT, "Accept": accept, "Accept-Encoding": "gzip, deflate"})
+        raise FetchError(400, "That isn't a web address Afterhours can open.")
+
+    def attempt(browser):
+        headers = {"User-Agent": BROWSER_UA if browser else APP_UA, "Accept": accept, "Accept-Encoding": "gzip, deflate"}
+        if browser:
+            headers["Accept-Language"] = "en-GB,en;q=0.9,ja;q=0.8,zh;q=0.7"
+        return urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=timeout, context=SSL_CTX)
+
     try:
-        with urllib.request.urlopen(request, timeout=TIMEOUT, context=SSL_CTX) as resp:
+        return attempt(False)
+    except urllib.error.HTTPError as e:
+        if e.code not in RETRY_STATUS:
+            raise _as_fetch_error(e)
+        try:
+            return attempt(True)
+        except Exception as e2:
+            raise _as_fetch_error(e2)
+    except Exception as e:
+        raise _as_fetch_error(e)
+
+
+def fetch_url(url, max_bytes=MAX_BYTES, accept=ACCEPT, partial=False, timeout=TIMEOUT):
+    """Fetch a URL and return (bytes, content_type, final_url). With partial=True, keep the first max_bytes."""
+    try:
+        with open_url(url, accept, timeout) as resp:
             data = resp.read(max_bytes + 1)
             encoding = (resp.headers.get("Content-Encoding") or "").lower()
             ctype = resp.headers.get("Content-Type") or "application/octet-stream"
             final_url = resp.geturl()
-    except urllib.error.HTTPError as e:
-        raise FetchError(502, "The site answered with an error (%s)." % e.code, upstream=e.code)
-    except urllib.error.URLError as e:
-        reason = e.reason
-        if isinstance(reason, ssl.SSLCertVerificationError) or "CERTIFICATE_VERIFY_FAILED" in str(reason):
-            raise FetchError(502, CERT_HELP)
-        if isinstance(reason, socket.timeout) or "timed out" in str(reason):
-            raise FetchError(504, "The site took too long to answer.")
-        raise FetchError(502, "Couldn't reach the site (%s)." % reason)
-    except (socket.timeout, TimeoutError):
-        raise FetchError(504, "The site took too long to answer.")
-    except Exception as e:  # keep the helper alive whatever happens upstream
-        raise FetchError(502, "Couldn't load that address (%s)." % e.__class__.__name__)
-
+    except Exception as e:
+        raise _as_fetch_error(e)
     if len(data) > max_bytes:
         if not partial:
             raise FetchError(413, "That file is too large to load.")
@@ -120,7 +163,7 @@ def fetch_url(url, max_bytes=MAX_BYTES, accept=ACCEPT, partial=False):
             except zlib.error:
                 data = zlib.decompressobj(-zlib.MAX_WBITS).decompress(data)
     except Exception:
-        raise FetchError(502, "The site sent data the player couldn't unpack.")
+        raise FetchError(502, "The site sent data Afterhours couldn't unpack.")
     if len(data) > MAX_BYTES * 4:
         raise FetchError(413, "That file is too large to load.")
     return data, ctype, final_url
@@ -135,6 +178,18 @@ def decode_text(data, ctype):
         except LookupError:
             continue
     return data.decode("utf-8", errors="replace")
+
+
+def clean_text(s):
+    s = re.sub(r"<!\[CDATA\[(.*?)\]\]>", r"\1", s or "", flags=re.S)
+    return " ".join(html.unescape(re.sub(r"<[^>]+>", " ", s)).split())
+
+
+def html_to_text(s):
+    s = re.sub(r"(?i)<br\s*/?>", "\n", s or "")
+    s = re.sub(r"(?i)</(p|div|li|h[1-6])>", "\n\n", s)
+    s = html.unescape(re.sub(r"<[^>]+>", "", s))
+    return re.sub(r"\n{3,}", "\n\n", re.sub(r"[ \t]+", " ", s)).strip()
 
 
 # ---------- Apple Podcasts directory, paced and cached ----------
@@ -168,12 +223,6 @@ def apple_get(path, params):
 
 
 # ---------- feed header, read from the start of a feed only ----------
-def _clean(s):
-    s = re.sub(r"<!\[CDATA\[(.*?)\]\]>", r"\1", s, flags=re.S)
-    s = re.sub(r"<[^>]+>", "", s)
-    return html.unescape(s).strip()
-
-
 def feed_info(url):
     data, ctype, final_url = fetch_url(url, max_bytes=768 * 1024, partial=True)
     text = decode_text(data, ctype)
@@ -183,17 +232,416 @@ def feed_info(url):
 
     def first(pattern, source):
         m = re.search(pattern, source, re.I | re.S)
-        return _clean(m.group(1)) if m else ""
+        return clean_text(m.group(1)) if m else ""
 
     image = (first(r"<itunes:image\b[^>]*\bhref\s*=\s*[\"']([^\"']+)[\"']", head)
              or first(r"<image\b[^>]*>.*?<url[^>]*>(.*?)</url>", head))
-    return {
-        "title": first(r"<title[^>]*>(.*?)</title>", no_image),
-        "author": first(r"<itunes:author[^>]*>(.*?)</itunes:author>", head),
-        "image": image,
-        "link": first(r"<link[^>]*>(.*?)</link>", no_image),
-        "finalUrl": final_url,
-    }
+    return {"title": first(r"<title[^>]*>(.*?)</title>", no_image),
+            "author": first(r"<itunes:author[^>]*>(.*?)</itunes:author>", head),
+            "image": image, "link": first(r"<link[^>]*>(.*?)</link>", no_image), "finalUrl": final_url}
+
+
+# ---------- website crawler: used when a show's RSS feed doesn't work ----------
+AUDIO_RE = re.compile(r"https?://[^\s\"'<>\\]+?\.(?:mp3|m4a|m4b|aac|ogg|oga|opus|wav|flac)(?:\?[^\s\"'<>\\]*)?", re.I)
+AUDIO_KEYS = {"asseturl", "enclosureurl", "audiourl", "audio_url", "streamurl", "stream_url", "mediaurl",
+              "media_url", "playurl", "play_url", "mp3url", "downloadurl"}
+NEST_KEYS = {"enclosure", "audio", "media", "associatedmedia", "source", "file", "attachment", "mediasource"}
+TITLE_KEYS = ("title", "name", "headline", "episodeTitle")
+DATE_KEYS = ("datePublished", "pubDate", "releaseDate", "publishedAt", "published_at", "pub_date",
+             "publishDate", "date", "createdAt", "uploadDate")
+DUR_KEYS = ("duration", "durationInMilliseconds", "duration_ms", "durationMs", "length")
+DESC_KEYS = ("description", "summary", "shownotes", "abstract")
+IMG_KEYS = ("image", "artwork", "thumbnailUrl", "thumbnail", "cover", "picture")
+EPISODE_HINT = re.compile(r"(episode|/ep[-_/]?\d|/e/\d|podcast|/show|/listen|/audio|/radio|/archives?/|/\d{4}/\d{2}/|/p/|/post/|/posts/|/blog/)", re.I)
+SKIP_LINK = re.compile(r"(about|contact|privacy|terms|login|signin|sign-in|signup|register|cart|shop|store|/tag/|/tags/|"
+                       r"category|categories|/author/|search|subscribe|donate|\.(?:jpe?g|png|gif|svg|webp|pdf|zip)(?:\?|$))", re.I)
+FEED_GUESSES = ("feed", "feed/podcast", "podcast/feed", "rss", "rss.xml", "feed.xml", "podcast.xml",
+                "index.xml", "?format=rss", "podcast?format=rss", "episodes?format=rss")
+
+
+class PageScan(HTMLParser):
+    def __init__(self, base):
+        super().__init__(convert_charrefs=True)
+        self.base = base
+        self.feeds, self.audio, self.links, self.json_blocks, self.times = [], [], [], [], []
+        self.meta, self.title = {}, ""
+        self._in_title, self._script, self._a = False, None, None
+
+    def handle_starttag(self, tag, attrs):
+        a = {k.lower(): (v or "") for k, v in attrs}
+        join = lambda u: urllib.parse.urljoin(self.base, u.strip())
+        if tag == "link":
+            rel, typ = a.get("rel", "").lower(), a.get("type", "").lower()
+            if "alternate" in rel and ("rss" in typ or "atom" in typ) and a.get("href"):
+                self.feeds.append(join(a["href"]))
+        elif tag == "meta":
+            key = (a.get("property") or a.get("name") or a.get("itemprop") or "").lower()
+            if key and a.get("content") and key not in self.meta:
+                self.meta[key] = a["content"].strip()
+        elif tag == "title":
+            self._in_title = True
+        elif tag in ("audio", "source", "video"):
+            src = a.get("src") or a.get("data-src")
+            if src:
+                self.audio.append((join(src), a.get("title", "")))
+        elif tag == "a" and a.get("href"):
+            self._a = [join(a["href"]), []]
+        elif tag == "script":
+            typ, sid = a.get("type", "").lower(), a.get("id", "")
+            if "json" in typ or sid == "__NEXT_DATA__":
+                self._script = []
+        elif tag == "time" and a.get("datetime"):
+            self.times.append(a["datetime"])
+        for k, v in a.items():
+            if k.startswith("data-") and v and AUDIO_RE.fullmatch(v.strip()):
+                self.audio.append((join(v), ""))
+
+    def handle_endtag(self, tag):
+        if tag == "title":
+            self._in_title = False
+        elif tag == "a" and self._a:
+            self.links.append((self._a[0], " ".join("".join(self._a[1]).split())))
+            self._a = None
+        elif tag == "script" and self._script is not None:
+            self.json_blocks.append("".join(self._script))
+            self._script = None
+
+    def handle_data(self, data):
+        if self._in_title:
+            self.title += data
+        if self._a is not None:
+            self._a[1].append(data)
+        if self._script is not None:
+            self._script.append(data)
+
+
+def scan_page(text, base):
+    scan = PageScan(base)
+    try:
+        scan.feed(text)
+        scan.close()
+    except Exception:
+        pass
+    return scan
+
+
+def looks_like_rss(text):
+    head = text[:5000].lower()
+    return "<rss" in head or ("<channel" in head and "<item" in text.lower())
+
+
+def to_epoch_ms(v):
+    if v is None or v == "" or isinstance(v, bool):
+        return 0
+    if isinstance(v, (int, float)):
+        x = float(v)
+        return int(x if x > 1e12 else x * 1000) if x > 1e8 else 0
+    s = str(v).strip()
+    if re.fullmatch(r"\d{10,13}", s):
+        return to_epoch_ms(int(s))
+    try:
+        d = email.utils.parsedate_to_datetime(s)
+        if d:
+            return int(d.timestamp() * 1000)
+    except Exception:
+        pass
+    try:
+        d = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        if d.tzinfo is None:
+            d = d.replace(tzinfo=timezone.utc)
+        return int(d.timestamp() * 1000)
+    except Exception:
+        pass
+    m = re.match(r"(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})", s)
+    if m:
+        try:
+            return int(datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)), tzinfo=timezone.utc).timestamp() * 1000)
+        except ValueError:
+            return 0
+    return 0
+
+
+def to_seconds(v, key=""):
+    if v is None or v == "" or isinstance(v, bool):
+        return 0
+    k = key.lower()
+    if isinstance(v, (int, float)):
+        x = float(v)
+        if "milli" in k or k.endswith("ms") or x > 100000:
+            x /= 1000.0
+        return int(x)
+    s = str(v).strip()
+    m = re.fullmatch(r"PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+(?:\.\d+)?)S)?", s, re.I)
+    if m and any(m.groups()):
+        return int(int(m.group(1) or 0) * 3600 + int(m.group(2) or 0) * 60 + float(m.group(3) or 0))
+    if re.fullmatch(r"\d+(?::\d{1,2}){1,2}", s):
+        total = 0
+        for p in s.split(":"):
+            total = total * 60 + int(p)
+        return total
+    if re.fullmatch(r"\d+(?:\.\d+)?", s):
+        return to_seconds(float(s), key)
+    return 0
+
+
+def pick(d, keys):
+    lower = {str(k).lower(): v for k, v in d.items()}
+    for key in keys:
+        v = lower.get(key.lower())
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            return v
+        if isinstance(v, dict):
+            for kk in ("url", "src", "href", "contentUrl", "@id", "text", "value"):
+                if isinstance(v.get(kk), str) and v[kk].strip():
+                    return v[kk].strip()
+        if isinstance(v, list) and v:
+            first = v[0]
+            if isinstance(first, str) and first.strip():
+                return first.strip()
+            if isinstance(first, dict):
+                for kk in ("url", "src", "href"):
+                    if isinstance(first.get(kk), str):
+                        return first[kk]
+    return ""
+
+
+def episode_from(d, audio, base):
+    duration = 0
+    for key in DUR_KEYS:
+        for k, v in d.items():
+            if str(k).lower() == key.lower() and v not in (None, ""):
+                duration = to_seconds(v, str(k))
+                break
+        if duration:
+            break
+    img = pick(d, IMG_KEYS)
+    return {"url": urllib.parse.urljoin(base, audio), "title": clean_text(str(pick(d, TITLE_KEYS)))[:300],
+            "date": to_epoch_ms(pick(d, DATE_KEYS)), "duration": duration,
+            "image": urllib.parse.urljoin(base, img) if isinstance(img, str) and img.startswith(("http", "/")) else "",
+            "desc": html_to_text(str(pick(d, DESC_KEYS)))[:1600],
+            "guid": str(d.get("guid") or d.get("eid") or d.get("id") or "")[:200]}
+
+
+def walk_json(obj, out, base, depth=0):
+    """Find episode-like objects (anything carrying an audio file) in a page's embedded JSON."""
+    if depth > 14 or len(out) > 600:
+        return
+    if isinstance(obj, dict):
+        audio = None
+        for k, v in obj.items():
+            key = str(k).lower()
+            if isinstance(v, str):
+                s = v.strip()
+                if AUDIO_RE.fullmatch(s) or (key in AUDIO_KEYS and s.startswith("http")):
+                    audio = s
+                    break
+            elif isinstance(v, dict) and key in NEST_KEYS:
+                inner = v.get("source")
+                u = v.get("url") or v.get("src") or v.get("contentUrl") or (inner.get("url") if isinstance(inner, dict) else None)
+                if isinstance(u, str) and (AUDIO_RE.fullmatch(u.strip()) or key in ("enclosure", "associatedmedia")):
+                    audio = u.strip()
+                    break
+        if audio:
+            out.append(episode_from(obj, audio, base))
+        for v in obj.values():
+            if isinstance(v, (dict, list)):
+                walk_json(v, out, base, depth + 1)
+    elif isinstance(obj, list):
+        for v in obj:
+            walk_json(v, out, base, depth + 1)
+
+
+def page_info(scan, base):
+    meta = scan.meta
+    title = meta.get("og:site_name") or meta.get("og:title") or clean_text(scan.title)
+    return {"title": clean_text(title)[:200], "image": urllib.parse.urljoin(base, meta.get("og:image", "")) if meta.get("og:image") else "",
+            "description": html_to_text(meta.get("og:description") or meta.get("description") or "")[:1200], "link": base}
+
+
+def page_episodes(scan, text, base):
+    out = []
+    for block in scan.json_blocks:
+        block = block.strip()
+        if block[:1] not in ("{", "["):
+            continue
+        try:
+            walk_json(json.loads(block), out, base)
+        except Exception:
+            continue
+    meta = scan.meta
+    page_title = clean_text(meta.get("og:title") or scan.title)
+    page_date = to_epoch_ms(meta.get("article:published_time") or meta.get("datepublished") or (scan.times[0] if scan.times else ""))
+    page_img = urllib.parse.urljoin(base, meta["og:image"]) if meta.get("og:image") else ""
+    page_desc = html_to_text(meta.get("og:description") or meta.get("description") or "")[:1600]
+    extra = []
+    for key in ("og:audio", "og:audio:url", "og:audio:secure_url", "twitter:player:stream"):
+        u = meta.get(key, "")
+        if u and AUDIO_RE.fullmatch(urllib.parse.urljoin(base, u)):
+            extra.append((urllib.parse.urljoin(base, u), page_title))
+    extra += [(src, t) for src, t in scan.audio if AUDIO_RE.fullmatch(src)]
+    extra += [(href, label) for href, label in scan.links if AUDIO_RE.fullmatch(href)]
+    for u, t in extra:
+        out.append({"url": u, "title": clean_text(t) or page_title, "date": page_date, "duration": 0,
+                    "image": page_img, "desc": page_desc, "guid": ""})
+    if not out:  # last resort: audio addresses written anywhere in the page, such as inside a player's script
+        for i, m in enumerate(AUDIO_RE.finditer(text.replace("\\/", "/"))):
+            if i >= 60:
+                break
+            out.append({"url": html.unescape(m.group(0)), "title": "", "date": 0, "duration": 0,
+                        "image": page_img, "desc": "", "guid": ""})
+    for e in out:
+        e["title"] = e["title"] or page_title
+        e["image"] = e["image"] or page_img
+    return out
+
+
+def episode_links(scan, base):
+    def host_of(u):
+        h = urllib.parse.urlsplit(u).netloc.lower()
+        return h[4:] if h.startswith("www.") else h
+    host, here, seen, out = host_of(base), base.split("#")[0].rstrip("/"), set(), []
+    for href, _label in scan.links:
+        u = urllib.parse.urlsplit(href)
+        if u.scheme not in ("http", "https"):
+            continue
+        h = host_of(href)
+        if h != host and not h.endswith("." + host):
+            continue
+        clean = urllib.parse.urlunsplit((u.scheme, u.netloc, u.path, u.query, ""))
+        path = u.path + ("?" + u.query if u.query else "")
+        if clean.rstrip("/") == here or clean in seen or SKIP_LINK.search(path) or not EPISODE_HINT.search(path):
+            continue
+        seen.add(clean)
+        out.append(clean)
+        if len(out) >= 16:
+            break
+    return out
+
+
+def episode_page(url):
+    try:
+        data, ctype, final = fetch_url(url, max_bytes=2 * 1024 * 1024, accept=HTML_ACCEPT, partial=True, timeout=12)
+    except FetchError:
+        return []
+    text = decode_text(data, ctype)
+    scan = scan_page(text, final)
+    eps = page_episodes(scan, text, final)
+    if not eps:
+        return []
+    e = eps[0]  # on an episode's own page, the main audio is the episode
+    meta = scan.meta
+    e["title"] = clean_text(meta.get("og:title") or scan.title) or e["title"]
+    e["date"] = e["date"] or to_epoch_ms(meta.get("article:published_time") or (scan.times[0] if scan.times else ""))
+    e["desc"] = e["desc"] or html_to_text(meta.get("og:description") or meta.get("description") or "")[:1600]
+    e["link"] = final
+    return [e]
+
+
+STOP_WORDS = {"the", "and", "with", "from", "podcast", "podcasts", "show", "radio", "official", "episodes", "episode",
+              "home", "feed", "rss", "channel", "new", "site", "page", "listen"}
+
+
+def titles_related(a, b):
+    """Loose check that two titles name the same show (works for spaced and CJK titles)."""
+    na, nb = re.sub(r"[\W_]+", "", (a or "").lower()), re.sub(r"[\W_]+", "", (b or "").lower())
+    if not na or not nb:
+        return False
+    if na in nb or nb in na:
+        return True
+    words = lambda s: {w for w in re.findall(r"[a-z0-9]+", (s or "").lower()) if len(w) >= 3 and w not in STOP_WORDS}
+    if words(a) & words(b):
+        return True
+    bigrams = lambda s: {s[i:i + 2] for i in range(len(s) - 1)}
+    cjk = re.compile(r"[\u3040-\u30ff\u3400-\u9fff]")
+    return bool(cjk.search(na) and cjk.search(nb) and len(bigrams(na) & bigrams(nb)) >= 2)
+
+
+def feed_title_of(text):
+    cut = re.search(r"<item[\s>]", text, re.I)
+    head = re.sub(r"<image\b.*?</image>", "", text[:cut.start()] if cut else text[:20000], flags=re.I | re.S)
+    m = re.search(r"<title[^>]*>(.*?)</title>", head, re.I | re.S)
+    return clean_text(m.group(1)) if m else ""
+
+
+def first_working_feed(candidates, wants=None):
+    """Check candidate feed addresses in parallel; return the first (in priority order) with audio episodes.
+    Guessed addresses (wants given) must also carry a title that matches the show."""
+    def check(url):
+        try:
+            data, ctype, final = fetch_url(url, max_bytes=2 * 1024 * 1024, partial=True, timeout=10)
+        except FetchError:
+            return ""
+        text = decode_text(data, ctype)
+        if not (looks_like_rss(text) and re.search(r"<enclosure\b", text, re.I)):
+            return ""
+        if wants is not None and not any(titles_related(feed_title_of(text), w) for w in wants if w):
+            return ""
+        return final
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+        for result in pool.map(check, candidates):
+            if result:
+                return result
+    return ""
+
+
+_crawl_cache = {}
+
+
+def crawl(url, hint=""):
+    hit = _crawl_cache.get(url + "|" + hint)
+    if hit and time.time() - hit[0] < 1800:
+        return hit[1]
+    data, ctype, final = fetch_url(url, max_bytes=4 * 1024 * 1024, accept=HTML_ACCEPT + ",application/rss+xml;q=0.9", partial=True, timeout=15)
+    text = decode_text(data, ctype)
+    if looks_like_rss(text):
+        if not re.search(r"<enclosure\b", text, re.I):
+            raise FetchError(422, "That feed has no audio episodes.")
+        result = {"source": "rss", "feedUrl": final, "pageUrl": final, "show": {}, "episodes": []}
+    else:
+        scan = scan_page(text, final)
+        explicit = list(scan.feeds)
+        explicit += [h for h, _ in scan.links if re.search(r"(/feed\b|/rss\b|rss\.xml|feed\.xml|podcast\.xml|format=rss)", h, re.I)]
+        for apple_id in list(dict.fromkeys(re.findall(r"podcasts\.apple\.com/[^\"'\s<>]*?/id(\d{5,12})", text)))[:2]:
+            try:
+                for item in json.loads(apple_get("/lookup", {"id": apple_id, "country": "gb"}).decode("utf-8")).get("results", []):
+                    if item.get("feedUrl"):
+                        explicit.append(item["feedUrl"])
+            except Exception:
+                pass
+        root = "{0.scheme}://{0.netloc}/".format(urllib.parse.urlsplit(final))
+        page = final.split("?")[0].split("#")[0]
+        page = page if page.endswith("/") else page + "/"
+        guesses = []
+        for guess in FEED_GUESSES:
+            guesses += [urllib.parse.urljoin(page, guess), urllib.parse.urljoin(root, guess)]
+        tidy = lambda xs: [c for c in dict.fromkeys(xs) if c.startswith("http") and c.rstrip("/") != final.rstrip("/")]
+        explicit = tidy(explicit)[:10]
+        guesses = [g for g in tidy(guesses) if g not in explicit][:14]
+        show = page_info(scan, final)
+        feed = first_working_feed(explicit) or first_working_feed(guesses, wants=[hint, show["title"], clean_text(scan.title)])
+        if feed:
+            result = {"source": "rss", "feedUrl": feed, "pageUrl": final, "show": show, "episodes": []}
+        else:
+            eps = page_episodes(scan, text, final)
+            if len(eps) < 3:
+                links = episode_links(scan, final)
+                with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+                    for got in pool.map(episode_page, links):
+                        eps.extend(got)
+            seen, unique = set(), []
+            for e in eps:
+                if e["url"] not in seen:
+                    seen.add(e["url"])
+                    unique.append(e)
+            if sum(1 for e in unique if e["date"]) >= max(1, len(unique) // 2):
+                unique.sort(key=lambda e: e["date"], reverse=True)
+            if not unique:
+                raise FetchError(404, "Afterhours couldn’t find a feed or any episodes on that page.")
+            result = {"source": "web", "feedUrl": "", "pageUrl": final, "show": show, "episodes": unique[:200]}
+    _crawl_cache[url + "|" + hint] = (time.time(), result)
+    return result
 
 
 # ---------- cover art through this origin, so the page can read its colours ----------
@@ -206,8 +654,7 @@ def get_image(url):
         if url in _img_cache:
             _img_cache.move_to_end(url)
             return _img_cache[url]
-    data, ctype, _ = fetch_url(url, max_bytes=8 * 1024 * 1024,
-                               accept="image/avif,image/webp,image/png,image/jpeg,image/*;q=0.8")
+    data, ctype, _ = fetch_url(url, max_bytes=8 * 1024 * 1024, accept="image/avif,image/webp,image/png,image/jpeg,image/*;q=0.8")
     if not ctype.lower().startswith("image/"):
         sniff = data[:12]
         if sniff.startswith(b"\x89PNG"):
@@ -227,8 +674,243 @@ def get_image(url):
     return data, ctype
 
 
+# ---------- caption recognition (runs on this computer with faster-whisper) ----------
+MODELS = ("tiny", "base", "small", "medium")
+MODEL_SIZES = {"tiny": "75 MB", "base": "145 MB", "small": "480 MB", "medium": "1.5 GB"}
+INSTALL_HINT = "python3 afterhours.py --setup-captions"
+
+
+class Cancelled(Exception):
+    pass
+
+
+def split_words(seg, offset):
+    """Turn one recognised segment into short caption lines using its word timings."""
+    words = list(getattr(seg, "words", None) or [])
+    text = (getattr(seg, "text", "") or "").strip()
+    if not words:
+        if text:
+            yield {"start": round(seg.start + offset, 2), "end": round(seg.end + offset, 2), "text": text}
+        return
+    cur, start, end = "", None, None
+    for w in words:
+        if start is None:
+            start = w.start
+        cur += w.word or ""
+        end = w.end
+        t = cur.strip()
+        if len(t) >= 84 or end - start >= 6.5 or re.search(r"[.!?。！？…]$", t):
+            if t:
+                yield {"start": round(start + offset, 2), "end": round(end + offset, 2), "text": t}
+            cur, start = "", None
+    t = cur.strip()
+    if t and start is not None:
+        yield {"start": round(start + offset, 2), "end": round(end + offset, 2), "text": t}
+
+
+class WhisperEngine:
+    name = "faster-whisper"
+
+    def __init__(self):
+        import faster_whisper
+        self.fw = faster_whisper
+        self.loaded = {}
+
+    def model(self, size, job):
+        if size not in self.loaded:
+            job["message"] = "Loading the %s speech model. The first time, it downloads once (about %s)." % (size, MODEL_SIZES.get(size, ""))
+            try:
+                import ctranslate2
+                cuda = ctranslate2.get_cuda_device_count() > 0
+            except Exception:
+                cuda = False
+            self.loaded[size] = self.fw.WhisperModel(size, device="cuda" if cuda else "cpu",
+                                                     compute_type="float16" if cuda else "int8")
+            job["message"] = ""
+        return self.loaded[size]
+
+    def decode(self, path):
+        return self.fw.decode_audio(str(path), sampling_rate=16000)
+
+    def segments(self, model, audio, a, b, lang, on_language):
+        chunk = audio[int(a * 16000):int(b * 16000)]
+        if len(chunk) < 16000:
+            return
+        segs, info = model.transcribe(chunk, language=lang or None, vad_filter=True, beam_size=1,
+                                      condition_on_previous_text=False, word_timestamps=True)
+        on_language(getattr(info, "language", "") or "")
+        for seg in segs:
+            for cue in split_words(seg, a):
+                yield cue
+
+
+class MockAudio:
+    def __init__(self, seconds):
+        self.seconds = seconds
+
+    def __len__(self):
+        return int(self.seconds * 16000)
+
+
+class MockEngine:
+    """Stand-in engine for testing the caption pipeline without the speech model."""
+    name = "mock"
+
+    def model(self, size, job):
+        return None
+
+    def decode(self, path):
+        try:
+            import wave
+            with wave.open(str(path)) as w:
+                return MockAudio(w.getnframes() / float(w.getframerate()))
+        except Exception:
+            return MockAudio(120.0)
+
+    def segments(self, model, audio, a, b, lang, on_language):
+        on_language(lang or "en")
+        t = a
+        while t < b - 0.5:
+            time.sleep(0.04)
+            yield {"start": round(t, 2), "end": round(min(b, t + 3.6), 2),
+                   "text": "Recognised speech at %d:%02d." % (int(t) // 60, int(t) % 60)}
+            t += 4.0
+
+
+def caption_engine_name():
+    if os.environ.get("AFTERHOURS_ASR_ENGINE") == "mock":
+        return "mock"
+    return "faster-whisper" if importlib.util.find_spec("faster_whisper") else ""
+
+
+class CaptionJobs:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.jobs = {}
+        self.queue = queue.Queue()
+        self.engine = None
+        self.worker = None
+
+    @staticmethod
+    def key(url, model):
+        return hashlib.sha1((url + "|" + model).encode("utf-8")).hexdigest()[:24]
+
+    def cache_path(self, key):
+        return DATA_DIR / "captions" / (key + ".json")
+
+    def start(self, url, model, start, lang):
+        key = self.key(url, model)
+        with self.lock:
+            job = self.jobs.get(key)
+            if job and job["state"] not in ("error", "cancelled"):
+                return self._status(job, 0)
+            job = {"key": key, "url": url, "model": model, "start": start, "lang": lang, "state": "queued",
+                   "progress": 0.0, "message": "", "language": "", "segments": [], "error": "", "cancel": False}
+            try:
+                cached = json.loads(self.cache_path(key).read_text(encoding="utf-8"))
+                job.update(state="done", progress=1.0, language=cached.get("language", ""), segments=cached.get("segments", []))
+            except Exception:
+                pass
+            self.jobs[key] = job
+            if job["state"] != "done":
+                if not self.worker:
+                    self.worker = threading.Thread(target=self._work, daemon=True)
+                    self.worker.start()
+                self.queue.put(key)
+            return self._status(job, 0)
+
+    def status(self, url, model, since):
+        with self.lock:
+            job = self.jobs.get(self.key(url, model))
+            return self._status(job, since) if job else {"state": "none"}
+
+    def cancel(self, url, model):
+        with self.lock:
+            job = self.jobs.get(self.key(url, model))
+            if job and job["state"] not in ("done", "error"):
+                job["cancel"] = True
+                job["state"] = "cancelled"
+        return {"state": "cancelled"}
+
+    @staticmethod
+    def _status(job, since):
+        return {"state": job["state"], "progress": round(job["progress"], 4), "message": job["message"],
+                "language": job["language"], "model": job["model"], "error": job["error"],
+                "total": len(job["segments"]), "segments": job["segments"][max(0, since):]}
+
+    def _work(self):
+        while True:
+            key = self.queue.get()
+            job = self.jobs.get(key)
+            if not job or job["cancel"]:
+                continue
+            try:
+                self._run(job)
+            except Cancelled:
+                pass
+            except FetchError as e:
+                job.update(state="error", error=e.message)
+            except Exception as e:
+                job.update(state="error", error="Caption recognition stopped (%s: %s)." % (e.__class__.__name__, str(e)[:160]))
+
+    def _run(self, job):
+        if self.engine is None:
+            self.engine = MockEngine() if caption_engine_name() == "mock" else WhisperEngine()
+        tmp_dir = DATA_DIR / "tmp"
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        ext = os.path.splitext(urllib.parse.urlsplit(job["url"]).path)[1][:6] or ".audio"
+        path = tmp_dir / (job["key"] + ext)
+        try:
+            job.update(state="downloading", progress=0.0)
+            with open_url(job["url"], accept="audio/*,*/*;q=0.8", timeout=30) as resp, open(path, "wb") as f:
+                total, got = int(resp.headers.get("Content-Length") or 0), 0
+                while True:
+                    if job["cancel"]:
+                        raise Cancelled()
+                    chunk = resp.read(256 * 1024)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    got += len(chunk)
+                    if got > MAX_AUDIO:
+                        raise FetchError(413, "That episode is too large to caption.")
+                    job["progress"] = got / total if total else 0.0
+            job.update(state="loading", progress=0.0)
+            model = self.engine.model(job["model"], job)
+            audio = self.engine.decode(path)
+            duration = len(audio) / 16000.0
+            start = min(max(0.0, job["start"] - 2.0), duration)
+            passes = [(start, duration), (0.0, start)] if start > 5 else [(0.0, duration)]
+            job.update(state="transcribing", progress=0.0)
+            done = 0.0
+
+            def on_language(code):
+                if code and not job["language"]:
+                    job["language"] = code
+            for a, b in passes:
+                for cue in self.engine.segments(model, audio, a, b, job["lang"], on_language):
+                    if job["cancel"]:
+                        raise Cancelled()
+                    with self.lock:
+                        job["segments"].append(cue)
+                        job["progress"] = min(0.999, (done + max(0.0, cue["end"] - a)) / max(1.0, duration))
+                done += b - a
+            self.cache_path(job["key"]).parent.mkdir(parents=True, exist_ok=True)
+            self.cache_path(job["key"]).write_text(json.dumps({"url": job["url"], "model": job["model"], "language": job["language"],
+                                                              "segments": job["segments"], "created": time.time()}), encoding="utf-8")
+            job.update(state="done", progress=1.0)
+        finally:
+            try:
+                path.unlink()
+            except Exception:
+                pass
+
+
+CAPTIONS = CaptionJobs()
+
+
 class Handler(http.server.BaseHTTPRequestHandler):
-    server_version = "AfterHours/" + VERSION
+    server_version = "Afterhours/" + VERSION
     sys_version = ""
     protocol_version = "HTTP/1.1"
 
@@ -269,7 +951,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def do_GET(self):
         if not self._host_ok():
-            return self._error(403, "This player only answers on 127.0.0.1.")
+            return self._error(403, "Afterhours only answers on 127.0.0.1.")
         path, _, query = self.path.partition("?")
         params = urllib.parse.parse_qs(query)
         arg = lambda name, default="": (params.get(name) or [default])[0].strip()
@@ -277,7 +959,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if path in ("/", "/index.html"):
                 return self._send(200, PAGE, "text/html; charset=utf-8", {"Content-Security-Policy": PAGE_CSP})
             if path == "/api/ping":
-                return self._json({"app": APP_ID, "version": VERSION})
+                return self._json({"app": APP_ID, "name": APP_NAME, "version": VERSION})
             if path == "/api/fetch":
                 data, ctype, final_url = fetch_url(arg("url"))
                 return self._send(200, data, ctype, {
@@ -285,6 +967,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     "Content-Security-Policy": "default-src 'none'; sandbox"})  # never runs as a page here
             if path == "/api/feedinfo":
                 return self._json(feed_info(arg("url")))
+            if path == "/api/crawl":
+                return self._json(crawl(arg("url"), arg("title")))
             if path == "/api/image":
                 data, ctype = get_image(arg("url"))
                 return self._send(200, data, ctype, {"Content-Security-Policy": "default-src 'none'; sandbox"},
@@ -301,14 +985,40 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         limit = max(1, min(50, int(arg("limit", "20"))))
                     except ValueError:
                         limit = 20
-                    data = apple_get("/search", {"media": "podcast", "entity": "podcast", "term": term,
-                                                 "country": country, "limit": limit})
+                    data = apple_get("/search", {"media": "podcast", "entity": "podcast", "term": term, "country": country, "limit": limit})
                 else:
                     ids = re.findall(r"\d{3,12}", arg("id"))[:50]
                     if not ids:
                         return self._error(400, "No podcast IDs given.")
                     data = apple_get("/lookup", {"id": ",".join(ids), "country": country})
                 return self._send(200, data, "application/json; charset=utf-8")
+            if path.startswith("/api/captions"):
+                engine = caption_engine_name()
+                if path == "/api/captions":
+                    return self._json({"available": bool(engine), "engine": engine, "models": list(MODELS),
+                                       "sizes": MODEL_SIZES, "install": INSTALL_HINT})
+                if not engine:
+                    return self._error(501, "Caption recognition isn’t installed. Run: " + INSTALL_HINT)
+                url, model = arg("url"), arg("model", "base")
+                if model not in MODELS:
+                    model = "base"
+                if not url.startswith(("http://", "https://")):
+                    return self._error(400, "That episode has no audio address.")
+                if path == "/api/captions/start":
+                    lang = arg("lang").lower()
+                    try:
+                        start = max(0.0, float(arg("start", "0")))
+                    except ValueError:
+                        start = 0.0
+                    return self._json(CAPTIONS.start(url, model, start, lang if re.fullmatch(r"[a-z]{2}", lang) else ""))
+                if path == "/api/captions/status":
+                    try:
+                        since = max(0, int(arg("since", "0")))
+                    except ValueError:
+                        since = 0
+                    return self._json(CAPTIONS.status(url, model, since))
+                if path == "/api/captions/cancel":
+                    return self._json(CAPTIONS.cancel(url, model))
             if path == "/favicon.ico":
                 return self._send(204, b"", "image/x-icon")
             return self._error(404, "Not found.")
@@ -330,34 +1040,51 @@ def already_running(port):
         return False
 
 
+def setup_captions():
+    print("Installing the caption recognition add-on (faster-whisper). This takes a minute or two…")
+    cmd = [sys.executable, "-m", "pip", "install", "--upgrade", "faster-whisper"]
+    if subprocess.call(cmd) != 0 and subprocess.call(cmd + ["--user"]) != 0:
+        venv = DATA_DIR / "venv"
+        print("\nThis Python doesn’t allow installing add-ons directly. Use a small private environment instead:\n"
+              "  python3 -m venv \"%s\"\n  \"%s\" -m pip install faster-whisper\n  \"%s\" afterhours.py\n"
+              % (venv, venv / ("Scripts/python.exe" if os.name == "nt" else "bin/python"), venv / ("Scripts/python.exe" if os.name == "nt" else "bin/python")))
+        return 1
+    print("\nDone. Start Afterhours again, and episodes without captions will be captioned on this computer.\n"
+          "The speech model downloads once, the first time it’s needed.")
+    return 0
+
+
 def main():
     for stream in (sys.stdout, sys.stderr):
         try:
             stream.reconfigure(errors="replace")
         except Exception:
             pass
-    parser = argparse.ArgumentParser(description="夜更かしラジオ (After Hours): a small, private podcast player.")
+    parser = argparse.ArgumentParser(description="Afterhours: a small, private podcast player.")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT, help="port to use (default %d)" % DEFAULT_PORT)
     parser.add_argument("--no-browser", action="store_true", help="don't open the browser automatically")
+    parser.add_argument("--setup-captions", action="store_true", help="install the caption recognition add-on, then exit")
     parser.add_argument("--verbose", action="store_true", help="log every request")
     args = parser.parse_args()
+    if args.setup_captions:
+        sys.exit(setup_captions())
     url = "http://127.0.0.1:%d/" % args.port
-
     try:
         server = Server(("127.0.0.1", args.port), Handler)
     except OSError:
         if already_running(args.port):
-            print("The player is already running at %s" % url)
+            print("Afterhours is already running at %s" % url)
             if not args.no_browser:
                 webbrowser.open(url)
             return
         print("Port %d is in use by another program. Try:  python3 afterhours.py --port %d\n"
-              "Each port keeps its own library, so pick one and stick with it." % (args.port, args.port + 1),
-              file=sys.stderr)
+              "Each port keeps its own library, so pick one and stick with it." % (args.port, args.port + 1), file=sys.stderr)
         sys.exit(1)
-
     server.verbose = args.verbose
-    print("夜更かしラジオ is running at %s\nKeep this window open while you listen. Press Ctrl+C to stop." % url)
+    engine = caption_engine_name()
+    print("Afterhours %s is running at %s\n%s\nKeep this window open while you listen. Press Ctrl+C to stop."
+          % (VERSION, url, "Caption recognition: on (%s)." % engine if engine else
+             "Caption recognition: off. To caption episodes that have none, run:  " + INSTALL_HINT))
     if not args.no_browser:
         threading.Timer(0.6, lambda: webbrowser.open(url)).start()
     try:
@@ -375,7 +1102,7 @@ PAGE = r'''<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="color-scheme" content="light dark">
 <meta name="referrer" content="no-referrer">
-<title>夜更かしラジオ</title>
+<title>Afterhours</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0' y1='0' x2='0' y2='1'%3E%3Cstop offset='0' stop-color='%23FFC15E'/%3E%3Cstop offset='.6' stop-color='%23F26B7A'/%3E%3Cstop offset='1' stop-color='%23B2418F'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect width='64' height='64' rx='14' fill='%2321184F'/%3E%3Ccircle cx='32' cy='32' r='20' fill='url(%23g)'/%3E%3C/svg%3E">
 <style>
 :root {
@@ -388,7 +1115,6 @@ PAGE = r'''<!DOCTYPE html>
   --pop-bg: #FFFFFF;
   --font: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI Variable Text", "Segoe UI", system-ui, Roboto, "Helvetica Neue", Arial, "Hiragino Sans", "Hiragino Kaku Gothic ProN", "PingFang SC", "Noto Sans JP", "Noto Sans CJK JP", "Microsoft YaHei", sans-serif;
   --font-display: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Segoe UI Variable Display", "Segoe UI", system-ui, Roboto, "Helvetica Neue", Arial, "Hiragino Sans", "PingFang SC", "Noto Sans JP", "Noto Sans CJK JP", sans-serif;
-  --font-brand: "Hiragino Mincho ProN", "Yu Mincho", YuMincho, "Noto Serif JP", "Noto Serif CJK JP", "Songti SC", serif;
   --side-w: 248px; --bar-h: 72px; --gutter: clamp(20px, 4vw, 48px);
   --th: 335; --ts: 62%; --tl: 52%;
   color-scheme: light;
@@ -438,7 +1164,7 @@ input[type=search]::-webkit-search-decoration, input[type=search]::-webkit-searc
 /* Shell */
 .app { display: grid; grid-template-columns: var(--side-w) minmax(0, 1fr); height: 100%; }
 .main { position: relative; height: 100%; min-height: 0; overflow-y: auto; overflow-x: hidden; outline: none; }
-.view { max-width: 1240px; margin: 0 auto; padding: 36px var(--gutter) 150px; animation: viewIn .32s cubic-bezier(.2,.8,.2,1); }
+.view { container: view / inline-size; max-width: 1240px; margin: 0 auto; padding: 36px var(--gutter) 150px; animation: viewIn .32s cubic-bezier(.2,.8,.2,1); }
 @keyframes viewIn { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
 
 /* Sidebar */
@@ -447,7 +1173,7 @@ input[type=search]::-webkit-search-decoration, input[type=search]::-webkit-searc
 .brand-sun { flex: none; width: 24px; height: 24px; border-radius: 50%; background: linear-gradient(#FFC15E, #F26B7A 60%, #B2418F); box-shadow: 0 3px 10px -2px rgba(242,107,122,.55);
   -webkit-mask: linear-gradient(#000 0 56%, transparent 56% 61%, #000 61% 69%, transparent 69% 75%, #000 75% 83%, transparent 83% 90%, #000 90%);
           mask: linear-gradient(#000 0 56%, transparent 56% 61%, #000 61% 69%, transparent 69% 75%, #000 75% 83%, transparent 83% 90%, #000 90%); }
-.brand-name { font-family: var(--font-brand); font-weight: 700; font-size: 17px; letter-spacing: .05em; white-space: nowrap; }
+.brand-name { font-family: var(--font-display); font-weight: 700; font-size: 18px; letter-spacing: -.015em; white-space: nowrap; }
 .side-search { display: flex; align-items: center; gap: 7px; height: 32px; margin: 0 2px 10px; padding: 0 10px; border-radius: 9px; background: var(--fill); }
 .side-search svg { width: 15px; height: 15px; color: var(--text-3); }
 .side-search input { flex: 1; min-width: 0; border: 0; background: none; outline: none; font-size: 13.5px; }
@@ -634,7 +1360,7 @@ body:not(.is-playing) .eq i { animation-play-state: paused; }
 .inline-add input:focus { box-shadow: 0 0 0 3px var(--accent-soft); }
 
 /* Player bar */
-.bar { position: fixed; z-index: 50; left: calc(var(--side-w) + 16px); right: 16px; bottom: calc(14px + env(safe-area-inset-bottom, 0px)); height: var(--bar-h); display: grid; grid-template-columns: minmax(180px, 1fr) minmax(300px, 1.5fr) minmax(180px, 1fr); align-items: center; gap: 18px; padding: 0 12px 0 10px; border-radius: 18px; background: var(--bar); -webkit-backdrop-filter: saturate(180%) blur(28px); backdrop-filter: saturate(180%) blur(28px); box-shadow: var(--shadow-float); transition: transform .45s cubic-bezier(.2,.8,.2,1), opacity .3s; }
+.bar { position: fixed; z-index: 50; left: calc(var(--side-w) + 16px); right: 16px; bottom: calc(14px + env(safe-area-inset-bottom, 0px)); height: var(--bar-h); max-width: 1200px; margin-inline: auto; container-type: inline-size; display: grid; grid-template-columns: minmax(0, 1fr) minmax(240px, 1.35fr) auto; align-items: center; gap: 16px; padding: 0 12px 0 10px; border-radius: 18px; background: var(--bar); -webkit-backdrop-filter: saturate(180%) blur(28px); backdrop-filter: saturate(180%) blur(28px); box-shadow: var(--shadow-float); transition: transform .45s cubic-bezier(.2,.8,.2,1), opacity .3s; }
 .bar.idle { transform: translateY(calc(100% + 40px)); opacity: 0; pointer-events: none; }
 .bar-info { display: flex; align-items: center; gap: 12px; min-width: 0; }
 .bar-art { flex: none; width: 52px; height: 52px; padding: 0; border: 0; border-radius: 10px; background: none; box-shadow: 0 6px 14px -6px rgba(0,0,0,.45); }
@@ -665,6 +1391,10 @@ body:not(.is-playing) .eq i { animation-play-state: paused; }
 .bar-prog { display: none; position: absolute; left: 14px; right: 14px; bottom: 4px; height: 2.5px; border-radius: 2px; background: var(--fill-2); overflow: hidden; }
 .bar-prog i { display: block; width: 0; height: 100%; background: hsl(var(--th) var(--ts) var(--tl)); }
 .bar .seek { --played: hsl(var(--th) var(--ts) var(--tl)); }
+/* the player bar sheds its least-used controls as it gets narrower, instead of overlapping */
+@container (max-width: 980px) { .bar .vol .seek { display: none; } }
+@container (max-width: 840px) { #barExpand { display: none; } }
+@container (max-width: 720px) { #barLyrics, #barSleep { display: none; } .bar-scrub { grid-template-columns: 38px minmax(0, 1fr) 42px; } }
 body.np-open .bar { opacity: 0; pointer-events: none; }
 
 /* Sliders */
@@ -694,11 +1424,11 @@ body.np-open .cap-pill { display: none; }
 .np-btn:hover { background: rgba(255,255,255,.22); }
 .np-btn[aria-pressed="true"] { background: #fff; color: #15121c; }
 .np-label { font-size: 13px; font-weight: 600; color: rgba(255,255,255,.72); }
-.np-body { position: relative; z-index: 1; flex: 1; min-height: 0; width: 100%; max-width: 1360px; margin: 0 auto; display: grid; grid-template-columns: minmax(300px, 430px) minmax(0, 1fr); align-items: center; gap: clamp(32px, 6vw, 96px); padding: 8px clamp(24px, 6vw, 88px) calc(26px + env(safe-area-inset-bottom, 0px)); }
+.np-body { position: relative; z-index: 1; flex: 1; min-height: 0; width: 100%; max-width: 1360px; margin: 0 auto; overflow-y: auto; overflow-x: hidden; scrollbar-width: none; display: grid; grid-template-columns: minmax(300px, 430px) minmax(0, 1fr); grid-template-rows: minmax(0, 1fr); align-items: stretch; gap: clamp(32px, 6vw, 96px); padding: 8px clamp(24px, 6vw, 88px) calc(26px + env(safe-area-inset-bottom, 0px)); }
 .np:not(.lyrics-on) .np-body { grid-template-columns: minmax(300px, 430px); justify-content: center; }
 .np:not(.lyrics-on) .np-right { display: none; }
-.np-left { display: flex; flex-direction: column; gap: 16px; min-height: 0; }
-.np-art { width: 100%; border-radius: 14px; overflow: hidden; box-shadow: 0 30px 60px -20px rgba(0,0,0,.75); transition: transform .55s cubic-bezier(.2,.8,.2,1); }
+.np-left { display: flex; flex-direction: column; gap: 16px; min-height: 0; margin-block: auto; }
+.np-art { flex: none; align-self: center; width: min(100%, max(170px, calc(100vh - 430px))); width: min(100%, max(170px, calc(100dvh - 430px))); border-radius: 14px; overflow: hidden; box-shadow: 0 30px 60px -20px rgba(0,0,0,.75); transition: transform .55s cubic-bezier(.2,.8,.2,1); }
 .np-art .art { border-radius: 14px; }
 .np.paused .np-art { transform: scale(.9); }
 .np-title { margin: 0; font-size: 21px; font-weight: 700; line-height: 1.25; letter-spacing: -.015em; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
@@ -770,14 +1500,16 @@ body.np-open .cap-pill { display: none; }
   .side-foot { align-items: center; }
   .side-tool { justify-content: center; width: 44px; height: 36px; padding: 0; }
   .side-tool span { display: none; }
-  .bar { grid-template-columns: minmax(150px, 1fr) minmax(260px, 1.4fr) auto; gap: 12px; }
+  .bar { gap: 12px; }
+  .sidebar { overflow-y: auto; scrollbar-width: none; }
   .bar .vol .seek { display: none; }
 }
 /* Phones */
 @media (max-width: 759px) {
   .app { grid-template-columns: minmax(0, 1fr); }
   .sidebar { display: none; }
-  .view { padding: 22px 18px calc(170px + env(safe-area-inset-bottom, 0px)); }
+  :root { --gutter: 18px; }
+  .view { padding: 22px var(--gutter) calc(170px + env(safe-area-inset-bottom, 0px)); }
   .page-title { font-size: 30px; }
   .tabbar { position: fixed; z-index: 55; left: 0; right: 0; bottom: 0; display: grid; grid-template-columns: repeat(4, 1fr); padding: 6px 4px calc(4px + env(safe-area-inset-bottom, 0px)); background: var(--bar); -webkit-backdrop-filter: saturate(180%) blur(28px); backdrop-filter: saturate(180%) blur(28px); border-top: .5px solid var(--sep); }
   .tabbar a { display: flex; flex-direction: column; align-items: center; gap: 2px; padding: 4px 0; font-size: 10.5px; font-weight: 600; color: var(--text-3); text-decoration: none; }
@@ -803,10 +1535,12 @@ body.np-open .cap-pill { display: none; }
 @media (max-width: 899px) {
   .np-body, .np:not(.lyrics-on) .np-body { display: flex; flex-direction: column; align-items: stretch; gap: 14px; padding: 4px 24px calc(20px + env(safe-area-inset-bottom, 0px)); }
   .np-left { display: contents; }
-  .np-art { order: 1; flex: 0 1 auto; width: min(100%, 44vh); align-self: center; }
+  .np-art { order: 1; flex: none; width: min(100%, max(150px, calc(100vh - 410px))); width: min(100%, max(150px, calc(100dvh - 410px))); align-self: center; }
+  .np:not(.lyrics-on) .np-art { margin-top: auto; }
+  .np:not(.lyrics-on) .np-tools { margin-bottom: auto; }
   .np-meta { order: 2; }
   .np-caption { order: 3; }
-  .np-right { order: 4; flex: 1; display: none; }
+  .np-right { order: 4; flex: 1 1 auto; min-height: 220px; display: none; }
   .np-scrub { order: 5; }
   .np-transport { order: 6; }
   .np-tools { order: 7; }
@@ -816,6 +1550,44 @@ body.np-open .cap-pill { display: none; }
   .lyric { font-size: 24px; }
   .lyrics { padding: 10vh 0 34vh; }
   .np .vol { display: none; }
+}
+/* content-width rules: these follow the space the page actually has, not the window */
+@container view (max-width: 760px) { .hero { grid-template-columns: minmax(0, 1fr); min-height: 0; padding: 26px; } .hero-stack { display: none; } }
+@container view (max-width: 560px) { .show-hero { grid-template-columns: minmax(0, 1fr); justify-items: start; } .hero-art { width: min(58vw, 230px); } }
+.source-box { margin-top: 16px; max-width: 580px; }
+.source-row { display: flex; gap: 8px; }
+.source-row input { flex: 1; min-width: 0; height: 36px; padding: 0 12px; border: 0; border-radius: 10px; background: var(--fill); outline: none; font-size: 14px; }
+.source-row input:focus { background: var(--bg); box-shadow: 0 0 0 3px var(--accent-soft), inset 0 0 0 1px color-mix(in srgb, var(--accent) 60%, transparent); }
+.source-note { margin: 8px 0 0; font-size: 13px; color: var(--text-2); }
+.show-source { margin: 12px 0 0; font-size: 13px; color: var(--text-3); }
+.np-status { position: absolute; z-index: 2; top: 6px; left: 0; right: 0; display: flex; flex-wrap: wrap; align-items: center; gap: 6px 12px; font-size: 13px; color: rgba(255,255,255,.75); }
+.np-status .meter, .cap-card .meter { width: 120px; height: 4px; background: rgba(255,255,255,.2); }
+.np-status .meter i, .cap-card .meter i { background: #fff; }
+.link-btn.light { color: rgba(255,255,255,.9); text-decoration: underline; text-decoration-color: rgba(255,255,255,.35); text-underline-offset: 3px; }
+.cap-card { max-width: 56ch; margin: 0 0 28px; padding: 18px 20px; border-radius: 16px; background: rgba(255,255,255,.11); }
+.np-notes .cap-card h3 { margin: 0 0 6px; font-size: 17px; font-weight: 700; color: #fff; }
+.cap-card p { margin: 0 0 12px; font-size: 14.5px; line-height: 1.55; color: rgba(255,255,255,.82); }
+.cap-card code { display: block; margin: 0 0 12px; padding: 10px 12px; border-radius: 10px; background: rgba(0,0,0,.35); color: #fff; font: 13px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; white-space: nowrap; overflow-x: auto; user-select: all; }
+.cap-card .meter { width: 100%; height: 5px; margin: 6px 0 12px; }
+.cap-actions { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+.cap-pill.hint { font-size: 13.5px; font-weight: 500; color: rgba(255,255,255,.85); }
+@media (max-height: 520px) and (min-width: 600px) {
+  .np-top { padding-top: calc(8px + env(safe-area-inset-top, 0px)); }
+  .np-body, .np:not(.lyrics-on) .np-body { display: grid; grid-template-columns: auto minmax(0, 1fr); grid-template-rows: repeat(5, auto); grid-template-areas: "art meta" "art caption" "art scrub" "art transport" "art tools"; align-content: center; column-gap: 32px; row-gap: 10px; padding: 4px 32px calc(12px + env(safe-area-inset-bottom, 0px)); }
+  .np-left { display: contents; }
+  .np-art { grid-area: art; width: max(140px, calc(100vh - 130px)); width: max(140px, calc(100dvh - 130px)); margin: 0 !important; align-self: center; }
+  .np-meta { grid-area: meta; }
+  .np-caption { grid-area: caption; min-height: 0; }
+  .np-scrub { grid-area: scrub; }
+  .np-transport { grid-area: transport; }
+  .np-tools { grid-area: tools; margin: 0 !important; }
+  .np-right { grid-area: art; align-self: center; width: min(46vw, 440px); height: calc(100vh - 110px); height: calc(100dvh - 110px); min-height: 0; }
+  .np.lyrics-on .np-right { display: block; }
+  .np:not(.lyrics-on) .np-right { display: none; }
+  .np.lyrics-on .np-art { display: none; }
+  .lyrics { padding: 4vh 0 30vh; }
+  .lyric { font-size: 20px; }
+  .np .ctl.play { width: 60px; height: 60px; }
 }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation: none !important; transition: none !important; scroll-behavior: auto !important; }
@@ -853,12 +1625,14 @@ body.np-open .cap-pill { display: none; }
   <symbol id="i-import" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" d="M12 4v11M7.5 10.5 12 15l4.5-4.5M5 19.5h14"/></symbol>
   <symbol id="i-export" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" d="M12 15V4M7.5 8.5 12 4l4.5 4.5M5 19.5h14"/></symbol>
   <symbol id="i-infinity" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" d="M6.8 9.3a2.7 2.7 0 1 0 0 5.4c2.7 0 7.7-5.4 10.4-5.4a2.7 2.7 0 1 1 0 5.4c-2.7 0-7.7-5.4-10.4-5.4z"/></symbol>
+  <symbol id="i-swap" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" d="M5 8h13M15 4.5 18.5 8 15 11.5M19 16H6M9 12.5 5.5 16 9 19.5"/></symbol>
+  <symbol id="i-wave" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" d="M4 11v2M7.5 8v8M11 5v14M14.5 9v6M18 7v10M21 11v2"/></symbol>
   <symbol id="i-file" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round" d="M7 3.5h7l4.5 4.5v12.5H7zM14 3.5V8h4.5"/><path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" d="M9.5 13h6M9.5 16.5h4"/></symbol>
 </defs></svg>
 
 <div class="app" id="app">
   <nav class="sidebar" aria-label="Main">
-    <a class="brand" href="#/home" aria-label="夜更かしラジオ, Listen Now"><span class="brand-sun" aria-hidden="true"></span><span class="brand-name">夜更かしラジオ</span></a>
+    <a class="brand" href="#/home" aria-label="Afterhours, Listen Now"><span class="brand-sun" aria-hidden="true"></span><span class="brand-name">Afterhours</span></a>
     <form class="side-search" id="searchForm" role="search" autocomplete="off">
       <svg aria-hidden="true"><use href="#i-search"/></svg>
       <input id="searchInput" type="search" placeholder="Search or paste a link" aria-label="Search podcasts, or paste a feed or Apple Podcasts link" spellcheck="false" enterkeyhint="search">
@@ -873,6 +1647,7 @@ body.np-open .cap-pill { display: none; }
     <ul class="side-shows" id="sideShows" aria-label="Your shows"></ul>
     <div class="side-foot">
       <button class="side-tool" id="themeBtn" type="button" title="Appearance"><svg aria-hidden="true"><use href="#i-theme"/></svg><span id="themeLabel">Appearance: System</span></button>
+      <button class="side-tool" id="autoCapBtn" type="button" title="Caption episodes that have no captions"><svg aria-hidden="true"><use href="#i-wave"/></svg><span id="autoCapLabel">Auto captions: On</span></button>
       <button class="side-tool" id="importBtn" type="button" title="Import OPML"><svg aria-hidden="true"><use href="#i-import"/></svg><span>Import OPML</span></button>
       <button class="side-tool" id="exportBtn" type="button" title="Export OPML"><svg aria-hidden="true"><use href="#i-export"/></svg><span>Export OPML</span></button>
     </div>
@@ -946,6 +1721,7 @@ body.np-open .cap-pill { display: none; }
       </div>
     </div>
     <div class="np-right" id="npRight">
+      <div class="np-status" id="npStatus" aria-live="polite" hidden></div>
       <ol class="lyrics" id="lyrics" aria-label="Transcript"></ol>
       <div class="np-notes" id="npNotes" hidden></div>
     </div>
@@ -973,64 +1749,61 @@ body.np-open .cap-pill { display: none; }
     {"id": "knowledge", "label": "Economics, physics & astronomy", "short": "Knowledge", "keywords": [["astronomy", "gb"], ["physics", "gb"], ["economics", "gb"]]},
     {"id": "games", "label": "Game industry", "short": "Games", "keywords": [["video game history", "gb"], ["game development", "gb"], ["ゲーム", "jp"]]}
   ],
-  "langs": {
-    "ja": {"label": "日本語", "keywords": [["シティポップ", "jp"], ["アニソン", "jp"], ["ライトノベル", "jp"], ["ミステリー", "jp"], ["ガジェット", "jp"]]},
-    "zh": {"label": "中文", "keywords": [["推理", "tw"], ["读书", "tw"], ["音乐", "tw"], ["科技", "tw"], ["游戏", "tw"]]}
-  },
+  "langs": {"ja": {"label": "日本語", "keywords": [["シティポップ", "jp"], ["アニソン", "jp"], ["ライトノベル", "jp"], ["ミステリー", "jp"], ["ガジェット", "jp"]]}, "zh": {"label": "中文", "keywords": [["推理", "tw"], ["读书", "tw"], ["音乐", "tw"], ["科技", "tw"], ["游戏", "tw"]]}},
   "presets": [
-    {"key": "primer", "cat": "citypop", "title": "Primer", "author": "Maximum Fun", "artist": "Maximum Fun", "term": "Primer Maximum Fun", "countries": ["us", "gb"], "why": "Japanese city pop, one album per episode."},
-    {"key": "mayonaka", "cat": "citypop", "title": "Mayonaka Hour 真夜中アワー", "match": "Mayonaka Hour", "author": "Yuki Tasaka & Van Paugam", "term": "Mayonaka Hour", "countries": ["us", "gb"], "why": "Profiles of city pop’s big names."},
-    {"key": "linernotes", "cat": "citypop", "title": "Liner Notes", "match": "Liner Notes", "author": "Light in the Attic", "artist": "Light in the Attic", "term": "Light in the Attic Liner Notes", "countries": ["us", "gb"], "why": "Includes the Pacific Breeze city pop episode."},
-    {"key": "heatrocks", "cat": "jazz", "title": "Heat Rocks", "author": "Maximum Fun", "artist": "Maximum Fun", "id": 1290971833, "term": "Heat Rocks", "countries": ["us", "gb"], "why": "Guests on one album: jazz, hip-hop, soul. A finished archive of about 200 episodes."},
-    {"key": "jazznight", "cat": "jazz", "title": "Jazz Night in America", "author": "NPR", "artist": "NPR", "term": "Jazz Night in America", "countries": ["us", "gb"], "why": "Live jazz from NPR and WBGO."},
+    {"key": "primer", "cat": "citypop", "title": "Primer", "author": "Maximum Fun", "artist": "Maximum Fun", "term": "Primer Maximum Fun", "countries": ["us", "gb"], "why": "Japanese city pop, one album per episode.", "site": "https://www.maximumfun.org/primer"},
+    {"key": "mayonaka", "cat": "citypop", "title": "Mayonaka Hour 真夜中アワー", "match": "Mayonaka Hour", "author": "Yuki Tasaka & Van Paugam", "term": "Mayonaka Hour", "countries": ["us", "gb"], "why": "Profiles of city pop’s big names.", "site": "https://www.vanpaugam.com/podcast"},
+    {"key": "linernotes", "cat": "citypop", "title": "Liner Notes", "match": "Liner Notes", "author": "Light in the Attic", "artist": "Light in the Attic", "term": "Light in the Attic Liner Notes", "countries": ["us", "gb"], "why": "Includes the Pacific Breeze city pop episode.", "site": "https://nl.player.fm/series/light-in-the-attics-liner-notes"},
+    {"key": "heatrocks", "cat": "jazz", "title": "Heat Rocks", "author": "Maximum Fun", "artist": "Maximum Fun", "id": 1290971833, "term": "Heat Rocks", "countries": ["us", "gb"], "why": "Guests on one album: jazz, hip-hop, soul. A finished archive of about 200 episodes.", "site": "https://www.maximumfun.org/shows/heat-rocks"},
+    {"key": "jazznight", "cat": "jazz", "title": "Jazz Night in America", "author": "NPR", "artist": "NPR", "term": "Jazz Night in America", "countries": ["us", "gb"], "why": "Live jazz from NPR and WBGO.", "site": "https://www.npr.org/series/347139849/jazz-night-in-america"},
     {"key": "takeitpersonal", "cat": "jazz", "title": "Take It Personal", "match": "Take It Personal", "author": "Philaflava", "term": "Take It Personal hip hop", "countries": ["us", "gb"], "why": "Golden-era, boom-bap East Coast hip-hop."},
     {"key": "composer", "cat": "jazz", "title": "Composer of the Week", "author": "BBC Radio 3", "artist": "BBC", "id": 275377513, "term": "Composer of the Week", "countries": ["gb"], "why": "Portraits of composers, with plenty of piano. The feed is UK-only."},
-    {"key": "songexploder", "cat": "jazz", "title": "Song Exploder", "author": "Hrishikesh Hirway", "artist": "Hrishikesh Hirway", "term": "Song Exploder", "countries": ["gb", "us"], "why": "Artists take their own songs apart."},
-    {"key": "vergecast", "cat": "tech", "title": "The Vergecast", "author": "The Verge", "artist": "The Verge", "term": "The Vergecast", "feed": "https://feeds.megaphone.fm/vergecast", "countries": ["gb", "us"], "why": "Weekly gadget and tech news."},
-    {"key": "upgrade", "cat": "tech", "title": "Upgrade", "match": "Upgrade", "author": "Relay", "artist": "Relay", "term": "Upgrade Relay FM", "feed": "https://www.relay.fm/upgrade/feed", "countries": ["gb", "us"], "why": "Relaxed Apple and tech conversation."},
-    {"key": "hardfork", "cat": "tech", "title": "Hard Fork", "author": "The New York Times", "artist": "New York Times", "term": "Hard Fork", "feed": "https://feeds.simplecast.com/l2i9YnTd", "countries": ["gb", "us"], "why": "AI and the week in tech."},
-    {"key": "darknet", "cat": "tech", "title": "Darknet Diaries", "author": "Jack Rhysider", "artist": "Jack Rhysider", "term": "Darknet Diaries", "feed": "https://feeds.megaphone.fm/darknetdiaries", "countries": ["gb", "us"], "why": "True stories from the security world."},
-    {"key": "rebuild", "cat": "tech", "title": "Rebuild", "match": "Rebuild", "author": "Tatsuhiko Miyagawa", "artist": "Miyagawa", "term": "Rebuild.fm", "feed": "https://feeds.rebuild.fm/rebuildfm", "countries": ["jp", "us"], "lang": "ja", "why": "Long-running Japanese tech talk."},
-    {"key": "inourtime", "cat": "lit", "title": "In Our Time", "author": "BBC Radio 4", "artist": "BBC", "term": "In Our Time", "feed": "https://podcasts.files.bbci.co.uk/b006qykl.rss", "countries": ["gb"], "why": "Literature, science and history with academics."},
-    {"key": "backlisted", "cat": "lit", "title": "Backlisted", "match": "Backlisted", "author": "Unbound", "term": "Backlisted podcast", "countries": ["gb", "us"], "why": "Forgotten and classic books, warmly discussed."},
-    {"key": "nyfiction", "cat": "lit", "title": "The New Yorker: Fiction", "author": "The New Yorker", "artist": "New Yorker", "term": "The New Yorker Fiction", "countries": ["us", "gb"], "why": "Authors read and discuss short stories."},
-    {"key": "suiji", "cat": "lit", "title": "随机波动", "author": "随机波动", "term": "随机波动", "countries": ["tw", "us"], "lang": "zh", "why": "Culture, books and society, with scholars as guests."},
-    {"key": "yurugengo", "cat": "lit", "title": "ゆる言語学ラジオ", "author": "Yuru Gengogaku Radio", "term": "ゆる言語学ラジオ", "countries": ["jp"], "lang": "ja", "why": "Light, funny linguistics."},
-    {"key": "shedunnit", "cat": "mystery", "title": "Shedunnit", "author": "Caroline Crampton", "artist": "Caroline Crampton", "term": "Shedunnit", "countries": ["gb", "us"], "why": "The history of Golden Age detective fiction."},
-    {"key": "sherlock", "cat": "mystery", "title": "I Hear of Sherlock Everywhere", "author": "Scott Monty & Burt Wolder", "term": "I Hear of Sherlock Everywhere", "countries": ["us", "gb"], "why": "Sherlock Holmes, in depth."},
-    {"key": "poirot", "cat": "mystery", "title": "波罗咖啡馆", "author": "机核", "term": "波罗咖啡馆", "countries": ["tw", "us"], "lang": "zh", "why": "Chinese mystery chat, including Japanese writers."},
-    {"key": "planetmoney", "cat": "knowledge", "title": "Planet Money", "author": "NPR", "artist": "NPR", "term": "Planet Money", "feed": "https://feeds.npr.org/510289/podcast.xml", "countries": ["gb", "us"], "why": "Friendly stories about how money works."},
-    {"key": "indicator", "cat": "knowledge", "title": "The Indicator from Planet Money", "author": "NPR", "artist": "NPR", "term": "The Indicator from Planet Money", "feed": "https://feeds.npr.org/510325/podcast.xml", "countries": ["gb", "us"], "why": "Short daily economics."},
-    {"key": "econtalk", "cat": "knowledge", "title": "EconTalk", "author": "Russ Roberts", "term": "EconTalk", "countries": ["gb", "us"], "why": "Long, thoughtful conversations about economics."},
-    {"key": "oddlots", "cat": "knowledge", "title": "Odd Lots", "match": "Odd Lots", "author": "Bloomberg", "artist": "Bloomberg", "term": "Odd Lots Bloomberg", "countries": ["gb", "us"], "why": "Markets and finance with a curious streak."},
-    {"key": "mindscape", "cat": "knowledge", "title": "Sean Carroll’s Mindscape", "match": "Mindscape", "author": "Sean Carroll", "artist": "Sean Carroll", "term": "Sean Carroll Mindscape", "feed": "https://rss.art19.com/sean-carrolls-mindscape", "countries": ["gb", "us"], "why": "Physics and the big questions."},
-    {"key": "monkeycage", "cat": "knowledge", "title": "The Infinite Monkey Cage", "author": "BBC Radio 4", "artist": "BBC", "term": "The Infinite Monkey Cage", "feed": "https://podcasts.files.bbci.co.uk/b00snr0w.rss", "countries": ["gb"], "why": "Science with comedians."},
-    {"key": "radiolab", "cat": "knowledge", "title": "Radiolab", "author": "WNYC Studios", "artist": "WNYC", "term": "Radiolab", "countries": ["gb", "us"], "why": "Atmospheric science storytelling."},
-    {"key": "retronauts", "cat": "games", "title": "Retronauts", "author": "Retronauts", "term": "Retronauts", "countries": ["gb", "us"], "why": "Retro games, with plenty of Japanese game history."},
-    {"key": "vghh", "cat": "games", "title": "Video Game History Hour", "author": "Video Game History Foundation", "term": "Video Game History Hour", "countries": ["us", "gb"], "why": "Developers and historians, every other week."}
+    {"key": "songexploder", "cat": "jazz", "title": "Song Exploder", "author": "Hrishikesh Hirway", "artist": "Hrishikesh Hirway", "term": "Song Exploder", "countries": ["gb", "us"], "why": "Artists take their own songs apart.", "site": "https://songexploder.net"},
+    {"key": "vergecast", "cat": "tech", "title": "The Vergecast", "author": "The Verge", "artist": "The Verge", "term": "The Vergecast", "feed": "https://feeds.megaphone.fm/vergecast", "countries": ["gb", "us"], "why": "Weekly gadget and tech news.", "site": "https://www.theverge.com/the-vergecast"},
+    {"key": "upgrade", "cat": "tech", "title": "Upgrade", "match": "Upgrade", "author": "Relay", "artist": "Relay", "term": "Upgrade Relay FM", "feed": "https://www.relay.fm/upgrade/feed", "countries": ["gb", "us"], "why": "Relaxed Apple and tech conversation.", "site": "https://www.relay.fm/upgrade"},
+    {"key": "hardfork", "cat": "tech", "title": "Hard Fork", "author": "The New York Times", "artist": "New York Times", "term": "Hard Fork", "feed": "https://feeds.simplecast.com/l2i9YnTd", "countries": ["gb", "us"], "why": "AI and the week in tech.", "site": "https://www.nytimes.com/column/hard-fork"},
+    {"key": "darknet", "cat": "tech", "title": "Darknet Diaries", "author": "Jack Rhysider", "artist": "Jack Rhysider", "term": "Darknet Diaries", "feed": "https://feeds.megaphone.fm/darknetdiaries", "countries": ["gb", "us"], "why": "True stories from the security world.", "site": "https://darknetdiaries.com"},
+    {"key": "rebuild", "cat": "tech", "title": "Rebuild", "match": "Rebuild", "author": "Tatsuhiko Miyagawa", "artist": "Miyagawa", "term": "Rebuild.fm", "feed": "https://feeds.rebuild.fm/rebuildfm", "countries": ["jp", "us"], "lang": "ja", "why": "Long-running Japanese tech talk.", "site": "https://rebuild.fm"},
+    {"key": "inourtime", "cat": "lit", "title": "In Our Time", "author": "BBC Radio 4", "artist": "BBC", "term": "In Our Time", "feed": "https://podcasts.files.bbci.co.uk/b006qykl.rss", "countries": ["gb"], "why": "Literature, science and history with academics.", "site": "https://www.bbc.co.uk/programmes/b006qykl"},
+    {"key": "backlisted", "cat": "lit", "title": "Backlisted", "match": "Backlisted", "author": "Unbound", "term": "Backlisted podcast", "countries": ["gb", "us"], "why": "Forgotten and classic books, warmly discussed.", "site": "https://www.backlisted.fm"},
+    {"key": "nyfiction", "cat": "lit", "title": "The New Yorker: Fiction", "author": "The New Yorker", "artist": "New Yorker", "term": "The New Yorker Fiction", "countries": ["us", "gb"], "why": "Authors read and discuss short stories.", "site": "https://www.newyorker.com/podcast/fiction"},
+    {"key": "suiji", "cat": "lit", "title": "随机波动", "author": "随机波动", "term": "随机波动", "countries": ["cn", "tw", "hk", "us"], "lang": "zh", "why": "Culture, books and society, with scholars as guests.", "site": "https://www.douban.com/podcast/36726521/"},
+    {"key": "yurugengo", "cat": "lit", "title": "ゆる言語学ラジオ", "author": "Yuru Gengogaku Radio", "term": "ゆる言語学ラジオ", "countries": ["jp"], "lang": "ja", "why": "Light, funny linguistics.", "site": "https://podnews.net/podcast/i9mkt"},
+    {"key": "shedunnit", "cat": "mystery", "title": "Shedunnit", "author": "Caroline Crampton", "artist": "Caroline Crampton", "term": "Shedunnit", "countries": ["gb", "us"], "why": "The history of Golden Age detective fiction.", "site": "https://shedunnitshow.com"},
+    {"key": "sherlock", "cat": "mystery", "title": "I Hear of Sherlock Everywhere", "author": "Scott Monty & Burt Wolder", "term": "I Hear of Sherlock Everywhere", "countries": ["us", "gb"], "why": "Sherlock Holmes, in depth.", "site": "https://www.ihearofsherlock.com"},
+    {"key": "poirot", "cat": "mystery", "title": "波罗咖啡馆", "author": "机核", "term": "波罗咖啡馆", "countries": ["cn", "tw", "hk", "us"], "lang": "zh", "why": "Chinese mystery chat, including Japanese writers.", "site": "https://rephonic.com/podcasts/bo-luo-ka-pei-guan"},
+    {"key": "planetmoney", "cat": "knowledge", "title": "Planet Money", "author": "NPR", "artist": "NPR", "term": "Planet Money", "feed": "https://feeds.npr.org/510289/podcast.xml", "countries": ["gb", "us"], "why": "Friendly stories about how money works.", "site": "https://www.npr.org/podcasts/510289/planet-money"},
+    {"key": "indicator", "cat": "knowledge", "title": "The Indicator from Planet Money", "author": "NPR", "artist": "NPR", "term": "The Indicator from Planet Money", "feed": "https://feeds.npr.org/510325/podcast.xml", "countries": ["gb", "us"], "why": "Short daily economics.", "site": "https://www.npr.org/podcasts/510325/the-indicator-from-planet-money"},
+    {"key": "econtalk", "cat": "knowledge", "title": "EconTalk", "author": "Russ Roberts", "term": "EconTalk", "countries": ["gb", "us"], "why": "Long, thoughtful conversations about economics.", "site": "https://www.econtalk.org"},
+    {"key": "oddlots", "cat": "knowledge", "title": "Odd Lots", "match": "Odd Lots", "author": "Bloomberg", "artist": "Bloomberg", "term": "Odd Lots Bloomberg", "countries": ["gb", "us"], "why": "Markets and finance with a curious streak.", "site": "https://www.bloomberg.com/oddlots"},
+    {"key": "mindscape", "cat": "knowledge", "title": "Sean Carroll’s Mindscape", "match": "Mindscape", "author": "Sean Carroll", "artist": "Sean Carroll", "term": "Sean Carroll Mindscape", "feed": "https://rss.art19.com/sean-carrolls-mindscape", "countries": ["gb", "us"], "why": "Physics and the big questions.", "site": "https://www.preposterousuniverse.com/podcast/"},
+    {"key": "monkeycage", "cat": "knowledge", "title": "The Infinite Monkey Cage", "author": "BBC Radio 4", "artist": "BBC", "term": "The Infinite Monkey Cage", "feed": "https://podcasts.files.bbci.co.uk/b00snr0w.rss", "countries": ["gb"], "why": "Science with comedians.", "site": "https://www.bbc.co.uk/programmes/b00snr0w"},
+    {"key": "radiolab", "cat": "knowledge", "title": "Radiolab", "author": "WNYC Studios", "artist": "WNYC", "term": "Radiolab", "countries": ["gb", "us"], "why": "Atmospheric science storytelling.", "site": "https://radiolab.org"},
+    {"key": "retronauts", "cat": "games", "title": "Retronauts", "author": "Retronauts", "term": "Retronauts", "countries": ["gb", "us"], "why": "Retro games, with plenty of Japanese game history.", "site": "https://retronauts.com"},
+    {"key": "vghh", "cat": "games", "title": "Video Game History Hour", "author": "Video Game History Foundation", "term": "Video Game History Hour", "countries": ["us", "gb"], "why": "Developers and historians, every other week.", "site": "https://gamehistory.org"}
   ],
   "extras": [
-    {"key": "x-switchedonpop", "cat": "citypop", "title": "Switched On Pop", "artist": "Vox", "term": "Switched On Pop", "why": "How pop songs work, including a city pop episode."},
+    {"key": "x-switchedonpop", "cat": "citypop", "title": "Switched On Pop", "artist": "Vox", "term": "Switched On Pop", "why": "How pop songs work, including a city pop episode.", "site": "https://switchedonpop.com"},
     {"key": "x-strongsongs", "cat": "citypop", "title": "Strong Songs", "match": "Strong Songs", "artist": "Kirk Hamilton", "term": "Strong Songs Kirk Hamilton", "why": "One song per episode, taken apart with love."},
     {"key": "x-anncast", "cat": "citypop", "title": "ANNCast", "match": "ANNCast", "term": "ANNCast Anime News Network", "why": "Anime industry talk, music included."},
     {"key": "x-questlove", "cat": "jazz", "title": "Questlove Supreme", "term": "Questlove Supreme", "why": "Music history with the people who made it."},
     {"key": "x-stickynotes", "cat": "jazz", "title": "Sticky Notes", "match": "Sticky Notes", "artist": "Joshua Weilerstein", "term": "Sticky Notes classical music podcast", "why": "A conductor explains classical pieces warmly."},
     {"key": "x-desertisland", "cat": "jazz", "title": "Desert Island Discs", "artist": "BBC", "term": "Desert Island Discs", "countries": ["gb"], "why": "Lives told through eight favourite records."},
     {"key": "x-waveform", "cat": "tech", "title": "Waveform: The MKBHD Podcast", "match": "Waveform", "term": "Waveform MKBHD", "why": "Gadget reviews and tech news with Marques Brownlee."},
-    {"key": "x-atp", "cat": "tech", "title": "Accidental Tech Podcast", "term": "Accidental Tech Podcast", "why": "Three developers on Apple and technology."},
+    {"key": "x-atp", "cat": "tech", "title": "Accidental Tech Podcast", "term": "Accidental Tech Podcast", "why": "Three developers on Apple and technology.", "site": "https://atp.fm"},
     {"key": "x-decoder", "cat": "tech", "title": "Decoder with Nilay Patel", "match": "Decoder", "artist": "The Verge", "term": "Decoder with Nilay Patel", "why": "Big ideas in tech, from The Verge."},
     {"key": "x-bookreview", "cat": "lit", "title": "The Book Review", "match": "The Book Review", "artist": "New York Times", "term": "The Book Review New York Times", "why": "New books and the people who write them."},
     {"key": "x-lrb", "cat": "lit", "title": "LRB Podcast", "artist": "London Review of Books", "term": "LRB Podcast", "countries": ["gb"], "why": "Essays and books from the London Review of Books."},
-    {"key": "x-ritan", "cat": "lit", "title": "日谈公园", "term": "日谈公园", "countries": ["tw", "us"], "lang": "zh", "why": "Chinese chat on anime, games, books and culture."},
+    {"key": "x-ritan", "cat": "lit", "title": "日谈公园", "term": "日谈公园", "countries": ["cn", "tw", "hk", "us"], "lang": "zh", "why": "Chinese chat on anime, games, books and culture."},
     {"key": "x-sherlockco", "cat": "mystery", "title": "Sherlock & Co.", "match": "Sherlock & Co", "term": "Sherlock & Co.", "why": "Sherlock Holmes reimagined as an audio drama."},
     {"key": "x-magnus", "cat": "mystery", "title": "The Magnus Archives", "artist": "Rusty Quill", "term": "The Magnus Archives", "why": "A slow-burn horror mystery in audio."},
-    {"key": "x-nightvale", "cat": "mystery", "title": "Welcome to Night Vale", "term": "Welcome to Night Vale", "why": "Strange, gentle mystery fiction."},
-    {"key": "x-freakonomics", "cat": "knowledge", "title": "Freakonomics Radio", "term": "Freakonomics Radio", "why": "The hidden side of everything, through economics."},
+    {"key": "x-nightvale", "cat": "mystery", "title": "Welcome to Night Vale", "term": "Welcome to Night Vale", "why": "Strange, gentle mystery fiction.", "site": "https://www.welcometonightvale.com"},
+    {"key": "x-freakonomics", "cat": "knowledge", "title": "Freakonomics Radio", "term": "Freakonomics Radio", "why": "The hidden side of everything, through economics.", "site": "https://freakonomics.com"},
     {"key": "x-startalk", "cat": "knowledge", "title": "StarTalk Radio", "artist": "Neil deGrasse Tyson", "term": "StarTalk Radio", "why": "Astrophysics with Neil deGrasse Tyson."},
     {"key": "x-coten", "cat": "knowledge", "title": "コテンラジオ", "match": "コテンラジオ", "term": "コテンラジオ", "countries": ["jp"], "lang": "ja", "why": "Japanese history told as long, lively stories."},
     {"key": "x-besties", "cat": "games", "title": "The Besties", "match": "The Besties", "term": "The Besties podcast", "why": "Friends talking games, warmly and funnily."},
-    {"key": "x-insertcredit", "cat": "games", "title": "Insert Credit", "match": "Insert Credit", "term": "Insert Credit Show", "why": "Thoughtful game talk with industry veterans."},
-    {"key": "x-retrohour", "cat": "games", "title": "The Retro Hour", "term": "The Retro Hour", "why": "Interviews with the people who made classic games."}
+    {"key": "x-insertcredit", "cat": "games", "title": "Insert Credit", "match": "Insert Credit", "term": "Insert Credit Show", "why": "Thoughtful game talk with industry veterans.", "site": "https://insertcredit.com"},
+    {"key": "x-retrohour", "cat": "games", "title": "The Retro Hour", "term": "The Retro Hour", "why": "Interviews with the people who made classic games.", "site": "https://theretrohour.com"}
   ]
 }
 </script>
@@ -1155,7 +1928,7 @@ function toast(msg, isError) {
 }
 
 /* ---------- state ---------- */
-const DEFAULTS = { speed: 1, volume: 1, muted: false, captions: true, autoNext: true, theme: 'system', sort: 'newest' };
+const DEFAULTS = { speed: 1, volume: 1, muted: false, captions: true, autoNext: true, theme: 'system', sort: 'newest', autoCaptions: true, captionModel: 'auto' };
 const settings = Object.assign({}, DEFAULTS, store.get(KEY.settings, {}));
 const saveSettings = () => store.set(KEY.settings, settings);
 let library = store.get(KEY.library, null);
@@ -1345,7 +2118,9 @@ function pickTranscript(list) {
   return [...list].sort((a, b) => score(b) - score(a))[0];
 }
 async function loadCaptions(ep) {
-  S.cues = []; S.untimed = ''; S.cueIdx = -2; S.capError = ''; S.capLoading = false;
+  Recog.stop();
+  S.cues = []; S.untimed = ''; S.cueIdx = -2; S.capError = ''; S.capLoading = false; S.auto = null;
+  const mine = () => S.current && S.current.ep.id === ep.id;
   const saved = store.get(KEY.cap(ep.id), null);
   if (saved && saved.text) applyTranscript(saved.text, saved.type);
   else {
@@ -1355,20 +2130,151 @@ async function loadCaptions(ep) {
       renderLyrics(); renderCaptions(true);
       try {
         const res = await fetchText(t.url);
-        if (!S.current || S.current.ep.id !== ep.id) return;
+        if (!mine()) return;
         applyTranscript(res.text, t.type || res.type);
-      } catch { if (S.current && S.current.ep.id === ep.id) S.capError = 'This episode’s captions couldn’t be loaded.'; }
-      if (!S.current || S.current.ep.id !== ep.id) return;
+      } catch { if (mine()) S.capError = 'This episode’s captions couldn’t be loaded.'; }
+      if (!mine()) return;
       S.capLoading = false;
     }
   }
+  if (!S.cues.length && !S.untimed) {   // no captions of its own: use recognised ones, or make them
+    const auto = await idb.get('asr:' + ep.id);
+    if (!mine()) return;
+    const has = !!(auto && auto.cues && auto.cues.length);
+    if (has) { S.cues = auto.cues; S.auto = { state: auto.complete ? 'done' : 'partial', model: auto.model, progress: auto.complete ? 1 : 0 }; }
+    if (!has || !auto.complete) Recog.maybeStart(ep, has);
+  }
   renderLyrics();
   renderCaptions(true);
+  paintRecog();
+}
+/* recognising speech on this computer, through the helper */
+const ACTIVE = ['queued', 'downloading', 'loading', 'transcribing'];
+const recogActive = () => !!(S.auto && ACTIVE.includes(S.auto.state));
+const langOf = show => { const lib = show && showByFeed(show.feedUrl); const p = lib && lib.preset ? PRESET[lib.preset] : null; return (p && p.lang) || ''; };
+const Recog = {
+  cap: null, timer: 0, ep: null, url: '', model: '', since: 0, lastSave: 0, dropCached: false,
+  async init() {
+    if (!VIA_HELPER) { this.cap = { available: false }; return this.cap; }
+    try { this.cap = await getJSON('/api/captions'); } catch { this.cap = { available: false }; }
+    return this.cap;
+  },
+  modelFor(show) { return settings.captionModel && settings.captionModel !== 'auto' ? settings.captionModel : (langOf(show) ? 'small' : 'base'); },
+  maybeStart(ep, resume) {
+    if (!this.cap) { this.init().then(() => { if (S.current && S.current.ep.id === ep.id) { this.maybeStart(ep, resume); paintRecog(); renderLyrics(); renderCaptions(true); } }); return; }
+    if (!this.cap.available) { if (!S.auto) S.auto = { state: 'unavailable' }; return; }
+    if (!settings.autoCaptions && !resume) { S.auto = { state: 'off' }; return; }
+    this.start(ep);
+  },
+  async start(ep, model) {
+    this.stop();
+    if (!S.current || S.current.ep.id !== ep.id) return;
+    const show = S.current.show;
+    Object.assign(this, { ep, url: ep.url, model: model || this.modelFor(show), since: 0, dropCached: S.cues.length > 0 });
+    S.auto = { state: 'queued', progress: 0, model: this.model };
+    paintRecog();
+    const at = Math.floor(S.pendingSeek != null ? S.pendingSeek : (audio.currentTime || 0));
+    try {
+      const st = await getJSON(`/api/captions/start?url=${encodeURIComponent(ep.url)}&model=${this.model}&start=${at}&lang=${langOf(show)}`);
+      if (this.ep === ep) this.apply(st);
+    } catch (e) { if (this.ep === ep) { S.auto = { state: 'error', error: e.message }; paintRecog(); renderLyrics(); renderCaptions(true); } return; }
+    this.poll();
+  },
+  poll() {
+    clearTimeout(this.timer);
+    if (!this.ep || !recogActive()) return;
+    const ep = this.ep;
+    this.timer = setTimeout(async () => {
+      try { const st = await getJSON(`/api/captions/status?url=${encodeURIComponent(this.url)}&model=${this.model}&since=${this.since}`); if (this.ep === ep) this.apply(st); }
+      catch {}
+      if (this.ep === ep) this.poll();
+    }, 1500);
+  },
+  apply(st) {
+    if (!st || st.state === 'none') return;
+    const fresh = (st.segments || []).map(c => ({ start: c.start, end: c.end, text: c.text, speaker: '', auto: true }));
+    if (fresh.length) {
+      const before = S.cues.length;
+      if (this.dropCached || this.since === 0) { S.cues = []; this.dropCached = false; }
+      const ordered = !S.cues.length || fresh[0].start >= S.cues[S.cues.length - 1].start;
+      S.cues = S.cues.concat(fresh);
+      if (!ordered) S.cues.sort((a, b) => a.start - b.start);
+      S.cueIdx = -2;
+      if (ordered && S.cues.length - fresh.length === before && before > 0 && $('lyrics').children.length === before) appendLyrics(fresh, before);
+      else renderLyrics();
+    }
+    this.since = st.total || this.since;
+    S.auto = { state: st.state, progress: st.progress || 0, model: st.model || this.model, message: st.message || '', error: st.error || '' };
+    if (st.state === 'done' || (fresh.length && Date.now() - this.lastSave > 15000)) this.save(st.state === 'done');
+    if (!S.cues.length) renderLyrics();
+    paintRecog();
+    renderCaptions(true);
+  },
+  save(complete) {
+    if (!this.ep || !S.cues.length) return;
+    this.lastSave = Date.now();
+    idb.set('asr:' + this.ep.id, { cues: S.cues.map(c => ({ start: c.start, end: c.end, text: c.text, speaker: '', auto: true })), model: this.model, complete, t: Date.now() });
+  },
+  stop() {
+    clearTimeout(this.timer);
+    if (this.ep && recogActive()) {
+      this.save(false);
+      getJSON(`/api/captions/cancel?url=${encodeURIComponent(this.url)}&model=${this.model}`).catch(() => {});
+    }
+    this.ep = null;
+  }
+};
+function recogPct() { return S.auto ? Math.round(Math.min(1, S.auto.progress || 0) * 100) : 0; }
+function recogText() {
+  const a = S.auto;
+  if (!a) return '';
+  switch (a.state) {
+    case 'queued': return 'Getting ready to recognise speech…';
+    case 'downloading': return `Downloading the episode for captions… ${recogPct()}%`;
+    case 'loading': return a.message || 'Loading the speech model…';
+    case 'transcribing': return `Auto captions: recognising speech, ${recogPct()}% done`;
+    case 'done': return 'Auto captions, made on this computer';
+    case 'partial': return 'Auto captions, partly done';
+    case 'cancelled': return 'Auto captions stopped';
+    case 'error': return a.error || 'Caption recognition stopped.';
+    default: return '';
+  }
+}
+function paintRecog() {
+  const box = $('npStatus');
+  const a = S.auto;
+  const show = !!(a && S.cues.length && ['queued', 'downloading', 'loading', 'transcribing', 'done', 'partial', 'cancelled', 'error'].includes(a.state));
+  box.hidden = !show;
+  if (!show) return;
+  const kids = [el('span', { text: recogText() })];
+  if (recogActive()) kids.push(el('span', { class: 'meter' }, el('i', { style: `width:${recogPct()}%` })), el('button', { class: 'link-btn light', type: 'button', text: 'Stop', onclick: stopRecognition }));
+  else if (S.current && (a.state === 'cancelled' || a.state === 'partial')) kids.push(el('button', { class: 'link-btn light', type: 'button', text: 'Continue', onclick: () => Recog.start(S.current.ep, a.model) }));
+  else if (S.current && a.state === 'done' && ['tiny', 'base'].includes(a.model)) kids.push(el('button', { class: 'link-btn light', type: 'button', text: 'Redo with more accuracy', onclick: () => Recog.start(S.current.ep, 'small') }));
+  box.replaceChildren(...kids);
+}
+function stopRecognition() { Recog.stop(); if (S.auto) S.auto = Object.assign({}, S.auto, { state: 'cancelled' }); paintRecog(); renderLyrics(); renderCaptions(true); }
+function captionCard() {
+  const a = S.auto, ep = S.current && S.current.ep;
+  if (!a || !ep) return null;
+  const card = (title, text, ...rest) => el('div', { class: 'cap-card' }, el('h3', { text: title }), text ? el('p', { text }) : null, ...rest);
+  const startBtn = label => el('button', { class: 'np-chip', type: 'button', onclick: () => Recog.start(ep) }, icon('wave'), el('span', { text: label }));
+  if (recogActive()) return card('Recognising speech on this computer', 'Captions appear here as they’re ready, starting from where you are in the episode.',
+    el('p', { text: recogText() }), el('span', { class: 'meter' }, el('i', { style: `width:${recogPct()}%` })),
+    el('div', { class: 'cap-actions' }, el('button', { class: 'np-chip', type: 'button', onclick: stopRecognition }, el('span', { text: 'Stop' }))));
+  if (a.state === 'unavailable') return card('Caption any episode', 'This episode has no captions. Afterhours can recognise the speech on your computer and caption it, privately and for free. To turn this on, quit Afterhours and run this once:',
+    el('code', { text: (Recog.cap && Recog.cap.install) || 'python3 afterhours.py --setup-captions' }), el('p', { text: 'Then start Afterhours again.' }));
+  if (a.state === 'off') return card('No captions for this episode', 'Auto captions are turned off. You can still caption this episode on your computer.', el('div', { class: 'cap-actions' }, startBtn('Generate captions')));
+  if (a.state === 'error') return card('Captions couldn’t be made', a.error || '', el('div', { class: 'cap-actions' }, startBtn('Try again')));
+  if (a.state === 'cancelled') return card('Captions stopped', '', el('div', { class: 'cap-actions' }, startBtn('Generate captions')));
+  return null;
 }
 function findCue(t) { const c = S.cues; let lo = 0, hi = c.length - 1, ans = -1; while (lo <= hi) { const mid = (lo + hi) >> 1; if (c[mid].start <= t) { ans = mid; lo = mid + 1; } else hi = mid - 1; } return ans; }
 const lyricsVisible = () => S.npOpen && S.lyricsOn;
 function captionHint() {
   if (S.capLoading) return 'Loading captions…';
+  if (recogActive()) return recogText();
+  if (S.auto && S.auto.state === 'error') return S.auto.error || 'Caption recognition stopped.';
+  if (S.auto && S.auto.state === 'unavailable') return 'No captions for this episode. Open the transcript to turn on auto captions.';
   return S.capError || (S.untimed ? 'This transcript isn’t timed. Open the transcript to read it.' : 'No captions for this episode.');
 }
 function renderCaptions(force) {
@@ -1380,12 +2286,23 @@ function renderCaptions(force) {
   S.cueIdx = i;
   const cur = i >= 0 ? S.cues[i] : null;
   const pill = $('capPill');
-  pill.hidden = !(settings.captions && S.current && cur && !S.npOpen);
+  const hint = !cur && recogActive() && !S.cues.length;
+  pill.hidden = !(settings.captions && S.current && !S.npOpen && (cur || hint));
+  pill.classList.toggle('hint', hint);
   if (cur) { $('capWho').textContent = cur.speaker || ''; $('capWho').hidden = !cur.speaker; $('capText').textContent = cur.text; }
+  else if (hint) { $('capWho').hidden = true; $('capText').textContent = recogText(); }
   const line = $('npCaption');
   line.hidden = !settings.captions || lyricsVisible() || !S.current;
   line.textContent = cur ? cur.text : (S.cues.length ? '' : captionHint());
   highlightLyric(i);
+}
+function lyricNode(c, i, prev) {
+  return el('li', { class: 'lyric', dataset: { i } }, c.speaker && c.speaker !== prev ? el('span', { class: 'who', text: c.speaker }) : null, c.text);
+}
+function appendLyrics(fresh, from) {
+  const list = $('lyrics');
+  let prev = from > 0 ? (S.cues[from - 1].speaker || '') : '';
+  fresh.forEach((c, k) => { list.append(lyricNode(c, from + k, prev)); prev = c.speaker || prev; });
 }
 function renderLyrics() {
   const list = $('lyrics'), notes = $('npNotes');
@@ -1397,15 +2314,12 @@ function renderLyrics() {
   if (has) {
     let prev = '';
     const frag = document.createDocumentFragment();
-    S.cues.forEach((c, i) => {
-      const who = c.speaker && c.speaker !== prev ? el('span', { class: 'who', text: c.speaker }) : null;
-      prev = c.speaker || prev;
-      frag.append(el('li', { class: 'lyric', dataset: { i } }, who, c.text));
-    });
+    S.cues.forEach((c, i) => { frag.append(lyricNode(c, i, prev)); prev = c.speaker || prev; });
     list.append(frag);
   } else {
     const c = S.current;
     notes.replaceChildren(
+      captionCard() || '',
       el('h3', { text: S.untimed ? 'Transcript' : 'About this episode' }),
       el('p', { class: 'notes-text', text: S.untimed || (c && c.ep.desc) || 'No notes for this episode.' }),
       el('div', { class: 'notes-actions' }, S.capLoading ? el('p', { class: 'np-label', text: 'Loading captions…' }) :
@@ -1483,7 +2397,22 @@ function resolveItem(item, pri = 5) {
     const countries = item.countries || ['gb', 'us'];
     if (item.id) { try { r = (await dirLookup([item.id], countries[0], pri))[0] || null; } catch (e) { if (e.status === 429) throw e; } }
     if (!r && item.feed && VIA_HELPER) { try { const info = await feedInfo(item.feed); if (info && titleOk(info.title, item)) r = { title: info.title, author: info.author || '', feedUrl: item.feed, image: info.image || '', genre: '' }; } catch {} }
-    if (!r) for (const c of countries) { r = bestMatch(await dirSearch(item.term || item.title, c, pri, 10), item); if (r) break; }
+    if (!r) {
+      try { for (const c of countries) { r = bestMatch(await dirSearch(item.term || item.title, c, pri, 10), item); if (r) break; } }
+      catch (e) { if (e.status === 429) throw e; }
+    }
+    if (!r && item.site && VIA_HELPER) {   // not in Apple's directory: look on the show's own website
+      try {
+        const res = await crawlSite(item.site, item.title);
+        const image = (res.show && res.show.image) || '';
+        if (res.feedUrl) r = { title: item.title, author: item.author || '', feedUrl: res.feedUrl, image, genre: '', site: res.pageUrl, source: 'rss' };
+        else if (res.episodes && res.episodes.length) {
+          const key = 'web:' + res.pageUrl;
+          await idb.set('eps:' + key, { t: Date.now(), eps: webEpisodes(res, key) });
+          r = { title: item.title, author: item.author || '', feedUrl: key, image, genre: '', site: res.pageUrl, source: 'web' };
+        }
+      } catch {}
+    }
     if (r) { resolved[item.key] = r; store.set(KEY.resolved, resolved); }
     return r;
   })();
@@ -1531,7 +2460,7 @@ async function runSetup() {
 function applyResolved(s, r) {
   if (r && r.feedUrl) {
     if (library.some(x => x !== s && x.feedUrl === r.feedUrl)) { library = library.filter(x => x !== s); saveLibrary(); renderSidebar(); return; }
-    Object.assign(s, { feedUrl: r.feedUrl, author: r.author || s.author, image: r.image || s.image, appleId: r.appleId || null, genre: r.genre || '', status: 'ready' });
+    Object.assign(s, { feedUrl: r.feedUrl, author: r.author || s.author, image: r.image || s.image, appleId: r.appleId || null, genre: r.genre || '', site: r.site || '', source: r.source || 'rss', status: 'ready' });
   } else s.status = 'missing';
   saveLibrary();
   renderSidebar();
@@ -1551,24 +2480,78 @@ function updateSetupUI() {
     el('div', { class: 'meter', role: 'progressbar', 'aria-valuemin': '0', 'aria-valuemax': String(total), 'aria-valuenow': String(done) }, el('i', { style: `width:${Math.round(done / Math.max(1, total) * 100)}%` }))));
 }
 
-/* ---------- feeds (cached in IndexedDB) ---------- */
+/* ---------- feeds (cached in IndexedDB), with a website fallback ---------- */
+const crawlSite = (url, title) => getJSON('/api/crawl?url=' + encodeURIComponent(url) + (title ? '&title=' + encodeURIComponent(title) : ''));
+const appleUrlOf = s => s && s.appleId ? `https://podcasts.apple.com/gb/podcast/id${s.appleId}` : '';
+function webEpisodes(result, key) {
+  const prefix = fnv(key) + ':', seen = new Set();
+  return (result.episodes || []).filter(e => e.url && !seen.has(e.url) && seen.add(e.url)).map(e => ({
+    id: prefix + (e.guid || e.url), url: e.url, type: '', title: e.title || 'Untitled episode', date: e.date || 0,
+    duration: e.duration || 0, image: e.image || '', number: '', desc: clip(e.desc || '', 1600), transcripts: [], link: e.link || ''
+  }));
+}
+function switchSource(show, feedUrl, kind, site, meta) {
+  const old = show.feedUrl;
+  const targets = [...new Set([show, showByFeed(old)].filter(Boolean))];
+  for (const t of targets) {
+    Object.assign(t, { feedUrl, source: kind, site: site || t.site || '', origFeed: t.origFeed || old || '', status: 'ready' });
+    if (meta) { if (!t.image && meta.image) t.image = meta.image; if (!t.description && meta.description) t.description = meta.description; }
+  }
+  saveLibrary();
+  renderSidebar();
+  if (old && old !== feedUrl) toast(kind === 'web' ? `${show.title}: the feed didn’t work, so episodes now come from the show’s website.` : `${show.title}: switched to a working feed.`);
+}
 const Feeds = {
   inflight: new Map(),
   async cached(show) { if (!show || !show.feedUrl) return null; return (await idb.get('eps:' + show.feedUrl)) || null; },
+  async fromFeed(show, url) {
+    const { text } = await fetchText(url);
+    const parsed = parseFeed(text, url);
+    noteFeedMeta(show, parsed.show);
+    return parsed.episodes.slice(0, 300);
+  },
+  async fromCrawl(show, result) {
+    if (result.feedUrl) {
+      const eps = await this.fromFeed(show, result.feedUrl);
+      if (eps.length) { switchSource(show, result.feedUrl, 'rss', result.pageUrl, result.show); return eps; }
+    }
+    const key = 'web:' + result.pageUrl;
+    const eps = webEpisodes(result, key);
+    if (!eps.length) throw new Error('No episodes were found at that address.');
+    switchSource(show, key, 'web', result.pageUrl, result.show);
+    return eps;
+  },
+  async rescue(show, err) {
+    const p = show.preset ? PRESET[show.preset] : null;
+    const sites = [...new Set([show.feedUrl, show.site, p && p.site, show.link, appleUrlOf(show)].filter(u => /^https?:\/\//i.test(u || '')))];
+    for (const site of sites) { try { return await this.fromCrawl(show, await crawlSite(site, show.title)); } catch {} }
+    throw new Error(`${err.message} Afterhours also looked on the show’s website and found no episodes.`);
+  },
   refresh(show) {
     const url = show.feedUrl;
     if (this.inflight.has(url)) return this.inflight.get(url);
     const p = (async () => {
-      const { text } = await fetchText(url);
-      const parsed = parseFeed(text, url);
-      noteFeedMeta(show, parsed.show);
-      const eps = parsed.episodes.slice(0, 300);
-      await idb.set('eps:' + url, { t: Date.now(), eps });
+      let eps;
+      if (url.startsWith('web:')) eps = await this.fromCrawl(show, await crawlSite(url.slice(4), show.title));
+      else {
+        try { eps = await this.fromFeed(show, url); if (!eps.length) throw new Error('This feed has no playable episodes.'); }
+        catch (e) { eps = await this.rescue(show, e); }
+      }
+      await idb.set('eps:' + show.feedUrl, { t: Date.now(), eps });
       return eps;
     })();
     this.inflight.set(url, p);
     p.then(() => this.inflight.delete(url), () => this.inflight.delete(url));
     return p;
+  },
+  async useSource(show, input) {
+    let url = input.trim().replace(/^(feed|pcast|podcast|itpc):\/\//i, 'https://');
+    if (!/^https?:\/\//i.test(url)) url = 'https://' + url;
+    let eps = null;
+    try { eps = await this.fromFeed(show, url); if (eps.length) switchSource(show, url, 'rss'); else eps = null; } catch {}
+    if (!eps) eps = await this.fromCrawl(show, await crawlSite(url, show.title));
+    await idb.set('eps:' + show.feedUrl, { t: Date.now(), eps });
+    return eps;
   }
 };
 function noteFeedMeta(show, meta) {
@@ -1686,7 +2669,7 @@ async function ensureFeed(c, pri) {
   if (!c.item) return false;
   try {
     const r = await resolveItem(c.item, pri);
-    if (r && r.feedUrl) { Object.assign(c, { feedUrl: r.feedUrl, image: r.image || c.image, author: r.author || c.author, appleId: r.appleId, genre: r.genre }); return true; }
+    if (r && r.feedUrl) { Object.assign(c, { feedUrl: r.feedUrl, image: r.image || c.image, author: r.author || c.author, appleId: r.appleId, genre: r.genre, site: r.site || '', source: r.source || '' }); return true; }
   } catch (e) { if (e.status === 429) toast(e.message, true); }
   return false;
 }
@@ -1752,7 +2735,7 @@ function addShow(c, quiet) {
   const existing = libFor(c);
   if (existing) return existing;
   const sidWanted = c.preset ? 'p-' + c.preset : 'u-' + fnv(c.feedUrl);
-  const s = { sid: library.some(x => x.sid === sidWanted) ? 'u-' + fnv(c.feedUrl) : sidWanted, preset: c.preset || null, cat: c.cat || 'mine', title: c.title, author: c.author || '', image: c.image || '', feedUrl: c.feedUrl, status: 'ready', appleId: c.appleId || null, genre: c.genre || '', description: c.description || '', link: c.link || '', addedAt: Date.now() };
+  const s = { sid: library.some(x => x.sid === sidWanted) ? 'u-' + fnv(c.feedUrl) : sidWanted, preset: c.preset || null, cat: c.cat || 'mine', title: c.title, author: c.author || '', image: c.image || '', feedUrl: c.feedUrl, status: 'ready', appleId: c.appleId || null, genre: c.genre || '', description: c.description || '', link: c.link || '', site: c.site || '', source: c.source || (String(c.feedUrl).startsWith('web:') ? 'web' : 'rss'), addedAt: Date.now() };
   library.push(s);
   saveLibrary();
   renderSidebar();
@@ -1955,12 +2938,30 @@ function renderLibrary() {
     if (shows.length) view.append(section(c.label, null, el('div', { class: 'grid' }, shows.map(showTile))));
   }
 }
+function sourcePanel(show, onDone) {
+  const input = el('input', { type: 'text', inputmode: 'url', placeholder: 'Paste the show’s RSS feed or website', 'aria-label': 'RSS feed or website address', spellcheck: 'false', value: show.site || show.link || '' });
+  const btn = el('button', { class: 'btn primary small', type: 'submit', text: 'Use this source' });
+  const note = el('p', { class: 'source-note', text: 'Afterhours reads the RSS feed. If there isn’t one, it looks through the website for episodes.' });
+  const form = el('form', { class: 'source-form', autocomplete: 'off' }, el('div', { class: 'source-row' }, input, btn), note);
+  form.addEventListener('submit', async e => {
+    e.preventDefault();
+    if (!input.value.trim()) return;
+    btn.disabled = true;
+    note.textContent = 'Checking that address. A website can take up to half a minute to look through…';
+    try { onDone(await Feeds.useSource(show, input.value)); }
+    catch (err) { note.textContent = err.message; }
+    finally { btn.disabled = false; }
+  });
+  return form;
+}
 async function renderShow(sid) {
   const show = showBySid(sid);
   if (!show) { view.append(emptyState('This show isn’t in your library', 'It may have been removed.', 'Open Library', '#/library')); return; }
   const inLib = library.includes(show);
   const preset = show.preset ? PRESET[show.preset] : null;
   const actions = el('div', { class: 'show-actions' });
+  const srcBox = el('div', { class: 'source-box', hidden: true });
+  const srcNote = el('p', { class: 'show-source', hidden: show.source !== 'web', text: 'No working RSS feed, so these episodes come from the show’s website.' });
   const about = el('p', { class: 'show-about', text: show.description || show.why || (preset && preset.why) || '' });
   const hero = el('header', { class: 'show-hero' },
     art(show.image, show.title, { cls: 'hero-art', pending: show.status === 'pending', eager: true }),
@@ -1968,7 +2969,7 @@ async function renderShow(sid) {
       el('p', { class: 'show-kicker', text: (CAT[show.cat] && CAT[show.cat].label) || (show.transient ? 'Preview' : 'Your additions') }),
       el('h1', { class: 'show-title', text: show.title }),
       show.author ? el('p', { class: 'show-author', text: show.author }) : null,
-      about, actions));
+      about, actions, srcNote, srcBox));
   view.append(hero);
   artColor(show.image).then(c => applyTint(hero, c));
   const list = el('ol', { class: 'eps' });
@@ -1976,6 +2977,12 @@ async function renderShow(sid) {
   const sortLabel = () => settings.sort === 'oldest' ? 'Oldest first' : 'Newest first';
   let eps = [], shown = 60;
   const still = () => route.name === 'show' && route.arg === sid && list.isConnected;
+  const openSource = () => {
+    if (!srcBox.hidden) { srcBox.hidden = true; return; }
+    srcBox.replaceChildren(sourcePanel(show, fresh => { toast(`${show.title} now has ${fresh.length} episodes.`); render(); }));
+    srcBox.hidden = false;
+    srcBox.querySelector('input').focus();
+  };
   const paint = () => {
     const sorted = settings.sort === 'oldest' ? [...eps].reverse() : eps;
     const sh = snap(show);
@@ -1983,7 +2990,8 @@ async function renderShow(sid) {
     list.replaceChildren(...sorted.slice(0, shown).map(e => episodeRow(e, sh, queue)));
     if (sorted.length > shown) list.append(el('li', { class: 'more-row' }, el('button', { class: 'btn tonal', type: 'button', text: `Show more episodes (${sorted.length - shown})`, onclick: () => { shown += 60; paint(); } })));
     note.hidden = sorted.length > 0;
-    if (!sorted.length) note.textContent = 'This feed has no playable episodes.';
+    if (!sorted.length) note.textContent = 'This show has no playable episodes.';
+    srcNote.hidden = show.source !== 'web';
   };
   const sortBtn = el('button', { class: 'btn tonal small', type: 'button' }, icon('sort'), el('span', { text: sortLabel() }));
   sortBtn.addEventListener('click', () => { settings.sort = settings.sort === 'oldest' ? 'newest' : 'oldest'; saveSettings(); sortBtn.lastChild.textContent = sortLabel(); paint(); });
@@ -1996,7 +3004,7 @@ async function renderShow(sid) {
       b.classList.add('spin');
       try { eps = await Feeds.refresh(show); if (still()) paint(); toast('This show is up to date.'); } catch (e) { toast(`Couldn’t refresh. ${e.message}`, true); }
       b.classList.remove('spin');
-    }));
+    }), iconBtn('swap', 'Change source', openSource));
     if (/^https?:\/\//i.test(show.link || '')) actions.append(el('a', { class: 'icon-round', href: show.link, target: '_blank', rel: 'noopener noreferrer', 'aria-label': 'Website', title: 'Website' }, icon('link')));
     actions.append(iconBtn('trash', 'Remove from library', () => removeShow(show)));
   } else {
@@ -2004,6 +3012,12 @@ async function renderShow(sid) {
     addBtn.addEventListener('click', () => { const s = addShow(show); transient.delete(sid); history.replaceState(null, '', '#/show/' + s.sid); render(); });
     actions.append(addBtn, playLatest);
   }
+  const failed = msg => {
+    list.replaceChildren();
+    note.hidden = false;
+    note.replaceChildren(msg + ' ', el('button', { class: 'link-btn', type: 'button', text: 'Change source', onclick: openSource }), ' or ',
+      el('a', { class: 'link-btn', href: '#/search/' + encodeURIComponent(show.title), text: 'search for it' }), '.');
+  };
   if (show.status === 'pending') {
     note.hidden = false;
     note.textContent = 'Finding this show’s feed…';
@@ -2012,18 +3026,18 @@ async function renderShow(sid) {
     return;
   }
   if (show.status === 'missing') {
-    note.hidden = false;
-    note.replaceChildren('Couldn’t find a public feed for this show automatically. ',
-      el('a', { class: 'link-btn', href: '#/search/' + encodeURIComponent(show.title), text: 'Search for it' }), ', or ',
-      el('button', { class: 'link-btn', type: 'button', text: 'try again', onclick: () => { show.status = 'pending'; saveLibrary(); runSetup(); render(); } }), '.');
+    failed('Afterhours couldn’t find this show’s feed in Apple’s directory or on its website.');
+    openSource();
     return;
   }
   list.append(...skeletonRows(5));
   const cached = await Feeds.cached(show);
   if (cached && still()) { eps = cached.eps; paint(); }
   if (!cached || Date.now() - cached.t > 30 * 60e3) {
-    try { eps = await Feeds.refresh(show); if (still()) paint(); }
-    catch (e) { if (still() && !eps.length) { list.replaceChildren(); note.hidden = false; note.textContent = `Couldn’t load episodes. ${e.message}`; } }
+    const slow = setTimeout(() => { if (still() && !eps.length) { note.hidden = false; note.textContent = 'Still loading. If the feed doesn’t answer, Afterhours will look for episodes on the show’s website.'; } }, 5000);
+    try { eps = await Feeds.refresh(show); if (still()) { note.hidden = true; paint(); } }
+    catch (e) { if (still() && !eps.length) failed(`Couldn’t load episodes. ${e.message}`); }
+    finally { clearTimeout(slow); }
   }
   if (still() && !about.textContent && show.description) about.textContent = show.description;
 }
@@ -2069,11 +3083,27 @@ async function handleLink(v) {
     } else {
       let url = v.replace(/^(feed|pcast|podcast|itpc):\/\//i, 'https://');
       if (!/^https?:\/\//i.test(url)) url = 'https://' + url;
-      toast('Loading that feed…');
-      const { text } = await fetchText(url);
-      const parsed = parseFeed(text, url);
-      info = { feedUrl: url, title: parsed.show.title, author: parsed.show.author, image: parsed.show.image, description: parsed.show.description, link: parsed.show.link };
-      await idb.set('eps:' + url, { t: Date.now(), eps: parsed.episodes.slice(0, 300) });
+      toast('Loading that link…');
+      try {
+        const { text } = await fetchText(url);
+        const parsed = parseFeed(text, url);
+        info = { feedUrl: url, title: parsed.show.title, author: parsed.show.author, image: parsed.show.image, description: parsed.show.description, link: parsed.show.link };
+        await idb.set('eps:' + url, { t: Date.now(), eps: parsed.episodes.slice(0, 300) });
+      } catch {
+        toast('That isn’t a feed, so Afterhours is looking through the page for episodes…');
+        const res = await crawlSite(url);
+        const meta = res.show || {};
+        if (res.feedUrl) {
+          const { text } = await fetchText(res.feedUrl);
+          const parsed = parseFeed(text, res.feedUrl);
+          info = { feedUrl: res.feedUrl, title: parsed.show.title, author: parsed.show.author, image: parsed.show.image || meta.image, description: parsed.show.description, link: parsed.show.link || res.pageUrl, site: res.pageUrl, source: 'rss' };
+          await idb.set('eps:' + res.feedUrl, { t: Date.now(), eps: parsed.episodes.slice(0, 300) });
+        } else {
+          const key = 'web:' + res.pageUrl;
+          info = { feedUrl: key, title: meta.title || url, author: '', image: meta.image || '', description: meta.description || '', link: res.pageUrl, site: res.pageUrl, source: 'web' };
+          await idb.set('eps:' + key, { t: Date.now(), eps: webEpisodes(res, key) });
+        }
+      }
     }
     const s = addShow(Object.assign({ cat: 'mine' }, info));
     $('searchInput').value = '';
@@ -2124,7 +3154,7 @@ function updateNowPlaying() {
   const bg = $('npBg');
   bg.replaceChildren();
   if (img) { const i = el('img', { alt: '', src: img }); i.addEventListener('error', () => i.remove(), { once: true }); bg.append(i); }
-  document.title = `${c.ep.title} | 夜更かしラジオ`;
+  document.title = `${c.ep.title} | Afterhours`;
   artColor(img).then(hsl => { if (S.current === c && hsl) for (const id of ['bar', 'np', 'capPill']) applyTint($(id), hsl); });
   if ('mediaSession' in navigator) {
     try { navigator.mediaSession.metadata = new MediaMetadata({ title: c.ep.title, artist: c.show.author || c.show.title, album: c.show.title, artwork: img ? [{ src: img, sizes: '512x512' }] : [] }); } catch {}
@@ -2228,7 +3258,7 @@ function openNp(withLyrics) {
   renderLyrics();
   renderCaptions(true);
   S.lastUserScroll = 0;
-  setTimeout(() => { if (S.cueIdx >= 0) highlightLyric(S.cueIdx); $('npClose').focus(); }, 60);
+  setTimeout(() => { if (S.cueIdx >= 0) highlightLyric(S.cueIdx); $('npClose').focus({ preventScroll: true, focusVisible: false }); }, 60);
 }
 function closeNp() {
   S.npOpen = false;
@@ -2325,6 +3355,11 @@ function syncVolumeUI() {
 /* ---------- theme, OPML ---------- */
 const THEMES = ['system', 'light', 'dark'];
 const THEME_LABEL = { system: 'Appearance: System', light: 'Appearance: Light', dark: 'Appearance: Dark' };
+function syncAutoCap() {
+  const on = settings.autoCaptions;
+  $('autoCapLabel').textContent = `Auto captions: ${on ? 'On' : 'Off'}`;
+  $('autoCapBtn').setAttribute('aria-pressed', String(on));
+}
 function applyTheme() {
   if (settings.theme === 'system') delete document.documentElement.dataset.theme;
   else document.documentElement.dataset.theme = settings.theme;
@@ -2336,7 +3371,7 @@ function exportOPML() {
   if (!ready.length) { toast('There’s nothing to export yet.'); return; }
   const esc = s => String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;');
   const body = ready.map(s => `    <outline type="rss" text="${esc(s.title)}" title="${esc(s.title)}" xmlUrl="${esc(s.feedUrl)}"/>`).join('\n');
-  const xml = `<?xml version="1.0" encoding="UTF-8"?>\n<opml version="2.0">\n  <head><title>夜更かしラジオ subscriptions</title></head>\n  <body>\n${body}\n  </body>\n</opml>\n`;
+  const xml = `<?xml version="1.0" encoding="UTF-8"?>\n<opml version="2.0">\n  <head><title>Afterhours subscriptions</title></head>\n  <body>\n${body}\n  </body>\n</opml>\n`;
   const a = el('a', { href: URL.createObjectURL(new Blob([xml], { type: 'text/x-opml' })), download: 'afterhours-subscriptions.opml' });
   document.body.append(a);
   a.click();
@@ -2379,6 +3414,15 @@ function wire() {
   window.addEventListener('hashchange', render);
   $('searchForm').addEventListener('submit', e => { e.preventDefault(); const v = $('searchInput').value.trim(); if (v) handleQuery(v); });
   $('themeBtn').addEventListener('click', () => { settings.theme = THEMES[(THEMES.indexOf(settings.theme) + 1) % THEMES.length]; saveSettings(); applyTheme(); toast(THEME_LABEL[settings.theme] + '.'); });
+  $('autoCapBtn').addEventListener('click', async () => {
+    settings.autoCaptions = !settings.autoCaptions;
+    saveSettings();
+    syncAutoCap();
+    const cap = Recog.cap || await Recog.init();
+    if (settings.autoCaptions && !cap.available) { toast(`Auto captions need a free add-on. Quit Afterhours and run: ${cap.install || 'python3 afterhours.py --setup-captions'}`, true); return; }
+    toast(settings.autoCaptions ? 'Episodes without captions will be captioned on this computer.' : 'Auto captions off.');
+    if (settings.autoCaptions && S.current && !S.cues.length && !S.untimed && !recogActive()) { Recog.start(S.current.ep); renderLyrics(); }
+  });
   $('importBtn').addEventListener('click', () => $('opmlFile').click());
   $('exportBtn').addEventListener('click', exportOPML);
   $('opmlFile').addEventListener('change', e => { const f = e.target.files[0]; e.target.value = ''; if (f) importOPML(f); });
@@ -2486,13 +3530,15 @@ function wire() {
     set('nexttrack', () => step(1));
     set('stop', () => audio.pause());
   }
-  window.addEventListener('pagehide', () => saveProgress(true));
+  window.addEventListener('pagehide', () => { saveProgress(true); if (recogActive()) Recog.save(false); });
   document.addEventListener('visibilitychange', () => { if (document.hidden) saveProgress(true); });
 }
 
 function init() {
   seedLibrary();
   applyTheme();
+  syncAutoCap();
+  Recog.init();
   wire();
   audio.volume = settings.volume;
   audio.muted = settings.muted;
