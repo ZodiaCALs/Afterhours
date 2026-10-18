@@ -2,6 +2,8 @@
 
 A small, private podcast player for slow evenings. Afterhours is a single file that runs on your own computer and opens in your browser. It comes with 30 shows already on the shelf, recommends related ones, and captions episodes that don't have captions.
 
+![afterhours-preview](/Users/zodiac/Documents/Models/Claude5.5/Afterhours/afterhours-preview.png)
+
 ## Quick start
 
 You need Python 3.8 or newer and a current browser (Chrome, Edge, Safari 16 or later, or Firefox).
@@ -56,6 +58,14 @@ You can open any show to preview its episodes before adding it.
 
 While you browse, the current line floats above the player bar like a subtitle.
 
+**Settings.** One place for:
+- the auto captions switch and recognition quality
+- showing captions, autoplay and appearance
+- importing and exporting shows
+- looking again for shows that couldn't be found
+
+Open it from the sidebar, or from the gear on Listen Now and Library on a phone.
+
 **Design.** Light and dark appearance. Each show page and the player take their accent colour from the cover art. Layouts are made for desktops, tablets and phones, including phones held sideways.
 
 ## Auto captions (optional)
@@ -74,11 +84,18 @@ If your Python refuses to install add-ons (common with Homebrew and some Linux s
 
 **Speed.** On a recent computer, the default model usually keeps ahead of playback. Larger models are slower but more accurate. A supported NVIDIA graphics card is used automatically.
 
-**Controls:**
-- **The sidebar switch** turns auto captions on or off. When they're off, Now Playing offers a "Generate captions" button for individual episodes.
-- **"Redo with more accuracy"** in Now Playing re-captions an episode with the larger model.
+**Turning it on and off.** The Auto captions switch is in three places, and they always match:
+- the sidebar
+- Now Playing, next to the captions
+- Settings
 
-**Privacy.** Recognition runs entirely on your computer. The only downloads are the episode audio and the one-time model download. Finished captions are saved in `~/.afterhours/captions`, so they appear instantly next time.
+Switching it off stops any captioning in progress. Lines already made stay, and Now Playing offers "Caption this episode" whenever you want one episode captioned anyway.
+
+**Quality.** Settings › Recognition quality offers Automatic, Fast, Accurate and Most accurate. Automatic uses Fast for English shows and Accurate for Japanese and Chinese ones. After an episode is captioned with Fast, Now Playing offers "Redo with more accuracy".
+
+**Reading the audio.** Afterhours reads episode audio itself, so it works with any version of the add-on's audio library (PyAV). If ffmpeg is installed, it's used as a backup for files PyAV can't read. Settings › Caption recognition shows whether everything is ready, with version numbers.
+
+**Privacy.** Recognition runs entirely on your computer. The only downloads are the episode audio and the one-time model download. Finished captions are saved in `~/.afterhours/captions`, so they appear instantly next time. To remove them, use Settings › Saved auto captions › Delete.
 
 ## How Afterhours finds episodes
 
@@ -110,7 +127,7 @@ Some shows can't be played anywhere outside one app (for example Spotify exclusi
 
 ## Your data
 
-- **Library, progress and settings** are kept in your browser on this computer. Each browser and each port keeps its own copy, so use the same one each time. To move your shows, use Export OPML and Import OPML.
+- **Library, progress and settings** are kept in your browser on this computer. Each browser and each port keeps its own copy, so use the same one each time. To move your shows, use Export OPML and Import OPML in Settings.
 - **Auto captions** are saved in `~/.afterhours`. Set `AFTERHOURS_DATA` to use another folder.
 - **Network:** Afterhours only listens on your own computer (127.0.0.1). It only connects to:
   - podcast sites and their cover art
@@ -138,6 +155,7 @@ Some shows can't be played anywhere outside one app (for example Spotify exclusi
 - **A show won't load.** Open it and press Change source, then paste its website or feed. Some feeds only work in certain countries; for example, Composer of the Week is UK-only.
 - **"Apple's podcast directory asked Afterhours to slow down."** Wait a minute. Setup and searches carry on by themselves.
 - **"Caption recognition isn't installed."** Run `python3 afterhours.py --setup-captions`, then restart Afterhours.
+- **Auto captions stopped with "open() got an unexpected keyword argument 'metadata_errors'".** This affected Afterhours 3.0 with newer versions of PyAV. Afterhours 3.1 fixes it. If a different caption error appears, update the add-on with `python3 afterhours.py --setup-captions`.
 - **An episode won't play.** Its audio link may have changed. Press the refresh button on the show's page.
 
 ## Project structure
@@ -152,51 +170,25 @@ The app itself (HTML, CSS and JavaScript) is embedded in the same file. There ar
 
 ## Changelog
 
-### 3.0.0 (2026-10-18)
-
-**Added**
-- **Website fallback.** When a feed fails, Afterhours finds the show's episodes on its website: a feed link in the page, an Apple Podcasts link, a common feed address checked against the show's title, or the audio on the page and its episode pages. Episodes embedded in a page's data and structured episode listings are understood.
-- **Change source** on every show page, to point a show at a different feed or website by hand.
-- **Browser retry:** sites that turn the player away get a second request made the way a browser would.
-- **Fallback websites** for 28 of the pre-added shows, used automatically when their feed fails or Apple's directory doesn't list them.
-- **Pasting a website** in search now adds the show, by finding its feed or reading the site.
-- **Auto captions:** speech recognition on your computer for episodes without captions. Captions start where you are, stream in as they're ready, and are saved for next time. There's a sidebar switch, a per-episode "Generate captions" button, and "Redo with more accuracy".
-- `--setup-captions` to install the recognition add-on.
-- This README.
-
-**Changed**
-- The project is now called **Afterhours** (it was 夜更かしラジオ, After Hours). The wordmark uses your system's own font.
-- Chinese-language shows are searched in more of Apple's regions (mainland China, Taiwan, Hong Kong and the US).
+### v0.1.1
 
 **Fixed**
-- **Player bar:** on mid-size windows (roughly 1100–1300 px wide) the controls ran into the progress bar. The bar now drops its least-used controls as it narrows, and on very wide screens it stays centred instead of stretching.
-- **Discover:** the featured artwork overlapped the headline when the content area was narrow (tablet sizes).
-- **Now Playing:** the controls were cut off on short windows such as 1280×720 laptops and phones held sideways. The cover now sizes itself to the window's height. Short, wide screens get a side-by-side layout. Very small screens can scroll.
-- **Show pages on phones:** they scrolled sideways by a couple of pixels.
-- **Tablet sidebar:** the navigation rail could cut off its buttons on short screens.
-- **Website fallback:** a feed found at a guessed address on a shared website could belong to a different show. Guessed feeds must now match the show's title.
 
-### 2.0.0 (2026-10-17)
+- **Auto captions failing** with "open() got an unexpected keyword argument 'metadata_errors'". PyAV 14 and later removed an option that some faster-whisper versions still pass when reading audio. Afterhours now reads the audio itself in a way that works with every PyAV version. It skips damaged stretches of audio instead of stopping, and falls back to ffmpeg if it's installed.
+- **Clearer caption errors**, including when the speech model couldn't be downloaded.
+- **Narrow phones:** the Library header no longer scrolls sideways on the narrowest phones.
 
-- **Pre-added shows:** the 30 shows from the recommendation poster are in the library from the first launch, found through Apple's podcast directory, with paced and cached lookups.
-- **Discover page:** "Because you listen to…" rows, hand-picked related shows, topic tabs, Japanese and Chinese tabs, and previews before adding.
-- **Redesign** inspired by Apple Podcasts with touches of Fluent and Material:
-  - native system fonts
-  - a sidebar with your shows
-  - a floating player bar
-  - accent colours taken from cover art
-  - a navigation rail on tablets
-  - a tab bar and floating mini player on phones
-- **Now Playing:** full screen over a blurred cover, with a lyrics-style live transcript. On phones it opens on the artwork.
-- **Listen Now:** Up Next and Latest episodes across the shelf.
-- **Faster library:** episode lists are cached in the browser, so large libraries open quickly.
-- **Fixes:** the caption line on phones now uses the full screen width, and the tablet rail labels stay on one line.
+**Added**
+- **Auto captions switch** in the sidebar, in Now Playing and in Settings, always in step. Switching off stops captioning in progress, and nothing starts by itself while it's off.
+- **Settings page.** It has:
+  - switches for showing captions, auto captions and autoplay
+  - recognition quality and appearance
+  - the caption add-on's status, with version numbers
+  - deleting saved auto captions
+  - looking again for missing shows
+  - OPML import and export
 
-### 1.0.0 (2026-10-17)
+  On phones it's a tap away from Listen Now and Library.
 
-- First release, as 夜更かしラジオ.
-- Podcast search, plus adding shows by RSS feed or Apple Podcasts link.
-- Playback speed, skip controls, sleep timer, volume and resume.
-- Captions and a transcript panel from feed transcripts or your own caption files.
-- Cover art, lock-screen controls and keyboard shortcuts.
-- OPML import and export, and light and dark appearance.
+**Changed**
+- Appearance and OPML import and export moved from the sidebar into Settings.

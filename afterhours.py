@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Afterhours 3.0: a small, private podcast player.
+Afterhours 3.1: a small, private podcast player.
 
 Run it:    python3 afterhours.py        (Windows: py afterhours.py)
 It opens:  http://127.0.0.1:8765  in your browser
@@ -35,6 +35,7 @@ import json
 import os
 import queue
 import re
+import shutil
 import socket
 import ssl
 import subprocess
@@ -52,7 +53,7 @@ from pathlib import Path
 
 APP_NAME = "Afterhours"
 APP_ID = "afterhours"
-VERSION = "3.0.0"
+VERSION = "3.1.0"
 DEFAULT_PORT = 8765
 MAX_BYTES = 25 * 1024 * 1024
 MAX_AUDIO = 1536 * 1024 * 1024
@@ -708,6 +709,91 @@ def split_words(seg, offset):
         yield {"start": round(start + offset, 2), "end": round(end + offset, 2), "text": t}
 
 
+def _frames(result):
+    """PyAV 9+ resamplers return a list of frames; older ones return one frame or None."""
+    if result is None:
+        return []
+    return [f for f in (result if isinstance(result, (list, tuple)) else [result]) if f is not None]
+
+
+def decode_with_av(path, rate=16000):
+    """Decode any audio file to 16 kHz mono floats with PyAV.
+    Unlike faster-whisper's own decoder, this never passes options that newer PyAV removed
+    (PyAV 14 dropped metadata_errors), and it skips damaged packets instead of giving up."""
+    import av
+    import numpy as np
+    chunks, bad = [], 0
+    state = {"resampler": None}
+
+    def take(frame):
+        frame.pts = None  # some PyAV versions refuse frames whose timestamps have gaps
+        for _attempt in (1, 2):
+            if state["resampler"] is None:
+                state["resampler"] = av.audio.resampler.AudioResampler(format="s16", layout="mono", rate=rate)
+            try:
+                for out in _frames(state["resampler"].resample(frame)):
+                    chunks.append(out.to_ndarray().reshape(-1))
+                return
+            except ValueError:
+                state["resampler"] = None  # the audio format changed partway through: start a fresh resampler
+
+    with av.open(str(path)) as container:
+        streams = getattr(container.streams, "audio", None) or [s for s in container.streams if getattr(s, "type", "") == "audio"]
+        if not streams:
+            raise RuntimeError("the file has no audio track")
+        for packet in container.demux(streams[0]):
+            try:
+                frames = packet.decode()
+            except Exception:
+                bad += 1
+                if bad > 500:
+                    break
+                continue
+            for frame in frames:
+                try:
+                    take(frame)
+                except Exception:
+                    bad += 1
+        if state["resampler"] is not None:
+            try:
+                for out in _frames(state["resampler"].resample(None)):
+                    chunks.append(out.to_ndarray().reshape(-1))
+            except Exception:
+                pass
+    if not chunks:
+        raise RuntimeError("no audio could be decoded")
+    return np.concatenate(chunks).astype(np.float32) / 32768.0
+
+
+def decode_with_ffmpeg(path, rate=16000):
+    import numpy as np
+    exe = shutil.which("ffmpeg")
+    if not exe:
+        raise RuntimeError("ffmpeg isn't installed")
+    proc = subprocess.run([exe, "-nostdin", "-hide_banner", "-loglevel", "error", "-i", str(path),
+                           "-f", "s16le", "-ac", "1", "-ar", str(rate), "-"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    data = proc.stdout[: len(proc.stdout) // 2 * 2]
+    if proc.returncode != 0 or not data:
+        lines = proc.stderr.decode("utf-8", "replace").strip().splitlines()
+        raise RuntimeError((lines[-1] if lines else "ffmpeg couldn't read the file")[:200])
+    return np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
+
+
+def caption_versions():
+    found = {}
+    try:
+        from importlib import metadata
+        for name in ("faster-whisper", "av", "ctranslate2"):
+            try:
+                found[name] = metadata.version(name)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    found["ffmpeg"] = bool(shutil.which("ffmpeg"))
+    return found
+
+
 class WhisperEngine:
     name = "faster-whisper"
 
@@ -730,7 +816,20 @@ class WhisperEngine:
         return self.loaded[size]
 
     def decode(self, path):
-        return self.fw.decode_audio(str(path), sampling_rate=16000)
+        problems = []
+        for decoder in (decode_with_av, decode_with_ffmpeg):
+            try:
+                audio = decoder(path)
+                if len(audio) >= 16000:
+                    return audio
+                problems.append(decoder.__name__[12:] + ": the audio was empty")
+            except Exception as e:
+                problems.append("%s: %s" % (decoder.__name__[12:], str(e)[:160] or e.__class__.__name__))
+        try:  # last resort: faster-whisper's own decoder, which works when its PyAV version matches
+            return self.fw.decode_audio(str(path), sampling_rate=16000)
+        except Exception as e:
+            problems.append("faster-whisper: %s" % (str(e)[:160] or e.__class__.__name__))
+        raise FetchError(422, "Afterhours couldn’t read this episode’s audio (%s)." % "; ".join(problems))
 
     def segments(self, model, audio, a, b, lang, on_language):
         chunk = audio[int(a * 16000):int(b * 16000)]
@@ -851,7 +950,12 @@ class CaptionJobs:
             except FetchError as e:
                 job.update(state="error", error=e.message)
             except Exception as e:
-                job.update(state="error", error="Caption recognition stopped (%s: %s)." % (e.__class__.__name__, str(e)[:160]))
+                text = "%s: %s" % (e.__class__.__name__, str(e)[:200])
+                if re.search(r"(huggingface|hf_hub|LocalEntryNotFound|Max retries|ConnectionError|getaddrinfo|Name or service|Temporary failure)", text, re.I):
+                    message = "Couldn’t download the speech model. Check your internet connection, then try again."
+                else:
+                    message = "Caption recognition stopped (%s). Updating the add-on often helps: %s" % (text, INSTALL_HINT)
+                job.update(state="error", error=message)
 
     def _run(self, job):
         if self.engine is None:
@@ -996,7 +1100,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 engine = caption_engine_name()
                 if path == "/api/captions":
                     return self._json({"available": bool(engine), "engine": engine, "models": list(MODELS),
-                                       "sizes": MODEL_SIZES, "install": INSTALL_HINT})
+                                       "sizes": MODEL_SIZES, "install": INSTALL_HINT, "versions": caption_versions()})
+                if path == "/api/captions/clear":
+                    removed = 0
+                    for f in (DATA_DIR / "captions").glob("*.json"):
+                        try:
+                            f.unlink()
+                            removed += 1
+                        except Exception:
+                            pass
+                    with CAPTIONS.lock:
+                        CAPTIONS.jobs = {k: j for k, j in CAPTIONS.jobs.items() if j["state"] != "done"}
+                    return self._json({"removed": removed})
                 if not engine:
                     return self._error(501, "Caption recognition isn’t installed. Run: " + INSTALL_HINT)
                 url, model = arg("url"), arg("model", "base")
@@ -1109,7 +1224,7 @@ PAGE = r'''<!DOCTYPE html>
   --bg: #FFFFFF; --bg-2: #F5F5F7; --side: #F2F2F5; --bar: rgba(250,250,252,.82);
   --fill: rgba(118,118,128,.1); --fill-2: rgba(118,118,128,.18);
   --text: #1D1D1F; --text-2: #6E6E73; --text-3: #8A8A8F; --sep: rgba(60,60,67,.12);
-  --accent: #C8326C; --accent-ink: #FFFFFF; --accent-soft: rgba(200,50,108,.1);
+  --accent: #C8326C; --accent-ink: #FFFFFF; --accent-soft: rgba(200,50,108,.1); --on: #34C759;
   --shadow-art: 0 10px 24px -12px rgba(28,18,58,.45), 0 0 0 .5px rgba(0,0,0,.05);
   --shadow-float: 0 14px 44px -12px rgba(0,0,0,.26), 0 0 0 .5px rgba(0,0,0,.08);
   --pop-bg: #FFFFFF;
@@ -1127,7 +1242,7 @@ PAGE = r'''<!DOCTYPE html>
     --bg: #18181A; --bg-2: #222225; --side: #1F1F22; --bar: rgba(44,44,48,.8);
     --fill: rgba(118,118,128,.2); --fill-2: rgba(118,118,128,.3);
     --text: #F5F5F7; --text-2: #A1A1A6; --text-3: #7C7C82; --sep: rgba(255,255,255,.09);
-    --accent: #FF6E9F; --accent-ink: #2B0715; --accent-soft: rgba(255,110,159,.15);
+    --accent: #FF6E9F; --accent-ink: #2B0715; --accent-soft: rgba(255,110,159,.15); --on: #30D158;
     --shadow-art: 0 12px 28px -12px rgba(0,0,0,.75), 0 0 0 .5px rgba(255,255,255,.07);
     --shadow-float: 0 16px 48px -10px rgba(0,0,0,.65), 0 0 0 .5px rgba(255,255,255,.1);
     --pop-bg: #2C2C30;
@@ -1139,7 +1254,7 @@ PAGE = r'''<!DOCTYPE html>
   --bg: #18181A; --bg-2: #222225; --side: #1F1F22; --bar: rgba(44,44,48,.8);
   --fill: rgba(118,118,128,.2); --fill-2: rgba(118,118,128,.3);
   --text: #F5F5F7; --text-2: #A1A1A6; --text-3: #7C7C82; --sep: rgba(255,255,255,.09);
-  --accent: #FF6E9F; --accent-ink: #2B0715; --accent-soft: rgba(255,110,159,.15);
+  --accent: #FF6E9F; --accent-ink: #2B0715; --accent-soft: rgba(255,110,159,.15); --on: #30D158;
   --shadow-art: 0 12px 28px -12px rgba(0,0,0,.75), 0 0 0 .5px rgba(255,255,255,.07);
   --shadow-float: 0 16px 48px -10px rgba(0,0,0,.65), 0 0 0 .5px rgba(255,255,255,.1);
   --pop-bg: #2C2C30;
@@ -1589,6 +1704,50 @@ body.np-open .cap-pill { display: none; }
   .lyric { font-size: 20px; }
   .np .ctl.play { width: 60px; height: 60px; }
 }
+.switch { -webkit-appearance: none; appearance: none; flex: none; position: relative; width: 51px; height: 31px; margin: 0; border-radius: 999px; background: var(--fill-2); cursor: pointer; transition: background .2s; }
+.switch::before { content: ""; position: absolute; top: 2px; left: 2px; width: 27px; height: 27px; border-radius: 50%; background: #fff; box-shadow: 0 2px 6px rgba(0,0,0,.25), 0 0 0 .5px rgba(0,0,0,.04); transition: transform .22s cubic-bezier(.2,.8,.2,1); }
+.switch:checked { background: var(--on); }
+.switch:checked::before { transform: translateX(20px); }
+.switch.small { width: 40px; height: 24px; }
+.switch.small::before { width: 20px; height: 20px; }
+.switch.small:checked::before { transform: translateX(16px); }
+.switch.on-dark { background: rgba(255,255,255,.26); }
+.switch.on-dark:checked { background: var(--on); }
+.switch:focus-visible { outline: 2.5px solid color-mix(in srgb, var(--accent) 75%, transparent); outline-offset: 2px; }
+.side-switch { display: flex; align-items: center; gap: 10px; min-height: 34px; padding: 0 8px 0 10px; border-radius: 8px; color: var(--text-2); font-size: 13px; cursor: pointer; }
+.side-switch:hover { background: var(--fill); color: var(--text); }
+.side-switch svg { width: 16px; height: 16px; }
+.side-switch:has(input:checked) svg { color: var(--accent); }
+.sw-label { flex: 1; min-width: 0; }
+a.side-tool { text-decoration: none; }
+.side-tool[aria-current="page"] { background: var(--fill-2); color: var(--text); }
+.cap-switch { display: inline-flex; align-items: center; gap: 8px; font-size: 13.5px; color: rgba(255,255,255,.85); cursor: pointer; }
+.np-status .cap-switch { margin-left: auto; }
+.head-tools { display: flex; align-items: center; gap: 10px; }
+.phone-only { display: none !important; }
+.seg { display: inline-flex; flex-wrap: wrap; gap: 2px; padding: 2px; border-radius: 10px; background: var(--fill); }
+.seg-btn { height: 30px; padding: 0 12px; border: 0; border-radius: 8px; background: none; font-size: 13px; font-weight: 600; color: var(--text); white-space: nowrap; }
+.seg-btn[aria-checked="true"] { background: var(--pop-bg); box-shadow: 0 1px 3px rgba(0,0,0,.14), 0 0 0 .5px rgba(0,0,0,.05); }
+.set-group { max-width: 760px; margin-top: 28px; }
+.set-head { margin: 0 0 8px 16px; font-size: 13px; font-weight: 600; color: var(--text-2); }
+.set-card { border-radius: 14px; background: var(--bg-2); overflow: hidden; }
+.set-row { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px 18px; min-height: 56px; padding: 13px 16px; }
+.set-row + .set-row { border-top: 1px solid var(--sep); }
+.set-text { flex: 1 1 260px; min-width: 0; display: flex; flex-direction: column; gap: 3px; }
+.set-title { font-size: 15px; font-weight: 500; }
+.set-sub { font-size: 13px; line-height: 1.45; color: var(--text-2); }
+.set-sub code { display: block; margin-top: 8px; padding: 8px 10px; border-radius: 8px; background: var(--fill); color: var(--text); font: 12.5px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; white-space: nowrap; overflow-x: auto; user-select: all; }
+.set-ok { color: var(--on); font-weight: 600; }
+.set-row > .seg, .set-row > .btn, .set-row > .switch { margin-left: auto; }
+@media (max-width: 1099px) and (min-width: 760px) {
+  .side-switch { justify-content: center; width: 44px; padding: 0; }
+  .side-switch .sw-label, .side-switch input { display: none; }
+}
+@media (max-width: 759px) {
+  .phone-only { display: grid !important; }
+  .page-head .head-tools { width: 100%; }
+  .head-tools .inline-add { flex: 1; width: auto; min-width: 0; }
+}
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation: none !important; transition: none !important; scroll-behavior: auto !important; }
 }
@@ -1627,6 +1786,7 @@ body.np-open .cap-pill { display: none; }
   <symbol id="i-infinity" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" d="M6.8 9.3a2.7 2.7 0 1 0 0 5.4c2.7 0 7.7-5.4 10.4-5.4a2.7 2.7 0 1 1 0 5.4c-2.7 0-7.7-5.4-10.4-5.4z"/></symbol>
   <symbol id="i-swap" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" d="M5 8h13M15 4.5 18.5 8 15 11.5M19 16H6M9 12.5 5.5 16 9 19.5"/></symbol>
   <symbol id="i-wave" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" d="M4 11v2M7.5 8v8M11 5v14M14.5 9v6M18 7v10M21 11v2"/></symbol>
+  <symbol id="i-gear" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></g></symbol>
   <symbol id="i-file" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round" d="M7 3.5h7l4.5 4.5v12.5H7zM14 3.5V8h4.5"/><path fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" d="M9.5 13h6M9.5 16.5h4"/></symbol>
 </defs></svg>
 
@@ -1646,10 +1806,8 @@ body.np-open .cap-pill { display: none; }
     <p class="nav-head"><span>Your shows</span><span class="side-progress" id="sideProgress" hidden></span></p>
     <ul class="side-shows" id="sideShows" aria-label="Your shows"></ul>
     <div class="side-foot">
-      <button class="side-tool" id="themeBtn" type="button" title="Appearance"><svg aria-hidden="true"><use href="#i-theme"/></svg><span id="themeLabel">Appearance: System</span></button>
-      <button class="side-tool" id="autoCapBtn" type="button" title="Caption episodes that have no captions"><svg aria-hidden="true"><use href="#i-wave"/></svg><span id="autoCapLabel">Auto captions: On</span></button>
-      <button class="side-tool" id="importBtn" type="button" title="Import OPML"><svg aria-hidden="true"><use href="#i-import"/></svg><span>Import OPML</span></button>
-      <button class="side-tool" id="exportBtn" type="button" title="Export OPML"><svg aria-hidden="true"><use href="#i-export"/></svg><span>Export OPML</span></button>
+      <label class="side-switch" title="Auto captions: caption episodes that have none, on this computer"><svg aria-hidden="true"><use href="#i-wave"/></svg><span class="sw-label">Auto captions</span><input type="checkbox" class="switch small" id="autoCapSwitch" role="switch" data-setting="autoCaptions" aria-label="Auto captions"></label>
+      <a class="side-tool" href="#/settings" data-route="settings" title="Settings"><svg aria-hidden="true"><use href="#i-gear"/></svg><span>Settings</span></a>
     </div>
   </nav>
   <main class="main" id="main" tabindex="-1"><div class="view" id="view"></div></main>
@@ -1850,7 +2008,12 @@ const idb = (() => {
   return {
     get: k => run('readonly', s => s.get(k)).catch(() => undefined),
     set: (k, v) => run('readwrite', s => s.put(v, k)).catch(() => {}),
-    del: k => run('readwrite', s => s.delete(k)).catch(() => {})
+    del: k => run('readwrite', s => s.delete(k)).catch(() => {}),
+    delPrefix: prefix => run('readwrite', s => {
+      const req = s.openCursor();
+      req.onsuccess = () => { const c = req.result; if (!c) return; if (String(c.key).startsWith(prefix)) c.delete(); c.continue(); };
+      return null;
+    }).catch(() => {})
   };
 })();
 function fnv(str) { let h = 0x811c9dc5; for (let i = 0; i < str.length; i++) { h ^= str.charCodeAt(i); h = Math.imul(h, 0x01000193); } return (h >>> 0).toString(36); }
@@ -2163,7 +2326,7 @@ const Recog = {
   maybeStart(ep, resume) {
     if (!this.cap) { this.init().then(() => { if (S.current && S.current.ep.id === ep.id) { this.maybeStart(ep, resume); paintRecog(); renderLyrics(); renderCaptions(true); } }); return; }
     if (!this.cap.available) { if (!S.auto) S.auto = { state: 'unavailable' }; return; }
-    if (!settings.autoCaptions && !resume) { S.auto = { state: 'off' }; return; }
+    if (!settings.autoCaptions) { if (!resume) S.auto = { state: 'off' }; return; }
     this.start(ep);
   },
   async start(ep, model) {
@@ -2250,6 +2413,7 @@ function paintRecog() {
   if (recogActive()) kids.push(el('span', { class: 'meter' }, el('i', { style: `width:${recogPct()}%` })), el('button', { class: 'link-btn light', type: 'button', text: 'Stop', onclick: stopRecognition }));
   else if (S.current && (a.state === 'cancelled' || a.state === 'partial')) kids.push(el('button', { class: 'link-btn light', type: 'button', text: 'Continue', onclick: () => Recog.start(S.current.ep, a.model) }));
   else if (S.current && a.state === 'done' && ['tiny', 'base'].includes(a.model)) kids.push(el('button', { class: 'link-btn light', type: 'button', text: 'Redo with more accuracy', onclick: () => Recog.start(S.current.ep, 'small') }));
+  kids.push(capSwitch());
   box.replaceChildren(...kids);
 }
 function stopRecognition() { Recog.stop(); if (S.auto) S.auto = Object.assign({}, S.auto, { state: 'cancelled' }); paintRecog(); renderLyrics(); renderCaptions(true); }
@@ -2260,12 +2424,12 @@ function captionCard() {
   const startBtn = label => el('button', { class: 'np-chip', type: 'button', onclick: () => Recog.start(ep) }, icon('wave'), el('span', { text: label }));
   if (recogActive()) return card('Recognising speech on this computer', 'Captions appear here as they’re ready, starting from where you are in the episode.',
     el('p', { text: recogText() }), el('span', { class: 'meter' }, el('i', { style: `width:${recogPct()}%` })),
-    el('div', { class: 'cap-actions' }, el('button', { class: 'np-chip', type: 'button', onclick: stopRecognition }, el('span', { text: 'Stop' }))));
+    el('div', { class: 'cap-actions' }, el('button', { class: 'np-chip', type: 'button', onclick: stopRecognition }, el('span', { text: 'Stop' })), capSwitch()));
   if (a.state === 'unavailable') return card('Caption any episode', 'This episode has no captions. Afterhours can recognise the speech on your computer and caption it, privately and for free. To turn this on, quit Afterhours and run this once:',
-    el('code', { text: (Recog.cap && Recog.cap.install) || 'python3 afterhours.py --setup-captions' }), el('p', { text: 'Then start Afterhours again.' }));
-  if (a.state === 'off') return card('No captions for this episode', 'Auto captions are turned off. You can still caption this episode on your computer.', el('div', { class: 'cap-actions' }, startBtn('Generate captions')));
-  if (a.state === 'error') return card('Captions couldn’t be made', a.error || '', el('div', { class: 'cap-actions' }, startBtn('Try again')));
-  if (a.state === 'cancelled') return card('Captions stopped', '', el('div', { class: 'cap-actions' }, startBtn('Generate captions')));
+    el('code', { text: (Recog.cap && Recog.cap.install) || 'python3 afterhours.py --setup-captions' }), el('p', { text: 'Then start Afterhours again. If you’d rather not, switch auto captions off.' }), el('div', { class: 'cap-actions' }, capSwitch()));
+  if (a.state === 'off') return card('No captions for this episode', 'Auto captions are off, so episodes without captions aren’t captioned automatically.', el('div', { class: 'cap-actions' }, startBtn('Caption this episode'), capSwitch()));
+  if (a.state === 'error') return card('Captions couldn’t be made', a.error || '', el('div', { class: 'cap-actions' }, startBtn('Try again'), capSwitch()));
+  if (a.state === 'cancelled') return card('Captions stopped', '', el('div', { class: 'cap-actions' }, startBtn('Caption this episode'), capSwitch()));
   return null;
 }
 function findCue(t) { const c = S.cues; let lo = 0, hi = c.length - 1, ans = -1; while (lo <= hi) { const mid = (lo + hi) >> 1; if (c[mid].start <= t) { ans = mid; lo = mid + 1; } else hi = mid - 1; } return ans; }
@@ -2821,7 +2985,7 @@ function render() {
   if (S.npOpen) closeNp();
   view.replaceChildren();
   view.style.animation = 'none'; void view.offsetWidth; view.style.animation = '';
-  const fn = { home: renderHome, discover: renderDiscover, library: renderLibrary, show: renderShow, search: renderSearch }[route.name] || renderHome;
+  const fn = { home: renderHome, discover: renderDiscover, library: renderLibrary, show: renderShow, search: renderSearch, settings: renderSettings }[route.name] || renderHome;
   fn(route.arg);
   $('main').scrollTop = 0;
   markNav();
@@ -2843,7 +3007,7 @@ function renderSidebar() {
 function renderHome() {
   const h = new Date().getHours();
   const greet = h < 5 ? 'Up late' : h < 12 ? 'Good morning' : h < 18 ? 'Good afternoon' : 'Good evening';
-  view.append(pageHead('Listen Now', `${greet}. Here’s what’s new on your shelf.`));
+  view.append(pageHead('Listen Now', `${greet}. Here’s what’s new on your shelf.`, gearLink()));
   view.append(el('div', { id: 'setupBanner' }));
   updateSetupUI();
   const up = recent.filter(r => { const p = progress[r.ep.id]; return p && !p.done && p.p > 10; }).slice(0, 12);
@@ -2931,7 +3095,7 @@ function renderLibrary() {
   const input = el('input', { type: 'text', placeholder: 'Paste a feed or Apple Podcasts link', 'aria-label': 'Add a show by link', spellcheck: 'false' });
   const form = el('form', { class: 'inline-add', autocomplete: 'off' }, input, el('button', { class: 'btn tonal small', type: 'submit', text: 'Add' }));
   form.addEventListener('submit', e => { e.preventDefault(); if (input.value.trim()) handleQuery(input.value.trim()); });
-  view.append(pageHead('Library', `${library.length} shows`, form));
+  view.append(pageHead('Library', `${library.length} shows`, el('div', { class: 'head-tools' }, form, gearLink())));
   if (!library.length) { view.append(emptyState('Your library is empty', 'Find shows in Discover, or search by name.', 'Open Discover', '#/discover')); return; }
   for (const c of [...CATS, { id: 'mine', label: 'Your additions' }]) {
     const shows = library.filter(s => s.cat === c.id);
@@ -3040,6 +3204,61 @@ async function renderShow(sid) {
     finally { clearTimeout(slow); }
   }
   if (still() && !about.textContent && show.description) about.textContent = show.description;
+}
+const gearLink = () => el('a', { class: 'icon-round phone-only', href: '#/settings', 'aria-label': 'Settings', title: 'Settings' }, icon('gear'));
+function segmented(options, value, onChange, label) {
+  const box = el('div', { class: 'seg', role: 'radiogroup', 'aria-label': label });
+  const paint = v => { for (const b of box.children) b.setAttribute('aria-checked', String(b.dataset.v === v)); };
+  for (const [v, text] of options) box.append(el('button', { class: 'seg-btn', type: 'button', role: 'radio', dataset: { v }, text, onclick: () => { paint(v); onChange(v); } }));
+  paint(value);
+  return box;
+}
+function retryMissing() {
+  let n = 0;
+  for (const s of library) if (s.status === 'missing' && s.preset) { s.status = 'pending'; delete resolved[s.preset]; n++; }
+  store.set(KEY.resolved, resolved);
+  saveLibrary();
+  toast(n ? `Looking for ${n} show${n > 1 ? 's' : ''} again…` : 'Nothing is missing.');
+  runSetup();
+  render();
+}
+async function clearAutoCaptions() {
+  if (!confirm('Delete the auto captions saved on this computer? They’ll be made again when you next play those episodes.')) return;
+  try { await getJSON('/api/captions/clear'); } catch {}
+  await idb.delPrefix('asr:');
+  toast('Saved auto captions deleted.');
+}
+function renderSettings() {
+  view.append(pageHead('Settings', 'Afterhours runs on this computer. Your library and settings stay in this browser.'));
+  const row = (title, sub, control) => el('div', { class: 'set-row' }, el('div', { class: 'set-text' }, el('span', { class: 'set-title', text: title }), sub ? el('span', { class: 'set-sub' }, sub) : null), control || null);
+  const group = (title, ...rows) => el('section', { class: 'set-group' }, el('h2', { class: 'set-head', text: title }), el('div', { class: 'set-card' }, rows));
+  const status = el('span', { text: 'Checking…' });
+  view.append(group('Captions',
+    row('Show captions', 'The current line above the player and in Now Playing.', switchInput('captions', 'Show captions', on => { settings.captions = on; saveSettings(); syncCC(); renderCaptions(true); })),
+    row('Auto captions', 'When an episode has no captions, recognise the speech on this computer and caption it.', switchInput('autoCaptions', 'Auto captions', on => setAutoCaptions(on))),
+    row('Recognition quality', 'Automatic uses Fast for English shows and Accurate for Japanese and Chinese ones. More accurate models take longer.',
+      segmented([['auto', 'Automatic'], ['base', 'Fast'], ['small', 'Accurate'], ['medium', 'Most accurate']], settings.captionModel || 'auto', v => { settings.captionModel = v; saveSettings(); }, 'Recognition quality')),
+    row('Caption recognition', status),
+    row('Saved auto captions', 'Captions made on this computer are kept, so they load instantly next time.', el('button', { class: 'btn tonal small', type: 'button', text: 'Delete', onclick: clearAutoCaptions }))));
+  getJSON('/api/captions').then(cap => {
+    Recog.cap = cap;
+    const v = cap.versions || {};
+    if (cap.available) status.replaceChildren(el('span', { class: 'set-ok', text: 'Ready. ' }),
+      `Speech is recognised with ${cap.engine}${v['faster-whisper'] ? ' ' + v['faster-whisper'] : ''}${v.av ? `, and audio is read with PyAV ${v.av}` : ''}${v.ffmpeg ? ' (ffmpeg is there as a backup)' : ''}.`);
+    else status.replaceChildren('Not set up yet. Quit Afterhours, run this once, then start it again:', el('code', { text: cap.install || 'python3 afterhours.py --setup-captions' }));
+  }).catch(() => { status.textContent = 'Afterhours’ helper isn’t answering. Is afterhours.py still running?'; });
+  view.append(group('Playback',
+    row('Play the next episode automatically', null, switchInput('autoNext', 'Play the next episode automatically', on => { settings.autoNext = on; saveSettings(); $('npAuto').setAttribute('aria-pressed', String(on)); }))));
+  view.append(group('Appearance',
+    row('Appearance', 'Follow your system, or always use light or dark.', segmented([['system', 'System'], ['light', 'Light'], ['dark', 'Dark']], settings.theme, v => { settings.theme = v; saveSettings(); applyTheme(); }, 'Appearance'))));
+  const missing = library.filter(s => s.status === 'missing').length;
+  view.append(group('Library',
+    row('Look for missing shows again', missing ? `${missing} show${missing > 1 ? 's' : ''} couldn’t be found automatically.` : 'Every show on your shelf was found.', el('button', { class: 'btn tonal small', type: 'button', text: 'Look again', disabled: !missing, onclick: retryMissing })),
+    row('Import OPML', 'Add shows from another podcast app.', el('button', { class: 'btn tonal small', type: 'button', text: 'Import…', onclick: () => $('opmlFile').click() })),
+    row('Export OPML', 'Save your shows for another podcast app.', el('button', { class: 'btn tonal small', type: 'button', text: 'Export', onclick: exportOPML }))));
+  const ver = el('span', { text: 'Afterhours' });
+  getJSON('/api/ping').then(x => { ver.textContent = `Afterhours ${x.version}`; }).catch(() => {});
+  view.append(group('About', row('Version', ver)));
 }
 function renderSearch(term) {
   const input = el('input', { type: 'search', value: term || '', placeholder: 'Shows, topics, or a feed link', 'aria-label': 'Search podcasts', enterkeyhint: 'search', autocomplete: 'off', spellcheck: 'false' });
@@ -3312,7 +3531,7 @@ function closeSpeed() {
   popAnchor = null;
   for (const b of document.querySelectorAll('[data-speed-btn]')) b.setAttribute('aria-expanded', 'false');
 }
-function syncCC() { for (const id of ['barCC', 'npCC']) $(id).setAttribute('aria-pressed', String(settings.captions)); }
+function syncCC() { for (const id of ['barCC', 'npCC']) $(id).setAttribute('aria-pressed', String(settings.captions)); syncSwitches(); }
 function toggleCaptions() { settings.captions = !settings.captions; saveSettings(); syncCC(); renderCaptions(true); toast(settings.captions ? 'Captions on.' : 'Captions off.'); }
 function toggleTranscript() { if (!S.current) return; if (!S.npOpen) openNp(true); else setLyrics(!S.lyricsOn); }
 const SLEEP_STEPS = ['off', 15, 30, 45, 60, 'end'];
@@ -3355,16 +3574,43 @@ function syncVolumeUI() {
 /* ---------- theme, OPML ---------- */
 const THEMES = ['system', 'light', 'dark'];
 const THEME_LABEL = { system: 'Appearance: System', light: 'Appearance: Light', dark: 'Appearance: Dark' };
-function syncAutoCap() {
-  const on = settings.autoCaptions;
-  $('autoCapLabel').textContent = `Auto captions: ${on ? 'On' : 'Off'}`;
-  $('autoCapBtn').setAttribute('aria-pressed', String(on));
+function syncSwitches() {
+  for (const i of document.querySelectorAll('input[data-setting]')) i.checked = !!settings[i.dataset.setting];
+}
+function syncAutoCap() { syncSwitches(); }
+function switchInput(key, label, onChange, cls) {
+  const i = el('input', { type: 'checkbox', class: 'switch' + (cls ? ' ' + cls : ''), role: 'switch', 'aria-label': label, dataset: { setting: key } });
+  i.checked = !!settings[key];
+  i.addEventListener('change', () => onChange(i.checked));
+  return i;
+}
+const capSwitch = () => el('label', { class: 'cap-switch' }, switchInput('autoCaptions', 'Auto captions', on => setAutoCaptions(on), 'small on-dark'), el('span', { text: 'Auto captions' }));
+async function setAutoCaptions(on, quiet) {
+  settings.autoCaptions = on;
+  saveSettings();
+  syncSwitches();
+  const bare = S.current && !S.untimed && !S.cues.some(c => !c.auto);
+  if (!on) {
+    if (recogActive()) Recog.stop();
+    if (bare) S.auto = S.cues.length ? Object.assign({}, S.auto, { state: 'cancelled' }) : { state: 'off' };
+    if (!quiet) toast('Auto captions off. Episodes without captions won’t be captioned automatically.');
+  } else {
+    const cap = Recog.cap || await Recog.init();
+    if (!cap.available) {
+      if (bare && !S.cues.length) S.auto = { state: 'unavailable' };
+      if (!quiet) toast(`Auto captions need a one-time setup. Quit Afterhours and run: ${cap.install || 'python3 afterhours.py --setup-captions'}`, true);
+    } else {
+      if (!quiet) toast('Auto captions on. Episodes without captions will be captioned on this computer.');
+      if (bare && !recogActive() && !(S.auto && S.auto.state === 'done')) Recog.start(S.current.ep);
+    }
+  }
+  renderLyrics();
+  paintRecog();
+  renderCaptions(true);
 }
 function applyTheme() {
   if (settings.theme === 'system') delete document.documentElement.dataset.theme;
   else document.documentElement.dataset.theme = settings.theme;
-  $('themeLabel').textContent = THEME_LABEL[settings.theme];
-  $('themeBtn').title = THEME_LABEL[settings.theme];
 }
 function exportOPML() {
   const ready = library.filter(s => s.feedUrl);
@@ -3413,18 +3659,7 @@ function wireSeek(id) {
 function wire() {
   window.addEventListener('hashchange', render);
   $('searchForm').addEventListener('submit', e => { e.preventDefault(); const v = $('searchInput').value.trim(); if (v) handleQuery(v); });
-  $('themeBtn').addEventListener('click', () => { settings.theme = THEMES[(THEMES.indexOf(settings.theme) + 1) % THEMES.length]; saveSettings(); applyTheme(); toast(THEME_LABEL[settings.theme] + '.'); });
-  $('autoCapBtn').addEventListener('click', async () => {
-    settings.autoCaptions = !settings.autoCaptions;
-    saveSettings();
-    syncAutoCap();
-    const cap = Recog.cap || await Recog.init();
-    if (settings.autoCaptions && !cap.available) { toast(`Auto captions need a free add-on. Quit Afterhours and run: ${cap.install || 'python3 afterhours.py --setup-captions'}`, true); return; }
-    toast(settings.autoCaptions ? 'Episodes without captions will be captioned on this computer.' : 'Auto captions off.');
-    if (settings.autoCaptions && S.current && !S.cues.length && !S.untimed && !recogActive()) { Recog.start(S.current.ep); renderLyrics(); }
-  });
-  $('importBtn').addEventListener('click', () => $('opmlFile').click());
-  $('exportBtn').addEventListener('click', exportOPML);
+  $('autoCapSwitch').addEventListener('change', e => setAutoCaptions(e.target.checked));
   $('opmlFile').addEventListener('change', e => { const f = e.target.files[0]; e.target.value = ''; if (f) importOPML(f); });
 
   audio.addEventListener('loadedmetadata', () => {
@@ -3458,7 +3693,7 @@ function wire() {
   $('barLyrics').addEventListener('click', () => openNp(true));
   $('npClose').addEventListener('click', closeNp);
   $('npShow').addEventListener('click', () => closeNp());
-  $('npAuto').addEventListener('click', () => { settings.autoNext = !settings.autoNext; saveSettings(); $('npAuto').setAttribute('aria-pressed', String(settings.autoNext)); toast(settings.autoNext ? 'The next episode will play automatically.' : 'Autoplay off.'); });
+  $('npAuto').addEventListener('click', () => { settings.autoNext = !settings.autoNext; saveSettings(); $('npAuto').setAttribute('aria-pressed', String(settings.autoNext)); syncSwitches(); toast(settings.autoNext ? 'The next episode will play automatically.' : 'Autoplay off.'); });
   $('npLyricsBtn').addEventListener('click', () => setLyrics(!S.lyricsOn));
   for (const id of ['barCC', 'npCC']) $(id).addEventListener('click', toggleCaptions);
   for (const id of ['barSleep', 'npSleep']) $(id).addEventListener('click', () => setSleep(SLEEP_STEPS[(SLEEP_STEPS.indexOf(S.sleep.mode) + 1) % SLEEP_STEPS.length]));
