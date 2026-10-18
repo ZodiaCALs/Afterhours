@@ -1,0 +1,296 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>After Hours: a podcast shelf for slow evenings</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Shippori+Mincho+B1:wght@600;800&family=Zen+Kaku+Gothic+New:wght@400;500;700&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #EEF1FA;
+    --ink: #1B1740;
+    --muted: #55517E;
+    --line: #CBD0EA;
+    --band: #E1E5F6;
+    --pink: #C2335F;
+    --amber: #A8640A;
+    --teal: #0B8580;
+    --violet: #6240C0;
+    --wine: #9C2438;
+    --blue: #2858BF;
+    --green: #277F47;
+    color-scheme: light;
+    box-sizing: border-box;
+    padding-top: env(safe-area-inset-top, 0px);
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #14112B;
+      --ink: #F3EEF9;
+      --muted: #B7B1DA;
+      --line: #353066;
+      --band: #1E1A44;
+      --pink: #FF86A8;
+      --amber: #FFBC68;
+      --teal: #55D8D1;
+      --violet: #B7A0FF;
+      --wine: #FF909F;
+      --blue: #86AEFF;
+      --green: #74DB9E;
+      color-scheme: dark;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #14112B;
+    --ink: #F3EEF9;
+    --muted: #B7B1DA;
+    --line: #353066;
+    --band: #1E1A44;
+    --pink: #FF86A8;
+    --amber: #FFBC68;
+    --teal: #55D8D1;
+    --violet: #B7A0FF;
+    --wine: #FF909F;
+    --blue: #86AEFF;
+    --green: #74DB9E;
+    color-scheme: dark;
+  }
+
+  *, *::before, *::after { box-sizing: inherit; }
+  html { background: var(--bg); scroll-padding-top: env(safe-area-inset-top, 0px); }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font-family: "Zen Kaku Gothic New", "Hiragino Sans", "Noto Sans JP", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+    font-size: 1rem;
+    line-height: 1.6;
+  }
+  .poster { max-width: 1080px; margin: 0 auto; padding: 2.5rem 1.25rem 3rem; }
+
+  /* Header */
+  .masthead {
+    display: grid;
+    grid-template-columns: 1fr auto;
+    align-items: center;
+    gap: 1.5rem;
+    padding-bottom: 2rem;
+    border-bottom: 2px solid var(--ink);
+  }
+  .masthead h1 {
+    margin: 0;
+    font-family: "Shippori Mincho B1", "Hiragino Mincho ProN", "Noto Serif JP", "Songti SC", serif;
+    font-weight: 800;
+    font-size: clamp(2.6rem, 9vw, 5.6rem);
+    line-height: 1.05;
+    letter-spacing: 0.02em;
+  }
+  .masthead p { margin: 0.9rem 0 0; max-width: 34rem; color: var(--muted); font-size: 1.05rem; }
+  .sun { width: clamp(110px, 22vw, 230px); height: auto; flex: none; }
+
+  /* Start here band */
+  .start {
+    margin: 0;
+    padding: 1.1rem 1.25rem;
+    background: var(--band);
+    border-bottom: 1px solid var(--line);
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 0.4rem 1.6rem;
+  }
+  .start strong { font-weight: 700; }
+  .start a { font-weight: 500; }
+
+  /* Shelves */
+  .shelves { columns: 2 22rem; column-gap: 3rem; margin-top: 2.25rem; }
+  .shelf {
+    break-inside: avoid;
+    margin: 0 0 2.4rem;
+    padding-left: 1.1rem;
+    border-left: 6px solid var(--accent);
+  }
+  .shelf h2 {
+    margin: 0;
+    font-family: "Shippori Mincho B1", "Hiragino Mincho ProN", "Noto Serif JP", "Songti SC", serif;
+    font-weight: 800;
+    font-size: 1.7rem;
+    line-height: 1.2;
+    color: var(--accent);
+  }
+  .shelf .mood { margin: 0.25rem 0 1rem; color: var(--muted); font-size: 0.95rem; }
+  .shelf ul { list-style: none; margin: 0; padding: 0; }
+  .shelf li { margin: 0 0 0.85rem; }
+  .shelf li:last-child { margin-bottom: 0; }
+  .shelf li a { font-weight: 700; font-size: 1.05rem; }
+  .shelf li span.d { display: block; color: var(--muted); font-size: 0.92rem; line-height: 1.45; }
+  .tag {
+    display: inline-block;
+    margin-left: 0.4rem;
+    padding: 0 0.45rem;
+    border: 1px solid var(--accent);
+    border-radius: 99px;
+    color: var(--accent);
+    font-size: 0.72rem;
+    font-weight: 500;
+    vertical-align: 0.1em;
+  }
+
+  .pink   { --accent: var(--pink); }
+  .amber  { --accent: var(--amber); }
+  .teal   { --accent: var(--teal); }
+  .violet { --accent: var(--violet); }
+  .wine   { --accent: var(--wine); }
+  .blue   { --accent: var(--blue); }
+  .green  { --accent: var(--green); }
+
+  a { color: var(--ink); text-decoration: underline; text-decoration-color: var(--accent, var(--ink)); text-decoration-thickness: 2px; text-underline-offset: 3px; }
+  a:hover { text-decoration-thickness: 3px; }
+  a:focus-visible { outline: 3px solid var(--accent, var(--ink)); outline-offset: 3px; border-radius: 2px; }
+
+  .notes { margin-top: 1rem; padding-top: 1.25rem; border-top: 1px solid var(--line); color: var(--muted); font-size: 0.9rem; }
+  .notes p { margin: 0 0 0.4rem; max-width: 46rem; }
+
+  @media (max-width: 560px) {
+    .masthead { grid-template-columns: 1fr; }
+    .sun { width: 120px; order: -1; }
+  }
+  @media print {
+    .poster { padding: 0; }
+    a { text-decoration: none; }
+  }
+</style>
+</head>
+<body>
+<main class="poster">
+
+  <header class="masthead">
+    <div>
+      <h1>夜更かしラジオ</h1>
+      <p>After hours: a podcast shelf for slow evenings. City pop, jazz, piano, gadgets, books, mysteries and big ideas, sorted by mood.</p>
+    </div>
+    <svg class="sun" viewBox="0 0 200 200" role="img" aria-label="A striped setting sun in the city-pop style">
+      <defs>
+        <linearGradient id="sunGrad" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0" stop-color="#FFC15E"/>
+          <stop offset="0.55" stop-color="#F26B7A"/>
+          <stop offset="1" stop-color="#B2418F"/>
+        </linearGradient>
+        <mask id="cuts">
+          <rect width="200" height="200" fill="#fff"/>
+          <rect y="112" width="200" height="4" fill="#000"/>
+          <rect y="130" width="200" height="6" fill="#000"/>
+          <rect y="150" width="200" height="8" fill="#000"/>
+          <rect y="172" width="200" height="10" fill="#000"/>
+        </mask>
+      </defs>
+      <circle cx="100" cy="100" r="92" fill="url(#sunGrad)" mask="url(#cuts)"/>
+    </svg>
+  </header>
+
+  <p class="start">
+    <strong>Start with these five:</strong>
+    <a href="https://podcasts.apple.com/podcast/id275377513" target="_blank" rel="noopener noreferrer">Composer of the Week</a>
+    <a href="https://www.maximumfun.org/primer" target="_blank" rel="noopener noreferrer">Primer</a>
+    <a href="https://www.bbc.co.uk/programmes/b006qykl" target="_blank" rel="noopener noreferrer">In Our Time</a>
+    <a href="https://shedunnitshow.com" target="_blank" rel="noopener noreferrer">Shedunnit</a>
+    <a href="https://www.preposterousuniverse.com/podcast/" target="_blank" rel="noopener noreferrer">Mindscape</a>
+  </p>
+
+  <div class="shelves">
+
+    <section class="shelf pink">
+      <h2>City pop and anime songs</h2>
+      <p class="mood">Neon, slap bass, and the story behind the songs.</p>
+      <ul>
+        <li><a href="https://www.maximumfun.org/primer" target="_blank" rel="noopener noreferrer">Primer</a><span class="d">Japanese city pop, one album per episode.</span></li>
+        <li><a href="https://www.vanpaugam.com/podcast/2020/9/22/episode-1-city-pop-genre-overview" target="_blank" rel="noopener noreferrer">Mayonaka Hour 真夜中アワー</a><span class="d">Profiles of city pop’s big names, from Yamashita to Matsubara.</span></li>
+        <li><a href="https://nl.player.fm/series/light-in-the-attics-liner-notes/pacific-breeze-japanese-city-pop" target="_blank" rel="noopener noreferrer">Liner Notes: Pacific Breeze</a><span class="d">Light in the Attic’s companion to the Pacific Breeze compilations.</span></li>
+        <li><a href="https://www.japansociety.org.uk/anisongs-history" target="_blank" rel="noopener noreferrer">Anisongs and the History of Anime Music</a><span class="d">A one-off Japan Society talk covering the 1960s to now.</span></li>
+        <li><a href="https://blog.animeinstrumentality.net" target="_blank" rel="noopener noreferrer">Anime Instrumentality</a><span class="d">OP/ED and soundtrack reviews, including an older piano episode.</span></li>
+      </ul>
+    </section>
+
+    <section class="shelf amber">
+      <h2>Jazz, hip-hop and piano</h2>
+      <p class="mood">Late-night crate-digging and quiet keys.</p>
+      <ul>
+        <li><a href="https://www.npr.org/series/347139849/jazz-night-in-america" target="_blank" rel="noopener noreferrer">Jazz Night in America</a><span class="d">Live jazz from NPR and WBGO.</span></li>
+        <li><a href="https://www.maximumfun.org/shows/heat-rocks" target="_blank" rel="noopener noreferrer">Heat Rocks</a><span class="d">Guests on one favorite album: jazz, hip-hop, soul. About 200 episodes in the archive.</span></li>
+        <li><a href="https://music.amazon.com/podcasts/c517ebce-c39d-49a1-b8c1-c28776b5534a/Take-It-Personal" target="_blank" rel="noopener noreferrer">Take It Personal</a><span class="d">Golden-era, boom-bap East Coast hip-hop.</span></li>
+        <li><a href="https://www.complex.com/music/nas-miss-info-the-bridge-podcast" target="_blank" rel="noopener noreferrer">The Bridge: 50 Years of Hip-Hop</a><span class="d">Nas and Miss Info, a Spotify original. Info page; check Spotify for new episodes.</span></li>
+        <li><a href="https://podcasts.apple.com/podcast/id275377513" target="_blank" rel="noopener noreferrer">Composer of the Week</a><span class="d">BBC Radio 3 portraits of composers. Podcast feed is UK only.</span></li>
+        <li><a href="https://songexploder.net" target="_blank" rel="noopener noreferrer">Song Exploder</a><span class="d">Artists take their own songs apart.</span></li>
+      </ul>
+    </section>
+
+    <section class="shelf teal">
+      <h2>Gadgets and latest tech</h2>
+      <p class="mood">News and devices, from easygoing to after-midnight.</p>
+      <ul>
+        <li><a href="https://www.theverge.com/the-vergecast" target="_blank" rel="noopener noreferrer">The Vergecast</a><span class="d">Weekly gadget and tech news.</span></li>
+        <li><a href="https://www.relay.fm/upgrade" target="_blank" rel="noopener noreferrer">Upgrade</a><span class="d">Relaxed Apple and tech conversation.</span></li>
+        <li><a href="https://www.nytimes.com/column/hard-fork" target="_blank" rel="noopener noreferrer">Hard Fork</a><span class="d">AI and tech news from the NYT.</span></li>
+        <li><a href="https://darknetdiaries.com" target="_blank" rel="noopener noreferrer">Darknet Diaries</a><span class="d">True stories from the security world.</span></li>
+        <li><a href="https://rebuild.fm" target="_blank" rel="noopener noreferrer">Rebuild.fm</a><span class="tag">日本語</span><span class="d">Long-running Japanese tech talk.</span></li>
+      </ul>
+    </section>
+
+    <section class="shelf violet">
+      <h2>Literature and light lit</h2>
+      <p class="mood">Books, ideas, and conversation in English, Japanese and Chinese.</p>
+      <ul>
+        <li><a href="https://www.bbc.co.uk/programmes/b006qykl" target="_blank" rel="noopener noreferrer">In Our Time</a><span class="d">BBC: literature, science, history and philosophy with academics.</span></li>
+        <li><a href="https://www.backlisted.fm" target="_blank" rel="noopener noreferrer">Backlisted</a><span class="d">Forgotten and classic books, warmly discussed.</span></li>
+        <li><a href="https://www.newyorker.com/podcast/fiction" target="_blank" rel="noopener noreferrer">The New Yorker: Fiction</a><span class="d">Authors read and discuss short stories.</span></li>
+        <li><a href="https://www.douban.com/podcast/36726521/" target="_blank" rel="noopener noreferrer">随机波动</a><span class="tag">中文</span><span class="d">Culture, books and society, with scholars as guests.</span></li>
+        <li><a href="https://podnews.net/podcast/i9mkt" target="_blank" rel="noopener noreferrer">ゆる言語学ラジオ</a><span class="tag">日本語</span><span class="d">Light, funny linguistics. Sister shows cover astronomy and music.</span></li>
+      </ul>
+    </section>
+
+    <section class="shelf wine">
+      <h2>Mystery novels</h2>
+      <p class="mood">Golden Age puzzles and modern whodunits.</p>
+      <ul>
+        <li><a href="https://shedunnitshow.com" target="_blank" rel="noopener noreferrer">Shedunnit</a><span class="d">The history of Golden Age detective fiction.</span></li>
+        <li><a href="https://ihearofsherlock.com" target="_blank" rel="noopener noreferrer">I Hear of Sherlock Everywhere</a><span class="d">Sherlock Holmes, in depth.</span></li>
+        <li><a href="https://rephonic.com/podcasts/bo-luo-ka-pei-guan" target="_blank" rel="noopener noreferrer">波罗咖啡馆</a><span class="tag">中文</span><span class="d">Chinese mystery chat; covers Japanese mystery writers such as Uketsu.</span></li>
+      </ul>
+    </section>
+
+    <section class="shelf blue">
+      <h2>Economics, physics and astronomy</h2>
+      <p class="mood">Big ideas, explained gently.</p>
+      <ul>
+        <li><a href="https://www.npr.org/podcasts/510289/planet-money" target="_blank" rel="noopener noreferrer">Planet Money</a><span class="d">Friendly storytelling about how money works.</span></li>
+        <li><a href="https://www.npr.org/podcasts/510325/the-indicator-from-planet-money" target="_blank" rel="noopener noreferrer">The Indicator</a><span class="d">Short daily economics.</span></li>
+        <li><a href="https://www.econtalk.org" target="_blank" rel="noopener noreferrer">EconTalk</a><span class="d">Long, thoughtful interviews.</span></li>
+        <li><a href="https://www.bloomberg.com/oddlots" target="_blank" rel="noopener noreferrer">Odd Lots</a><span class="d">Markets and finance, with a curious streak.</span></li>
+        <li><a href="https://www.preposterousuniverse.com/podcast/" target="_blank" rel="noopener noreferrer">Sean Carroll’s Mindscape</a><span class="d">Physics and big questions.</span></li>
+        <li><a href="https://www.bbc.co.uk/programmes/b00snr0w" target="_blank" rel="noopener noreferrer">The Infinite Monkey Cage</a><span class="d">BBC science with comedians.</span></li>
+        <li><a href="https://radiolab.org" target="_blank" rel="noopener noreferrer">Radiolab</a><span class="d">Atmospheric science storytelling.</span></li>
+      </ul>
+    </section>
+
+    <section class="shelf green">
+      <h2>Game industry</h2>
+      <p class="mood">Where games came from and how they get made.</p>
+      <ul>
+        <li><a href="https://retronauts.com" target="_blank" rel="noopener noreferrer">Retronauts</a><span class="d">Retro games, with a lot of Japanese game history.</span></li>
+        <li><a href="https://gamehistory.org" target="_blank" rel="noopener noreferrer">Video Game History Hour</a><span class="d">Developers and historians, every other week.</span></li>
+      </ul>
+    </section>
+
+  </div>
+
+  <footer class="notes">
+    <p>Heat Rocks finished its Maximum Fun run in 2021; the archive is still worth a listen.</p>
+    <p>Composer of the Week’s podcast feed is UK only. Check each show’s page for its current schedule.</p>
+  </footer>
+
+</main>
+</body>
+</html>
