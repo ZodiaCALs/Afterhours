@@ -2,6 +2,21 @@
 
 A small, private podcast player for slow evenings. Afterhours is a single file that runs on your own computer and opens in your browser. It comes with 30 shows already on the shelf, recommends related ones, and captions episodes that don't have captions.
 
+## Download
+
+Each release has a download for your system. All of them need Python 3.8 or newer, free from [python.org](https://www.python.org/downloads/). If Python is missing, Afterhours tells you where to get it.
+
+| System | Download | How to start |
+| --- | --- | --- |
+| macOS 10.13 or later | `Afterhours-3.3.0-macOS.zip` | Unzip it and drag **Afterhours.app** into Applications. The first time, Control-click the app and choose **Open**, because it isn't signed by Apple. |
+| Windows 10 or 11 | `Afterhours-3.3.0-Windows.zip` | Unzip the **Afterhours** folder anywhere and double-click **Start Afterhours.cmd**. |
+| Linux | `Afterhours-3.3.0-Linux.tar.gz` | Unpack it. Run `./install.sh` to add Afterhours to your app menu, or `./afterhours.sh` to just start it. |
+| Any system | `afterhours.py` | Run `python3 afterhours.py`. |
+
+To stop Afterhours, use **Settings › Quit Afterhours**. On Windows you can also close its window.
+
+Check your download against `SHA256SUMS.txt` from the same release.
+
 ## Quick start
 
 You need Python 3.8 or newer and a current browser (Chrome, Edge, Safari 16 or later, or Firefox).
@@ -59,18 +74,37 @@ While you browse, the current line floats above the player bar like a subtitle.
 **Settings.** One place for:
 - the auto captions switch and recognition quality
 - showing captions, autoplay and appearance
+- the Animations and Pointer highlight switches
 - importing and exporting shows
 - looking again for shows that couldn't be found
+- quitting Afterhours
 
 Open it from the sidebar, or from the gear on Listen Now and Library on a phone.
 
 **Design.** Light and dark appearance. Each show page and the player take their accent colour from the cover art. Layouts are made for desktops, tablets and phones, including phones held sideways.
 
+**Motion.** Afterhours uses Fluent-style motion:
+- pages glide in, and rows and cards cascade into place
+- artwork flies into show pages and into Now Playing
+- a selection marker slides between sections
+- controls respond as you press them
+
+Turn it off in **Settings › Appearance › Animations**. It starts off if your system asks for reduced motion.
+
+The soft glow that follows your mouse over lists, menus and buttons has its own switch: **Settings › Appearance › Pointer highlight**. When it's off, Afterhours doesn't track the pointer at all.
+
 ## Auto captions (optional)
 
 When an episode has no captions, Afterhours can recognise the speech on your computer and caption it. Captions start from where you are in the episode, appear as they're ready, and then fill in the rest.
 
-**Turn it on once.** Quit Afterhours, run this, then start Afterhours again:
+**Which model?** Captions come from OpenAI's **Whisper** speech-recognition models, run on your computer by faster-whisper.
+- English shows use Whisper **base** (about 145 MB).
+- Japanese and Chinese shows use Whisper **small** (about 480 MB), which handles them much better.
+- You can choose **base**, **small** or **medium** (about 1.5 GB, slowest and most accurate) in Settings › Recognition quality.
+
+The model runs on your processor in a compact 8-bit form, or on a supported NVIDIA graphics card if you have one. Silent stretches are skipped, so captions arrive sooner.
+
+**Turn it on once.** In the macOS and Windows downloads, open **Set Up Auto Captions** once. Otherwise, quit Afterhours, run this, then start Afterhours again:
 
 ```
 python3 afterhours.py --setup-captions
@@ -158,7 +192,7 @@ Some shows can't be played anywhere outside one app (for example Spotify exclusi
 
 ## Project structure
 
-Everything is in `afterhours.py`. The Python part is a small local helper that:
+The download is one file, `afterhours.py`. The Python part is a small local helper that:
 - serves the app
 - fetches feeds, websites and cover art
 - paces Apple directory lookups
@@ -166,27 +200,44 @@ Everything is in `afterhours.py`. The Python part is a small local helper that:
 
 The app itself (HTML, CSS and JavaScript) is embedded in the same file. There are no other dependencies unless you turn on auto captions.
 
+The source project is laid out like this:
+
+| Path | What it is |
+| --- | --- |
+| `src/helper.py` | The local helper, with a placeholder where the app goes |
+| `src/app.html` | The app |
+| `tools/build.py` | Combines the two into `dist/afterhours.py` |
+| `tools/package_release.py` | Makes the macOS, Windows and Linux downloads, icons, checksums and release notes (needs Pillow) |
+| `.github/workflows/release.yml` | Builds and publishes a release on GitHub when you push a tag such as `v3.3.0` |
+
 ## Changelog
 
-### v0.1.1
-
-**Fixed**
-
-- **Auto captions failing** with "open() got an unexpected keyword argument 'metadata_errors'". PyAV 14 and later removed an option that some faster-whisper versions still pass when reading audio. Afterhours now reads the audio itself in a way that works with every PyAV version. It skips damaged stretches of audio instead of stopping, and falls back to ffmpeg if it's installed.
-- **Clearer caption errors**, including when the speech model couldn't be downloaded.
-- **Narrow phones:** the Library header no longer scrolls sideways on the narrowest phones.
+### 3.3.0
 
 **Added**
-- **Auto captions switch** in the sidebar, in Now Playing and in Settings, always in step. Switching off stops captioning in progress, and nothing starts by itself while it's off.
-- **Settings page.** It has:
-  - switches for showing captions, auto captions and autoplay
-  - recognition quality and appearance
-  - the caption add-on's status, with version numbers
-  - deleting saved auto captions
-  - looking again for missing shows
-  - OPML import and export
+- **Pointer highlight switch** in Settings › Appearance. It turns off the soft glow that follows your mouse over lists, menus and buttons, separately from the other animations. When it's off, Afterhours doesn't track the pointer at all.
 
-  On phones it's a tap away from Listen Now and Library.
+### 3.2.0 
+
+**Added**
+
+- **Release downloads:**
+  - a macOS app
+  - a Windows folder with a "Start Afterhours" launcher
+  - a Linux bundle with an installer that adds Afterhours to the app menu
+
+  Each has an app icon and a helper for setting up auto captions, and every release comes with checksums.
+- **Fluent-style motion:**
+  - pages glide in, and show pages "drill in"
+  - rows and cards cascade into place
+  - artwork flies from the library into the show page, and from the player into Now Playing
+  - a selection marker slides between sections in the sidebar and the phone tab bar
+  - segmented choices slide, switches stretch as you press them, and a soft light follows the pointer
+  - new caption lines ease in
+- **Animations switch** in Settings › Appearance. It starts off if your system asks for reduced motion.
+- **Quit Afterhours** in Settings, for stopping the packaged apps.
+- **Model information:** Settings and this README now say which speech models make the captions.
+- **Release workflow:** a GitHub workflow builds and publishes the downloads when a version is tagged.
 
 **Changed**
-- Appearance and OPML import and export moved from the sidebar into Settings.
+- Quitting and deleting saved captions only accept requests from Afterhours itself, so other websites can't trigger them.

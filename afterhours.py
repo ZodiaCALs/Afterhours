@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Afterhours 3.1: a small, private podcast player.
+Afterhours 3.3: a small, private podcast player.
 
 Run it:    python3 afterhours.py        (Windows: py afterhours.py)
 It opens:  http://127.0.0.1:8765  in your browser
@@ -53,7 +53,7 @@ from pathlib import Path
 
 APP_NAME = "Afterhours"
 APP_ID = "afterhours"
-VERSION = "3.1.0"
+VERSION = "3.3.0"
 DEFAULT_PORT = 8765
 MAX_BYTES = 25 * 1024 * 1024
 MAX_AUDIO = 1536 * 1024 * 1024
@@ -1013,6 +1013,19 @@ class CaptionJobs:
 CAPTIONS = CaptionJobs()
 
 
+def clear_saved_captions():
+    removed = 0
+    for f in (DATA_DIR / "captions").glob("*.json"):
+        try:
+            f.unlink()
+            removed += 1
+        except Exception:
+            pass
+    with CAPTIONS.lock:
+        CAPTIONS.jobs = {k: j for k, j in CAPTIONS.jobs.items() if j["state"] != "done"}
+    return removed
+
+
 class Handler(http.server.BaseHTTPRequestHandler):
     server_version = "Afterhours/" + VERSION
     sys_version = ""
@@ -1052,6 +1065,26 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def _json(self, obj):
         self._send(200, json.dumps(obj), "application/json; charset=utf-8")
+
+    def do_POST(self):
+        # Anything that changes state is POST-only and needs a custom header. Other websites can't send
+        # that header to this helper (the browser would ask first, and the helper never agrees).
+        if not self._host_ok() or self.headers.get("X-Afterhours") != "1":
+            return self._error(403, "Not allowed.")
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = 0
+        if length:
+            self.rfile.read(min(length, 65536))
+        path = self.path.partition("?")[0]
+        if path == "/api/quit":
+            self._json({"ok": True})
+            threading.Thread(target=self.server.shutdown, daemon=True).start()
+            return
+        if path == "/api/captions/clear":
+            return self._json({"removed": clear_saved_captions()})
+        return self._error(404, "Not found.")
 
     def do_GET(self):
         if not self._host_ok():
@@ -1101,17 +1134,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 if path == "/api/captions":
                     return self._json({"available": bool(engine), "engine": engine, "models": list(MODELS),
                                        "sizes": MODEL_SIZES, "install": INSTALL_HINT, "versions": caption_versions()})
-                if path == "/api/captions/clear":
-                    removed = 0
-                    for f in (DATA_DIR / "captions").glob("*.json"):
-                        try:
-                            f.unlink()
-                            removed += 1
-                        except Exception:
-                            pass
-                    with CAPTIONS.lock:
-                        CAPTIONS.jobs = {k: j for k, j in CAPTIONS.jobs.items() if j["state"] != "done"}
-                    return self._json({"removed": removed})
+
                 if not engine:
                     return self._error(501, "Caption recognition isn’t installed. Run: " + INSTALL_HINT)
                 url, model = arg("url"), arg("model", "base")
@@ -1197,7 +1220,7 @@ def main():
         sys.exit(1)
     server.verbose = args.verbose
     engine = caption_engine_name()
-    print("Afterhours %s is running at %s\n%s\nKeep this window open while you listen. Press Ctrl+C to stop."
+    print("Afterhours %s is running at %s\n%s\nKeep this window open while you listen. To stop, press Ctrl+C or use Settings > Quit Afterhours."
           % (VERSION, url, "Caption recognition: on (%s)." % engine if engine else
              "Caption recognition: off. To caption episodes that have none, run:  " + INSTALL_HINT))
     if not args.no_browser:
@@ -1224,7 +1247,7 @@ PAGE = r'''<!DOCTYPE html>
   --bg: #FFFFFF; --bg-2: #F5F5F7; --side: #F2F2F5; --bar: rgba(250,250,252,.82);
   --fill: rgba(118,118,128,.1); --fill-2: rgba(118,118,128,.18);
   --text: #1D1D1F; --text-2: #6E6E73; --text-3: #8A8A8F; --sep: rgba(60,60,67,.12);
-  --accent: #C8326C; --accent-ink: #FFFFFF; --accent-soft: rgba(200,50,108,.1); --on: #34C759;
+  --accent: #C8326C; --accent-ink: #FFFFFF; --accent-soft: rgba(200,50,108,.1); --on: #34C759; --reveal: rgba(200,50,108,.075);
   --shadow-art: 0 10px 24px -12px rgba(28,18,58,.45), 0 0 0 .5px rgba(0,0,0,.05);
   --shadow-float: 0 14px 44px -12px rgba(0,0,0,.26), 0 0 0 .5px rgba(0,0,0,.08);
   --pop-bg: #FFFFFF;
@@ -1232,6 +1255,7 @@ PAGE = r'''<!DOCTYPE html>
   --font-display: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Segoe UI Variable Display", "Segoe UI", system-ui, Roboto, "Helvetica Neue", Arial, "Hiragino Sans", "PingFang SC", "Noto Sans JP", "Noto Sans CJK JP", sans-serif;
   --side-w: 248px; --bar-h: 72px; --gutter: clamp(20px, 4vw, 48px);
   --th: 335; --ts: 62%; --tl: 52%;
+  --ease-out: cubic-bezier(0.1, 0.9, 0.2, 1); --ease-mid: cubic-bezier(0, 0, 0, 1); --ease-in: cubic-bezier(0.9, 0.1, 1, 0.2); --ease-std: cubic-bezier(0.33, 0, 0.67, 1);
   color-scheme: light;
   box-sizing: border-box;
   padding-top: env(safe-area-inset-top, 0px);
@@ -1242,7 +1266,7 @@ PAGE = r'''<!DOCTYPE html>
     --bg: #18181A; --bg-2: #222225; --side: #1F1F22; --bar: rgba(44,44,48,.8);
     --fill: rgba(118,118,128,.2); --fill-2: rgba(118,118,128,.3);
     --text: #F5F5F7; --text-2: #A1A1A6; --text-3: #7C7C82; --sep: rgba(255,255,255,.09);
-    --accent: #FF6E9F; --accent-ink: #2B0715; --accent-soft: rgba(255,110,159,.15); --on: #30D158;
+    --accent: #FF6E9F; --accent-ink: #2B0715; --accent-soft: rgba(255,110,159,.15); --on: #30D158; --reveal: rgba(255,255,255,.075);
     --shadow-art: 0 12px 28px -12px rgba(0,0,0,.75), 0 0 0 .5px rgba(255,255,255,.07);
     --shadow-float: 0 16px 48px -10px rgba(0,0,0,.65), 0 0 0 .5px rgba(255,255,255,.1);
     --pop-bg: #2C2C30;
@@ -1254,7 +1278,7 @@ PAGE = r'''<!DOCTYPE html>
   --bg: #18181A; --bg-2: #222225; --side: #1F1F22; --bar: rgba(44,44,48,.8);
   --fill: rgba(118,118,128,.2); --fill-2: rgba(118,118,128,.3);
   --text: #F5F5F7; --text-2: #A1A1A6; --text-3: #7C7C82; --sep: rgba(255,255,255,.09);
-  --accent: #FF6E9F; --accent-ink: #2B0715; --accent-soft: rgba(255,110,159,.15); --on: #30D158;
+  --accent: #FF6E9F; --accent-ink: #2B0715; --accent-soft: rgba(255,110,159,.15); --on: #30D158; --reveal: rgba(255,255,255,.075);
   --shadow-art: 0 12px 28px -12px rgba(0,0,0,.75), 0 0 0 .5px rgba(255,255,255,.07);
   --shadow-float: 0 16px 48px -10px rgba(0,0,0,.65), 0 0 0 .5px rgba(255,255,255,.1);
   --pop-bg: #2C2C30;
@@ -1279,8 +1303,10 @@ input[type=search]::-webkit-search-decoration, input[type=search]::-webkit-searc
 /* Shell */
 .app { display: grid; grid-template-columns: var(--side-w) minmax(0, 1fr); height: 100%; }
 .main { position: relative; height: 100%; min-height: 0; overflow-y: auto; overflow-x: hidden; outline: none; }
-.view { container: view / inline-size; max-width: 1240px; margin: 0 auto; padding: 36px var(--gutter) 150px; animation: viewIn .32s cubic-bezier(.2,.8,.2,1); }
-@keyframes viewIn { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+.view { container: view / inline-size; max-width: 1240px; margin: 0 auto; padding: 36px var(--gutter) 150px; animation: pageIn 460ms var(--ease-out) both; }
+.view.drill { animation-name: drillIn; animation-duration: 380ms; transform-origin: 50% 0; }
+@keyframes pageIn { from { opacity: 0; transform: translateY(22px); } to { opacity: 1; transform: none; } }
+@keyframes drillIn { from { opacity: 0; transform: scale(.965); } to { opacity: 1; transform: none; } }
 
 /* Sidebar */
 .sidebar { position: relative; z-index: 5; display: flex; flex-direction: column; gap: 4px; min-height: 0; padding: 18px 12px 12px; background: var(--side); border-right: 1px solid var(--sep); overflow: hidden; }
@@ -1380,8 +1406,9 @@ input[type=search]::-webkit-search-decoration, input[type=search]::-webkit-searc
 /* Cards */
 .card { position: relative; min-width: 0; container-type: inline-size; scroll-snap-align: start; }
 .card-body, .tile-link { display: flex; flex-direction: column; width: 100%; padding: 0; border: 0; background: none; text-align: left; text-decoration: none; color: inherit; }
-.card-body .art, .tile-link .art { box-shadow: var(--shadow-art); transition: transform .22s cubic-bezier(.2,.8,.2,1); }
-.card-body:hover .art, .tile-link:hover .art { transform: translateY(-3px); }
+.card-body .art, .tile-link .art { box-shadow: var(--shadow-art); transition: transform 320ms var(--ease-out), box-shadow 320ms var(--ease-out); }
+.card-body:hover .art, .tile-link:hover .art { transform: translateY(-4px); box-shadow: 0 22px 36px -18px rgba(28,18,58,.55), 0 0 0 .5px rgba(0,0,0,.05); }
+.card-body:active .art, .tile-link:active .art { transform: scale(.97); transition-duration: 120ms; }
 .card-title { margin-top: 10px; font-size: 14px; font-weight: 600; line-height: 1.28; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
 .card-sub { margin-top: 2px; font-size: 13px; color: var(--text-2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .card-why { margin-top: 4px; font-size: 12.5px; line-height: 1.38; color: var(--text-3); display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
@@ -1529,8 +1556,9 @@ body.np-open .bar { opacity: 0; pointer-events: none; }
 body.np-open .cap-pill { display: none; }
 
 /* Now Playing */
-.np { position: fixed; inset: 0; z-index: 100; display: flex; flex-direction: column; overflow: hidden; color: #fff; background: #0E0E12; transform: translateY(100%); transition: transform .48s cubic-bezier(.2,.8,.2,1); }
-.np.open { transform: none; }
+.np { position: fixed; inset: 0; z-index: 100; display: flex; flex-direction: column; overflow: hidden; color: #fff; background: #0E0E12; opacity: 0; transform: translateY(36px) scale(.985); transition: opacity 280ms var(--ease-out), transform 520ms var(--ease-out); }
+.np.closing { transition: opacity 200ms var(--ease-in), transform 240ms var(--ease-in); }
+.np.open { opacity: 1; transform: none; }
 .np-bg { position: absolute; inset: -18%; z-index: 0; background: radial-gradient(60% 60% at 25% 25%, hsl(var(--th) 70% 45%), transparent 70%), radial-gradient(60% 60% at 80% 80%, hsl(calc(var(--th) + 40) 60% 32%), transparent 70%), #121018; }
 .np-bg img { width: 100%; height: 100%; object-fit: cover; filter: blur(70px) saturate(1.7) brightness(.82); transform: scale(1.15); }
 .np-scrim { position: absolute; inset: 0; z-index: 0; background: linear-gradient(180deg, rgba(0,0,0,.2), rgba(0,0,0,.52)); }
@@ -1567,9 +1595,9 @@ body.np-open .cap-pill { display: none; }
 .np-right { position: relative; height: 100%; min-height: 0; align-self: stretch; }
 .lyrics { position: relative; list-style: none; height: 100%; margin: 0; padding: 32vh 0 42vh; overflow-y: auto; scrollbar-width: none; -webkit-mask-image: linear-gradient(transparent, #000 14%, #000 78%, transparent); mask-image: linear-gradient(transparent, #000 14%, #000 78%, transparent); }
 .lyrics::-webkit-scrollbar { display: none; }
-.lyric { margin: 0 0 22px; max-width: 30ch; font-size: clamp(22px, 2.3vw, 32px); font-weight: 700; line-height: 1.26; letter-spacing: -.015em; color: rgba(255,255,255,.32); cursor: pointer; transition: color .35s; }
+.lyric { margin: 0 0 22px; max-width: 30ch; font-size: clamp(22px, 2.3vw, 32px); font-weight: 700; line-height: 1.26; letter-spacing: -.015em; color: rgba(255,255,255,.32); cursor: pointer; transform: scale(.975); transform-origin: 0 50%; transition: color 420ms var(--ease-std), transform 520ms var(--ease-out); }
 .lyric:hover { color: rgba(255,255,255,.58); }
-.lyric.active { color: #fff; }
+.lyric.active { color: #fff; transform: none; }
 .lyric .who { display: block; margin-bottom: 4px; font-size: 13px; font-weight: 600; letter-spacing: .02em; color: rgba(255,255,255,.55); }
 .np-notes { height: 100%; overflow-y: auto; padding: 8vh 0; max-width: 62ch; scrollbar-width: thin; }
 .np-notes h3 { margin: 0 0 12px; font-size: 13px; font-weight: 600; color: rgba(255,255,255,.6); }
@@ -1708,9 +1736,14 @@ body.np-open .cap-pill { display: none; }
 .switch::before { content: ""; position: absolute; top: 2px; left: 2px; width: 27px; height: 27px; border-radius: 50%; background: #fff; box-shadow: 0 2px 6px rgba(0,0,0,.25), 0 0 0 .5px rgba(0,0,0,.04); transition: transform .22s cubic-bezier(.2,.8,.2,1); }
 .switch:checked { background: var(--on); }
 .switch:checked::before { transform: translateX(20px); }
+.switch:active::before { width: 32px; }
+.switch:checked:active::before { transform: translateX(15px); }
+.switch::before { transition: transform 260ms var(--ease-out), width 200ms var(--ease-out) !important; }
 .switch.small { width: 40px; height: 24px; }
 .switch.small::before { width: 20px; height: 20px; }
 .switch.small:checked::before { transform: translateX(16px); }
+.switch.small:active::before { width: 24px; }
+.switch.small:checked:active::before { transform: translateX(12px); }
 .switch.on-dark { background: rgba(255,255,255,.26); }
 .switch.on-dark:checked { background: var(--on); }
 .switch:focus-visible { outline: 2.5px solid color-mix(in srgb, var(--accent) 75%, transparent); outline-offset: 2px; }
@@ -1725,9 +1758,13 @@ a.side-tool { text-decoration: none; }
 .np-status .cap-switch { margin-left: auto; }
 .head-tools { display: flex; align-items: center; gap: 10px; }
 .phone-only { display: none !important; }
-.seg { display: inline-flex; flex-wrap: wrap; gap: 2px; padding: 2px; border-radius: 10px; background: var(--fill); }
+.seg { position: relative; display: inline-flex; flex-wrap: wrap; gap: 2px; padding: 2px; border-radius: 10px; background: var(--fill); }
+.seg-thumb { position: absolute; top: 0; left: 0; border-radius: 8px; background: var(--pop-bg); box-shadow: 0 1px 3px rgba(0,0,0,.14), 0 0 0 .5px rgba(0,0,0,.05); opacity: 0; transition: transform 380ms var(--ease-out), width 380ms var(--ease-out), height 380ms var(--ease-out); }
+.seg-thumb.on { opacity: 1; }
+.seg-thumb.instant { transition: none; }
 .seg-btn { height: 30px; padding: 0 12px; border: 0; border-radius: 8px; background: none; font-size: 13px; font-weight: 600; color: var(--text); white-space: nowrap; }
-.seg-btn[aria-checked="true"] { background: var(--pop-bg); box-shadow: 0 1px 3px rgba(0,0,0,.14), 0 0 0 .5px rgba(0,0,0,.05); }
+.seg-btn { position: relative; z-index: 1; }
+.seg:not(:has(.seg-thumb.on)) .seg-btn[aria-checked="true"] { background: var(--pop-bg); box-shadow: 0 1px 3px rgba(0,0,0,.14), 0 0 0 .5px rgba(0,0,0,.05); }
 .set-group { max-width: 760px; margin-top: 28px; }
 .set-head { margin: 0 0 8px 16px; font-size: 13px; font-weight: 600; color: var(--text-2); }
 .set-card { border-radius: 14px; background: var(--bg-2); overflow: hidden; }
@@ -1748,9 +1785,20 @@ a.side-tool { text-decoration: none; }
   .page-head .head-tools { width: 100%; }
   .head-tools .inline-add { flex: 1; width: auto; min-width: 0; }
 }
-@media (prefers-reduced-motion: reduce) {
-  *, *::before, *::after { animation: none !important; transition: none !important; scroll-behavior: auto !important; }
-}
+.nav-ind { position: absolute; z-index: 1; left: 0; top: 0; width: 3px; height: 18px; border-radius: 3px; background: var(--accent); opacity: 0; pointer-events: none; transform: translate(calc(var(--x, 0px) + 4px), var(--y, 0px)); transition: transform 440ms var(--ease-out), opacity 150ms; }
+.tab-ind { position: absolute; z-index: 1; top: 0; left: 0; width: 28px; height: 3px; border-radius: 0 0 3px 3px; background: var(--accent); opacity: 0; pointer-events: none; transform: translateX(var(--x, 0px)); transition: transform 440ms var(--ease-out), opacity 150ms; }
+.nav-ind.on, .tab-ind.on { opacity: 1; }
+.nav-ind.instant, .tab-ind.instant { transition: none; }
+html:not(.no-glow) :is(.side-shows a, .nav a, .side-tool, .side-switch, .set-row, .ep, .up-card):hover {
+  background-image: radial-gradient(180px circle at var(--rx, 50%) var(--ry, 50%), var(--reveal), transparent 72%); }
+.icon-round, .chip, .tool, .np-btn, .np-chip, .seg-btn, .pill, .btn { transition: transform 140ms var(--ease-std), background-color 160ms, color 160ms, filter 160ms; }
+.icon-round:active, .chip:active, .tool:active, .np-btn:active, .np-chip:active, .seg-btn:active { transform: scale(.94); }
+.bar { transition: transform 520ms var(--ease-out), opacity 300ms var(--ease-out); }
+.toast { transition: opacity 220ms var(--ease-out), transform 360ms var(--ease-out); }
+::view-transition-old(root), ::view-transition-new(root) { animation-duration: 280ms; animation-timing-function: var(--ease-out); }
+::view-transition-group(show-art) { animation-duration: 520ms; animation-timing-function: cubic-bezier(0.1, 0.9, 0.2, 1); }
+::view-transition-old(show-art), ::view-transition-new(show-art) { height: 100%; mix-blend-mode: normal; }
+html.no-motion *, html.no-motion *::before, html.no-motion *::after { animation: none !important; transition: none !important; scroll-behavior: auto !important; }
 </style>
 </head>
 <body>
@@ -1803,6 +1851,7 @@ a.side-tool { text-decoration: none; }
       <li><a href="#/library" data-route="library"><svg aria-hidden="true"><use href="#i-stack"/></svg><span>Library</span></a></li>
       <li class="rail-only"><a href="#/search" data-route="search"><svg aria-hidden="true"><use href="#i-search"/></svg><span>Search</span></a></li>
     </ul>
+    <span class="nav-ind" id="navInd" aria-hidden="true"></span>
     <p class="nav-head"><span>Your shows</span><span class="side-progress" id="sideProgress" hidden></span></p>
     <ul class="side-shows" id="sideShows" aria-label="Your shows"></ul>
     <div class="side-foot">
@@ -1818,6 +1867,7 @@ a.side-tool { text-decoration: none; }
   <a href="#/discover" data-route="discover"><svg aria-hidden="true"><use href="#i-sparkle"/></svg><span>Discover</span></a>
   <a href="#/library" data-route="library"><svg aria-hidden="true"><use href="#i-stack"/></svg><span>Library</span></a>
   <a href="#/search" data-route="search"><svg aria-hidden="true"><use href="#i-search"/></svg><span>Search</span></a>
+  <span class="tab-ind" id="tabInd" aria-hidden="true"></span>
 </nav>
 
 <div class="cap-pill" id="capPill" aria-hidden="true" hidden><span class="who" id="capWho"></span><span id="capText"></span></div>
@@ -2091,9 +2141,12 @@ function toast(msg, isError) {
 }
 
 /* ---------- state ---------- */
-const DEFAULTS = { speed: 1, volume: 1, muted: false, captions: true, autoNext: true, theme: 'system', sort: 'newest', autoCaptions: true, captionModel: 'auto' };
+const DEFAULTS = { speed: 1, volume: 1, muted: false, captions: true, autoNext: true, theme: 'system', sort: 'newest', autoCaptions: true, captionModel: 'auto', motion: !reduceMotion, pointerGlow: true };
 const settings = Object.assign({}, DEFAULTS, store.get(KEY.settings, {}));
 const saveSettings = () => store.set(KEY.settings, settings);
+const motionOn = () => settings.motion !== false;
+function applyMotion() { document.documentElement.classList.toggle('no-motion', !motionOn()); }
+function applyGlow() { document.documentElement.classList.toggle('no-glow', settings.pointerGlow === false); }
 let library = store.get(KEY.library, null);
 let progress = store.get(KEY.progress, {});
 let recent = store.get(KEY.recent, []);
@@ -2133,6 +2186,15 @@ async function getJSON(path) {
   let res;
   try { res = await fetch(path, { cache: 'no-store' }); }
   catch { const e = new Error('The player’s helper isn’t answering. Is afterhours.py still running?'); e.status = 0; throw e; }
+  let data = null;
+  try { data = await res.json(); } catch {}
+  if (!res.ok) { const e = new Error((data && data.error) || `Something went wrong (${res.status}).`); e.status = res.status; throw e; }
+  return data;
+}
+async function postJSON(path) {
+  let res;
+  try { res = await fetch(path, { method: 'POST', headers: { 'X-Afterhours': '1' } }); }
+  catch { const e = new Error('Afterhours’ helper isn’t answering.'); e.status = 0; throw e; }
   let data = null;
   try { data = await res.json(); } catch {}
   if (!res.ok) { const e = new Error((data && data.error) || `Something went wrong (${res.status}).`); e.status = res.status; throw e; }
@@ -2453,7 +2515,10 @@ function renderCaptions(force) {
   const hint = !cur && recogActive() && !S.cues.length;
   pill.hidden = !(settings.captions && S.current && !S.npOpen && (cur || hint));
   pill.classList.toggle('hint', hint);
-  if (cur) { $('capWho').textContent = cur.speaker || ''; $('capWho').hidden = !cur.speaker; $('capText').textContent = cur.text; }
+  if (cur) {
+    $('capWho').textContent = cur.speaker || ''; $('capWho').hidden = !cur.speaker; $('capText').textContent = cur.text;
+    if (changed && !pill.hidden && motionOn()) $('capText').animate([{ opacity: 0, transform: 'translateY(6px)' }, { opacity: 1, transform: 'none' }], { duration: 260, easing: 'cubic-bezier(0, 0, 0, 1)' });
+  }
   else if (hint) { $('capWho').hidden = true; $('capText').textContent = recogText(); }
   const line = $('npCaption');
   line.hidden = !settings.captions || lyricsVisible() || !S.current;
@@ -2502,7 +2567,7 @@ function highlightLyric(i) {
   S.activeLyric = li;
   if (lyricsVisible() && Date.now() - S.lastUserScroll > 3500) {
     const box = $('lyrics');
-    box.scrollTo({ top: li.offsetTop - box.clientHeight * 0.36, behavior: reduceMotion ? 'auto' : 'smooth' });
+    box.scrollTo({ top: li.offsetTop - box.clientHeight * 0.36, behavior: !motionOn() ? 'auto' : 'smooth' });
   }
 }
 
@@ -2808,7 +2873,7 @@ function section(title, sub, body, opts = {}) {
   const tools = el('div', { class: 'section-tools' });
   if (opts.link) tools.append(el('a', { class: 'see-all', href: opts.link[1], text: opts.link[0] }));
   if (body.classList.contains('row')) {
-    const by = dir => () => body.scrollBy({ left: dir * body.clientWidth * 0.9, behavior: reduceMotion ? 'auto' : 'smooth' });
+    const by = dir => () => body.scrollBy({ left: dir * body.clientWidth * 0.9, behavior: !motionOn() ? 'auto' : 'smooth' });
     tools.append(el('button', { class: 'row-nav', type: 'button', 'aria-label': `Scroll ${title} left`, onclick: by(-1) }, icon('chevleft')), el('button', { class: 'row-nav', type: 'button', 'aria-label': `Scroll ${title} right`, onclick: by(1) }, icon('chevright')));
   }
   return el('section', { class: 'section' }, el('div', { class: 'section-head' }, el('div', {}, el('h2', { class: 'section-title', text: title }), sub ? el('p', { class: 'section-sub', text: sub }) : null), tools), body);
@@ -2852,7 +2917,7 @@ function card(c) {
     el('span', { class: 'card-title', text: c.title }),
     el('span', { class: 'card-sub', text: c.author || '\u00a0' }),
     c.why ? el('span', { class: 'card-why', text: c.why }) : null);
-  body.addEventListener('click', () => openCandidate(c));
+  body.addEventListener('click', () => openCandidate(c, body.querySelector('.art')));
   const add = el('button', { class: 'add-btn', type: 'button' });
   const sync = () => {
     const has = !!libFor(c);
@@ -2884,16 +2949,16 @@ function card(c) {
   }
   return node;
 }
-const cardRow = cands => el('div', { class: 'row' }, cands.map(card));
-async function openCandidate(c) {
+const cardRow = cands => { const row = el('div', { class: 'row' }, cands.map(card)); animateItems(row.children); return row; };
+async function openCandidate(c, artEl) {
   const lib = libFor(c);
-  if (lib) { go('show/' + lib.sid); return; }
+  if (lib) { transitionTo('show/' + lib.sid, artEl); return; }
   if (!(await ensureFeed(c, 1))) { toast(`Couldn’t find a public feed for ${c.title}.`, true); return; }
   const again = libFor(c);
-  if (again) { go('show/' + again.sid); return; }
+  if (again) { transitionTo('show/' + again.sid, artEl); return; }
   const sid = 't-' + fnv(c.feedUrl);
   transient.set(sid, { sid, preset: c.preset, cat: c.cat || 'mine', title: c.title, author: c.author, image: c.image, feedUrl: c.feedUrl, status: 'ready', appleId: c.appleId, genre: c.genre, why: c.why, transient: true });
-  go('show/' + sid);
+  transitionTo('show/' + sid, artEl && artEl.isConnected ? artEl : null);
 }
 function addShow(c, quiet) {
   const existing = libFor(c);
@@ -2976,6 +3041,49 @@ function upNextCard(r, queue) {
   return b;
 }
 
+/* ---------- motion (Fluent-style) ---------- */
+function animateItems(nodes, step = 28) {
+  if (!motionOn()) return;
+  let i = 0;
+  for (const n of nodes) {
+    if (!n.animate) continue;
+    n.animate([{ opacity: 0, transform: 'translateY(16px)' }, { opacity: 1, transform: 'none' }],
+      { duration: 460, delay: Math.min(i, 16) * step, easing: 'cubic-bezier(0.1, 0.9, 0.2, 1)', fill: 'backwards' });
+    i++;
+  }
+}
+function moveIndicators() {
+  const place = (ind, link, vertical) => {
+    if (!ind) return;
+    if (!link || !link.offsetParent) { ind.classList.remove('on'); return; }
+    if (vertical) { ind.style.setProperty('--y', (link.offsetTop + link.offsetHeight / 2 - 9) + 'px'); ind.style.setProperty('--x', link.offsetLeft + 'px'); }
+    else ind.style.setProperty('--x', (link.offsetLeft + link.offsetWidth / 2 - 14) + 'px');
+    if (!ind.classList.contains('on')) { ind.classList.add('instant'); void ind.offsetWidth; ind.classList.add('on'); requestAnimationFrame(() => ind.classList.remove('instant')); }
+  };
+  place($('navInd'), document.querySelector('.sidebar [data-route][aria-current="page"]'), true);
+  place($('tabInd'), document.querySelector('.tabbar [aria-current="page"]'), false);
+}
+// connected animation: the artwork you pressed flies into the show page (where the browser supports it)
+function transitionTo(path, artEl) {
+  if (!artEl || !motionOn() || !document.startViewTransition) { go(path); return; }
+  artEl.style.viewTransitionName = 'show-art';
+  S.flyArt = true;
+  const vt = document.startViewTransition(() => { artEl.style.viewTransitionName = ''; history.pushState(null, '', '#/' + path); render(); });
+  vt.finished.finally(() => { S.flyArt = false; const h = document.querySelector('.hero-art'); if (h) h.style.viewTransitionName = ''; });
+}
+// the Now Playing artwork flies from (or back to) the player bar
+function flyArt(from, to, back) {
+  if (!motionOn() || !from || !to || !to.animate) return;
+  const a = from.getBoundingClientRect(), b = to.getBoundingClientRect();
+  if (!a.width || !b.width) return;
+  const moved = { transform: `translate(${a.left - b.left}px, ${a.top - b.top}px) scale(${a.width / b.width})`, borderRadius: '10px' };
+  const home = { transform: 'none', borderRadius: '14px' };
+  to.style.transformOrigin = '0 0';
+  const anim = to.animate(back ? [home, moved] : [moved, home], back
+    ? { duration: 240, easing: 'cubic-bezier(0.9, 0.1, 1, 0.2)', fill: 'forwards' }
+    : { duration: 560, easing: 'cubic-bezier(0.1, 0.9, 0.2, 1)' });
+  if (!back) anim.finished.then(() => { to.style.transformOrigin = ''; }, () => {});
+}
 /* ---------- routing ---------- */
 function parseRoute() { const h = location.hash.replace(/^#\/?/, ''); const [name, ...rest] = h.split('/'); return { name: name || 'home', arg: decodeURIComponent(rest.join('/')) }; }
 function go(path) { if (location.hash === '#/' + path) render(); else location.hash = '#/' + path; }
@@ -2984,7 +3092,8 @@ function render() {
   closeSpeed();
   if (S.npOpen) closeNp();
   view.replaceChildren();
-  view.style.animation = 'none'; void view.offsetWidth; view.style.animation = '';
+  view.classList.toggle('drill', route.name === 'show');
+  view.style.animation = 'none'; void view.offsetWidth; view.style.animation = S.flyArt ? 'none' : '';
   const fn = { home: renderHome, discover: renderDiscover, library: renderLibrary, show: renderShow, search: renderSearch, settings: renderSettings }[route.name] || renderHome;
   fn(route.arg);
   $('main').scrollTop = 0;
@@ -2994,6 +3103,7 @@ function markNav() {
   const top = route.name === 'show' ? '' : route.name;
   for (const a of document.querySelectorAll('[data-route]')) a.setAttribute('aria-current', a.dataset.route === top ? 'page' : 'false');
   renderSidebar();
+  moveIndicators();
 }
 function renderSidebar() {
   const ul = $('sideShows');
@@ -3036,6 +3146,7 @@ async function fillLatest() {
     return;
   }
   box.replaceChildren(...top.map(x => episodeRow(x.ep, x.show, top, { rich: true })));
+  if (!box.dataset.anim) { box.dataset.anim = '1'; animateItems(box.children, 24); }
 }
 function favouriteCats(n) {
   const counts = new Map();
@@ -3052,6 +3163,7 @@ function searchRow(term, country, cat) {
     if (!row.isConnected) return;
     const list = rs.filter(r => !showByFeed(r.feedUrl)).slice(0, 14).map(r => card(candFromResult(r, cat)));
     row.replaceChildren(...(list.length ? list : [el('p', { class: 'row-empty', text: 'Nothing new here right now.' })]));
+    animateItems(row.children);
   }).catch(e => {
     if (!row.isConnected) return;
     row.replaceChildren(el('p', { class: 'row-empty' }, e.message + ' ', el('button', { class: 'link-btn', type: 'button', text: 'Try again', onclick: () => row.replaceWith(searchRow(term, country, cat)) })));
@@ -3101,6 +3213,7 @@ function renderLibrary() {
     const shows = library.filter(s => s.cat === c.id);
     if (shows.length) view.append(section(c.label, null, el('div', { class: 'grid' }, shows.map(showTile))));
   }
+  animateItems(view.querySelectorAll('.tile'), 22);
 }
 function sourcePanel(show, onDone) {
   const input = el('input', { type: 'text', inputmode: 'url', placeholder: 'Paste the show’s RSS feed or website', 'aria-label': 'RSS feed or website address', spellcheck: 'false', value: show.site || show.link || '' });
@@ -3135,6 +3248,7 @@ async function renderShow(sid) {
       show.author ? el('p', { class: 'show-author', text: show.author }) : null,
       about, actions, srcNote, srcBox));
   view.append(hero);
+  if (S.flyArt) { const h = hero.querySelector('.hero-art'); if (h) h.style.viewTransitionName = 'show-art'; }
   artColor(show.image).then(c => applyTint(hero, c));
   const list = el('ol', { class: 'eps' });
   const note = el('p', { class: 'list-note', hidden: true });
@@ -3152,6 +3266,7 @@ async function renderShow(sid) {
     const sh = snap(show);
     const queue = sorted.map(e => ({ ep: e, show: sh }));
     list.replaceChildren(...sorted.slice(0, shown).map(e => episodeRow(e, sh, queue)));
+    if (!list.dataset.anim) { list.dataset.anim = '1'; animateItems(list.children, 30); }
     if (sorted.length > shown) list.append(el('li', { class: 'more-row' }, el('button', { class: 'btn tonal', type: 'button', text: `Show more episodes (${sorted.length - shown})`, onclick: () => { shown += 60; paint(); } })));
     note.hidden = sorted.length > 0;
     if (!sorted.length) note.textContent = 'This show has no playable episodes.';
@@ -3208,9 +3323,25 @@ async function renderShow(sid) {
 const gearLink = () => el('a', { class: 'icon-round phone-only', href: '#/settings', 'aria-label': 'Settings', title: 'Settings' }, icon('gear'));
 function segmented(options, value, onChange, label) {
   const box = el('div', { class: 'seg', role: 'radiogroup', 'aria-label': label });
-  const paint = v => { for (const b of box.children) b.setAttribute('aria-checked', String(b.dataset.v === v)); };
-  for (const [v, text] of options) box.append(el('button', { class: 'seg-btn', type: 'button', role: 'radio', dataset: { v }, text, onclick: () => { paint(v); onChange(v); } }));
-  paint(value);
+  const thumb = el('span', { class: 'seg-thumb', 'aria-hidden': 'true' });
+  const btns = [];
+  const place = instant => {
+    const b = btns.find(x => x.getAttribute('aria-checked') === 'true');
+    if (!b || !b.offsetWidth) return;
+    thumb.classList.toggle('instant', !!instant);
+    Object.assign(thumb.style, { width: b.offsetWidth + 'px', height: b.offsetHeight + 'px', transform: `translate(${b.offsetLeft}px, ${b.offsetTop}px)` });
+    thumb.classList.add('on');
+  };
+  const paint = v => { for (const b of btns) b.setAttribute('aria-checked', String(b.dataset.v === v)); place(false); };
+  box.append(thumb);
+  for (const [v, text] of options) {
+    const b = el('button', { class: 'seg-btn', type: 'button', role: 'radio', dataset: { v }, text, 'aria-checked': String(v === value) });
+    b.addEventListener('click', () => { paint(v); onChange(v); });
+    btns.push(b);
+    box.append(b);
+  }
+  requestAnimationFrame(() => place(true));
+  if ('ResizeObserver' in window) new ResizeObserver(() => place(true)).observe(box);
   return box;
 }
 function retryMissing() {
@@ -3224,7 +3355,7 @@ function retryMissing() {
 }
 async function clearAutoCaptions() {
   if (!confirm('Delete the auto captions saved on this computer? They’ll be made again when you next play those episodes.')) return;
-  try { await getJSON('/api/captions/clear'); } catch {}
+  try { await postJSON('/api/captions/clear'); } catch {}
   await idb.delPrefix('asr:');
   toast('Saved auto captions deleted.');
 }
@@ -3236,7 +3367,7 @@ function renderSettings() {
   view.append(group('Captions',
     row('Show captions', 'The current line above the player and in Now Playing.', switchInput('captions', 'Show captions', on => { settings.captions = on; saveSettings(); syncCC(); renderCaptions(true); })),
     row('Auto captions', 'When an episode has no captions, recognise the speech on this computer and caption it.', switchInput('autoCaptions', 'Auto captions', on => setAutoCaptions(on))),
-    row('Recognition quality', 'Automatic uses Fast for English shows and Accurate for Japanese and Chinese ones. More accurate models take longer.',
+    row('Recognition quality', 'Captions come from OpenAI’s Whisper speech models, running on this computer. Fast uses Whisper base, Accurate uses Whisper small and Most accurate uses Whisper medium. Automatic picks base for English shows and small for Japanese and Chinese ones.',
       segmented([['auto', 'Automatic'], ['base', 'Fast'], ['small', 'Accurate'], ['medium', 'Most accurate']], settings.captionModel || 'auto', v => { settings.captionModel = v; saveSettings(); }, 'Recognition quality')),
     row('Caption recognition', status),
     row('Saved auto captions', 'Captions made on this computer are kept, so they load instantly next time.', el('button', { class: 'btn tonal small', type: 'button', text: 'Delete', onclick: clearAutoCaptions }))));
@@ -3244,13 +3375,15 @@ function renderSettings() {
     Recog.cap = cap;
     const v = cap.versions || {};
     if (cap.available) status.replaceChildren(el('span', { class: 'set-ok', text: 'Ready. ' }),
-      `Speech is recognised with ${cap.engine}${v['faster-whisper'] ? ' ' + v['faster-whisper'] : ''}${v.av ? `, and audio is read with PyAV ${v.av}` : ''}${v.ffmpeg ? ' (ffmpeg is there as a backup)' : ''}.`);
+      `Speech is recognised by Whisper, running in ${cap.engine}${v['faster-whisper'] ? ' ' + v['faster-whisper'] : ''}${v.av ? `, and audio is read with PyAV ${v.av}` : ''}${v.ffmpeg ? ' (ffmpeg is there as a backup)' : ''}.`);
     else status.replaceChildren('Not set up yet. Quit Afterhours, run this once, then start it again:', el('code', { text: cap.install || 'python3 afterhours.py --setup-captions' }));
   }).catch(() => { status.textContent = 'Afterhours’ helper isn’t answering. Is afterhours.py still running?'; });
   view.append(group('Playback',
     row('Play the next episode automatically', null, switchInput('autoNext', 'Play the next episode automatically', on => { settings.autoNext = on; saveSettings(); $('npAuto').setAttribute('aria-pressed', String(on)); }))));
   view.append(group('Appearance',
-    row('Appearance', 'Follow your system, or always use light or dark.', segmented([['system', 'System'], ['light', 'Light'], ['dark', 'Dark']], settings.theme, v => { settings.theme = v; saveSettings(); applyTheme(); }, 'Appearance'))));
+    row('Appearance', 'Follow your system, or always use light or dark.', segmented([['system', 'System'], ['light', 'Light'], ['dark', 'Dark']], settings.theme, v => { settings.theme = v; saveSettings(); applyTheme(); }, 'Appearance')),
+    row('Animations', 'Fluent-style motion: pages glide in, artwork flies into place, and controls respond as you press them.', switchInput('motion', 'Animations', on => { settings.motion = on; saveSettings(); applyMotion(); toast(on ? 'Animations on.' : 'Animations off.'); })),
+    row('Pointer highlight', 'The soft glow that follows your mouse over lists, menus and buttons.', switchInput('pointerGlow', 'Pointer highlight', on => { settings.pointerGlow = on; saveSettings(); applyGlow(); toast(on ? 'Pointer highlight on.' : 'Pointer highlight off.'); }))));
   const missing = library.filter(s => s.status === 'missing').length;
   view.append(group('Library',
     row('Look for missing shows again', missing ? `${missing} show${missing > 1 ? 's' : ''} couldn’t be found automatically.` : 'Every show on your shelf was found.', el('button', { class: 'btn tonal small', type: 'button', text: 'Look again', disabled: !missing, onclick: retryMissing })),
@@ -3258,7 +3391,16 @@ function renderSettings() {
     row('Export OPML', 'Save your shows for another podcast app.', el('button', { class: 'btn tonal small', type: 'button', text: 'Export', onclick: exportOPML }))));
   const ver = el('span', { text: 'Afterhours' });
   getJSON('/api/ping').then(x => { ver.textContent = `Afterhours ${x.version}`; }).catch(() => {});
-  view.append(group('About', row('Version', ver)));
+  view.append(group('About', row('Version', ver),
+    row('Quit Afterhours', 'Stops Afterhours on this computer. Open it again whenever you want to listen.', el('button', { class: 'btn tonal small', type: 'button', text: 'Quit', onclick: quitApp }))));
+  animateItems(view.querySelectorAll('.set-group'), 50);
+}
+async function quitApp() {
+  if (!confirm('Quit Afterhours? Playback stops, and you can open Afterhours again any time.')) return;
+  audio.pause();
+  saveProgress(true);
+  try { await postJSON('/api/quit'); } catch {}
+  document.body.replaceChildren(el('div', { class: 'empty', style: 'margin-top:30vh' }, el('h2', { text: 'Afterhours has stopped' }), el('p', { text: 'You can close this tab. To listen again, open Afterhours.' })));
 }
 function renderSearch(term) {
   const input = el('input', { type: 'search', value: term || '', placeholder: 'Shows, topics, or a feed link', 'aria-label': 'Search podcasts', enterkeyhint: 'search', autocomplete: 'off', spellcheck: 'false' });
@@ -3277,6 +3419,7 @@ function renderSearch(term) {
   searchAll(term).then(rs => {
     if (!grid.isConnected) return;
     grid.replaceChildren(...(rs.length ? rs.map(r => card(candFromResult(r, 'mine'))) : [el('p', { class: 'row-empty', text: 'No shows found. Try fewer words, or paste the feed link.' })]));
+    animateItems(grid.children, 22);
   }).catch(e => { if (grid.isConnected) grid.replaceChildren(el('p', { class: 'row-empty', text: e.message })); });
 }
 async function searchAll(term) {
@@ -3470,6 +3613,7 @@ function openNp(withLyrics) {
   if (withLyrics != null) setLyrics(withLyrics);
   S.npOpen = true;
   const np = $('np');
+  np.classList.remove('closing');
   np.hidden = false;
   void np.offsetWidth;
   np.classList.add('open');
@@ -3477,14 +3621,23 @@ function openNp(withLyrics) {
   renderLyrics();
   renderCaptions(true);
   S.lastUserScroll = 0;
+  flyArt($('barArt'), $('npArt').firstElementChild, false);
   setTimeout(() => { if (S.cueIdx >= 0) highlightLyric(S.cueIdx); $('npClose').focus({ preventScroll: true, focusVisible: false }); }, 60);
 }
 function closeNp() {
   S.npOpen = false;
-  $('np').classList.remove('open');
+  const np = $('np'), art = $('npArt').firstElementChild;
+  if (np.classList.contains('open')) flyArt($('barArt'), art, true);
+  np.classList.add('closing');
+  np.classList.remove('open');
   document.body.classList.remove('np-open');
   closeSpeed();
-  setTimeout(() => { if (!S.npOpen) $('np').hidden = true; }, reduceMotion ? 0 : 480);
+  setTimeout(() => {
+    if (S.npOpen) return;
+    np.hidden = true;
+    np.classList.remove('closing');
+    if (art) { for (const a of art.getAnimations()) a.cancel(); art.style.transformOrigin = ''; }
+  }, motionOn() ? 260 : 0);
   renderCaptions(true);
 }
 function setLyrics(on) {
@@ -3658,6 +3811,21 @@ function wireSeek(id) {
 }
 function wire() {
   window.addEventListener('hashchange', render);
+  window.addEventListener('resize', moveIndicators);
+  document.addEventListener('pointermove', e => {
+    if (settings.pointerGlow === false || e.pointerType === 'touch') return;
+    const t = e.target.closest && e.target.closest('.side-shows a, .nav a, .side-tool, .side-switch, .set-row, .ep, .up-card');
+    if (!t) return;
+    const r = t.getBoundingClientRect();
+    t.style.setProperty('--rx', (e.clientX - r.left) + 'px');
+    t.style.setProperty('--ry', (e.clientY - r.top) + 'px');
+  }, { passive: true });
+  view.addEventListener('click', e => {
+    const link = e.target.closest('a.tile-link');
+    if (!link || e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || !motionOn() || !document.startViewTransition) return;
+    e.preventDefault();
+    transitionTo(link.getAttribute('href').replace(/^#\//, ''), link.querySelector('.art'));
+  });
   $('searchForm').addEventListener('submit', e => { e.preventDefault(); const v = $('searchInput').value.trim(); if (v) handleQuery(v); });
   $('autoCapSwitch').addEventListener('change', e => setAutoCaptions(e.target.checked));
   $('opmlFile').addEventListener('change', e => { const f = e.target.files[0]; e.target.value = ''; if (f) importOPML(f); });
@@ -3772,6 +3940,8 @@ function wire() {
 function init() {
   seedLibrary();
   applyTheme();
+  applyMotion();
+  applyGlow();
   syncAutoCap();
   Recog.init();
   wire();
