@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """
-Afterhours 3.3: a small, private podcast player.
+Afterhours 4.1: a small, private podcast player.
 
 Run it:    python3 afterhours.py        (Windows: py afterhours.py)
-It opens:  http://127.0.0.1:8765  in your browser
+It opens in its own window, made with the web view built into your system (pywebview).
+Install that once from Settings > Window, or with --setup-window. Until then, Afterhours
+opens in your browser.
 
 Needs only Python 3.8 or newer. Optional: to caption episodes that have no
 captions, install the free speech-recognition add-on once with
@@ -16,13 +18,17 @@ results on its behalf. It only listens on your own computer.
 
 Options:
   --port 8765        use a different port (each port keeps its own library)
-  --no-browser       don't open the browser automatically
+  --window           open in its own window (the default)
+  --browser          open in a normal browser tab instead
+  --no-browser       don't open anything
+  --setup-window     install the window component (pywebview), then exit
   --setup-captions   install the caption recognition add-on, then exit
   --verbose          log every request
 See README.md for details.
 """
 
 import argparse
+import base64
 import collections
 import concurrent.futures
 import email.utils
@@ -31,10 +37,13 @@ import hashlib
 import html
 import http.server
 import importlib.util
+import inspect
 import json
 import os
 import queue
 import re
+import secrets
+import shlex
 import shutil
 import socket
 import ssl
@@ -53,7 +62,7 @@ from pathlib import Path
 
 APP_NAME = "Afterhours"
 APP_ID = "afterhours"
-VERSION = "3.3.0"
+VERSION = "4.1.0"
 DEFAULT_PORT = 8765
 MAX_BYTES = 25 * 1024 * 1024
 MAX_AUDIO = 1536 * 1024 * 1024
@@ -676,8 +685,62 @@ def get_image(url):
 
 
 # ---------- caption recognition (runs on this computer with faster-whisper) ----------
-MODELS = ("tiny", "base", "small", "medium")
-MODEL_SIZES = {"tiny": "75 MB", "base": "145 MB", "small": "480 MB", "medium": "1.5 GB"}
+MODELS = ("tiny", "tiny.en", "base", "base.en", "small", "small.en", "medium", "medium.en", "large-v3", "large-v3-turbo", "distil-large-v3")
+MODEL_SIZES = {"tiny": "75 MB", "tiny.en": "75 MB", "base": "145 MB", "base.en": "145 MB", "small": "480 MB", "small.en": "480 MB",
+               "medium": "1.5 GB", "medium.en": "1.5 GB", "large-v3": "3 GB", "large-v3-turbo": "1.6 GB", "distil-large-v3": "1.5 GB"}
+# Pro-mode options: name -> (kind, default, limits). Anything else sent by the page is ignored.
+PRO_SPEC = {
+    "language": ("lang", ""), "task": ("choice", "transcribe", ("transcribe", "translate")),
+    "device": ("choice", "auto", ("auto", "cpu", "cuda")), "compute": ("choice", "auto", ("auto", "int8", "int8_float16", "int16", "float16", "float32")),
+    "threads": ("int", 0, 0, 64), "beam": ("int", 1, 1, 10), "temperature": ("float", 0.0, 0.0, 1.0),
+    "condition": ("bool", False), "vad": ("bool", True), "vadThreshold": ("float", 0.5, 0.05, 0.95), "minSilence": ("int", 500, 50, 5000),
+    "noSpeech": ("float", 0.6, 0.0, 1.0), "compression": ("float", 2.4, 1.0, 10.0), "logProb": ("float", -1.0, -10.0, 0.0),
+    "words": ("bool", True), "maxChars": ("int", 84, 20, 300), "maxSeconds": ("float", 6.5, 1.0, 30.0),
+    "prompt": ("text", "", 400), "hotwords": ("text", "", 400),
+}
+PRO_DEFAULTS = {k: v[1] for k, v in PRO_SPEC.items()}
+
+
+def clean_opts(raw):
+    """Validate pro-mode options from the page, falling back to defaults."""
+    try:
+        data = json.loads(raw) if raw else {}
+    except ValueError:
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    out = dict(PRO_DEFAULTS)
+    for key, spec in PRO_SPEC.items():
+        if key not in data:
+            continue
+        v, kind = data[key], spec[0]
+        try:
+            if kind == "bool":
+                out[key] = bool(v)
+            elif kind == "int":
+                out[key] = max(spec[2], min(spec[3], int(v)))
+            elif kind == "float":
+                out[key] = max(spec[2], min(spec[3], float(v)))
+            elif kind == "choice":
+                out[key] = v if v in spec[2] else spec[1]
+            elif kind == "lang":
+                out[key] = v if isinstance(v, str) and re.fullmatch(r"[a-z]{2,3}", v) else ""
+            elif kind == "text":
+                out[key] = str(v)[: spec[2]].strip()
+        except (TypeError, ValueError):
+            pass
+    return out
+
+
+def supported(fn, kwargs):
+    """Keep only the keyword arguments this faster-whisper version understands."""
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return kwargs
+    if any(p.kind == p.VAR_KEYWORD for p in params.values()):
+        return kwargs
+    return {k: v for k, v in kwargs.items() if k in params}
 INSTALL_HINT = "python3 afterhours.py --setup-captions"
 
 
@@ -685,7 +748,7 @@ class Cancelled(Exception):
     pass
 
 
-def split_words(seg, offset):
+def split_words(seg, offset, max_chars=84, max_secs=6.5):
     """Turn one recognised segment into short caption lines using its word timings."""
     words = list(getattr(seg, "words", None) or [])
     text = (getattr(seg, "text", "") or "").strip()
@@ -700,7 +763,7 @@ def split_words(seg, offset):
         cur += w.word or ""
         end = w.end
         t = cur.strip()
-        if len(t) >= 84 or end - start >= 6.5 or re.search(r"[.!?。！？…]$", t):
+        if len(t) >= max_chars or end - start >= max_secs or re.search(r"[.!?。！？…]$", t):
             if t:
                 yield {"start": round(start + offset, 2), "end": round(end + offset, 2), "text": t}
             cur, start = "", None
@@ -802,18 +865,26 @@ class WhisperEngine:
         self.fw = faster_whisper
         self.loaded = {}
 
-    def model(self, size, job):
-        if size not in self.loaded:
+    def model(self, size, job, opts):
+        try:
+            import ctranslate2
+            cuda = ctranslate2.get_cuda_device_count() > 0
+        except Exception:
+            cuda = False
+        device = opts["device"] if opts["device"] != "auto" else ("cuda" if cuda else "cpu")
+        if device == "cuda" and not cuda:
+            raise FetchError(422, "No compatible NVIDIA graphics card was found. In Pro mode, choose Automatic or Processor.")
+        compute = opts["compute"] if opts["compute"] != "auto" else ("float16" if device == "cuda" else "int8")
+        key = (size, device, compute, opts["threads"])
+        if key not in self.loaded:
             job["message"] = "Loading the %s speech model. The first time, it downloads once (about %s)." % (size, MODEL_SIZES.get(size, ""))
-            try:
-                import ctranslate2
-                cuda = ctranslate2.get_cuda_device_count() > 0
-            except Exception:
-                cuda = False
-            self.loaded[size] = self.fw.WhisperModel(size, device="cuda" if cuda else "cpu",
-                                                     compute_type="float16" if cuda else "int8")
+            kwargs = {"device": device, "compute_type": compute}
+            if opts["threads"]:
+                kwargs["cpu_threads"] = opts["threads"]
+            self.loaded[key] = self.fw.WhisperModel(size, **supported(self.fw.WhisperModel.__init__, kwargs))
             job["message"] = ""
-        return self.loaded[size]
+        job["engineInfo"] = "%s · %s · %s" % (size, "graphics card" if device == "cuda" else "processor", compute)
+        return self.loaded[key]
 
     def decode(self, path):
         problems = []
@@ -831,15 +902,21 @@ class WhisperEngine:
             problems.append("faster-whisper: %s" % (str(e)[:160] or e.__class__.__name__))
         raise FetchError(422, "Afterhours couldn’t read this episode’s audio (%s)." % "; ".join(problems))
 
-    def segments(self, model, audio, a, b, lang, on_language):
+    def segments(self, model, audio, a, b, lang, on_language, opts):
         chunk = audio[int(a * 16000):int(b * 16000)]
         if len(chunk) < 16000:
             return
-        segs, info = model.transcribe(chunk, language=lang or None, vad_filter=True, beam_size=1,
-                                      condition_on_previous_text=False, word_timestamps=True)
+        kwargs = {"language": opts["language"] or lang or None, "task": opts["task"], "beam_size": opts["beam"],
+                  "temperature": opts["temperature"], "condition_on_previous_text": opts["condition"],
+                  "vad_filter": opts["vad"], "word_timestamps": opts["words"],
+                  "no_speech_threshold": opts["noSpeech"], "compression_ratio_threshold": opts["compression"],
+                  "log_prob_threshold": opts["logProb"], "initial_prompt": opts["prompt"] or None, "hotwords": opts["hotwords"] or None}
+        if opts["vad"]:
+            kwargs["vad_parameters"] = {"threshold": opts["vadThreshold"], "min_silence_duration_ms": opts["minSilence"]}
+        segs, info = model.transcribe(chunk, **supported(model.transcribe, kwargs))
         on_language(getattr(info, "language", "") or "")
         for seg in segs:
-            for cue in split_words(seg, a):
+            for cue in split_words(seg, a, opts["maxChars"], opts["maxSeconds"]):
                 yield cue
 
 
@@ -855,7 +932,8 @@ class MockEngine:
     """Stand-in engine for testing the caption pipeline without the speech model."""
     name = "mock"
 
-    def model(self, size, job):
+    def model(self, size, job, opts):
+        job["engineInfo"] = "%s · mock" % size
         return None
 
     def decode(self, path):
@@ -866,13 +944,13 @@ class MockEngine:
         except Exception:
             return MockAudio(120.0)
 
-    def segments(self, model, audio, a, b, lang, on_language):
-        on_language(lang or "en")
+    def segments(self, model, audio, a, b, lang, on_language, opts):
+        on_language(opts["language"] or lang or "en")
         t = a
         while t < b - 0.5:
             time.sleep(0.04)
             yield {"start": round(t, 2), "end": round(min(b, t + 3.6), 2),
-                   "text": "Recognised speech at %d:%02d." % (int(t) // 60, int(t) % 60)}
+                   "text": ("Translated speech at %d:%02d." if opts["task"] == "translate" else "Recognised speech at %d:%02d.") % (int(t) // 60, int(t) % 60)}
             t += 4.0
 
 
@@ -891,20 +969,24 @@ class CaptionJobs:
         self.worker = None
 
     @staticmethod
-    def key(url, model):
-        return hashlib.sha1((url + "|" + model).encode("utf-8")).hexdigest()[:24]
+    def key(url, model, opts=None):
+        base = url + "|" + model
+        if opts and opts != PRO_DEFAULTS:   # captions made with the standard settings keep their old key
+            base += "|" + json.dumps(opts, sort_keys=True)
+        return hashlib.sha1(base.encode("utf-8")).hexdigest()[:24]
 
     def cache_path(self, key):
         return DATA_DIR / "captions" / (key + ".json")
 
-    def start(self, url, model, start, lang):
-        key = self.key(url, model)
+    def start(self, url, model, start, lang, opts=None):
+        opts = opts or dict(PRO_DEFAULTS)
+        key = self.key(url, model, opts)
         with self.lock:
             job = self.jobs.get(key)
             if job and job["state"] not in ("error", "cancelled"):
                 return self._status(job, 0)
-            job = {"key": key, "url": url, "model": model, "start": start, "lang": lang, "state": "queued",
-                   "progress": 0.0, "message": "", "language": "", "segments": [], "error": "", "cancel": False}
+            job = {"key": key, "url": url, "model": model, "start": start, "lang": lang, "opts": opts, "state": "queued",
+                   "progress": 0.0, "message": "", "language": "", "segments": [], "error": "", "cancel": False, "engineInfo": ""}
             try:
                 cached = json.loads(self.cache_path(key).read_text(encoding="utf-8"))
                 job.update(state="done", progress=1.0, language=cached.get("language", ""), segments=cached.get("segments", []))
@@ -918,14 +1000,14 @@ class CaptionJobs:
                 self.queue.put(key)
             return self._status(job, 0)
 
-    def status(self, url, model, since):
+    def status(self, url, model, since, job_id=""):
         with self.lock:
-            job = self.jobs.get(self.key(url, model))
+            job = self.jobs.get(job_id) if job_id else self.jobs.get(self.key(url, model))
             return self._status(job, since) if job else {"state": "none"}
 
-    def cancel(self, url, model):
+    def cancel(self, url, model, job_id=""):
         with self.lock:
-            job = self.jobs.get(self.key(url, model))
+            job = self.jobs.get(job_id) if job_id else self.jobs.get(self.key(url, model))
             if job and job["state"] not in ("done", "error"):
                 job["cancel"] = True
                 job["state"] = "cancelled"
@@ -933,7 +1015,8 @@ class CaptionJobs:
 
     @staticmethod
     def _status(job, since):
-        return {"state": job["state"], "progress": round(job["progress"], 4), "message": job["message"],
+        return {"id": job["key"], "options": job.get("opts", PRO_DEFAULTS), "engineInfo": job.get("engineInfo", ""),
+                "state": job["state"], "progress": round(job["progress"], 4), "message": job["message"],
                 "language": job["language"], "model": job["model"], "error": job["error"],
                 "total": len(job["segments"]), "segments": job["segments"][max(0, since):]}
 
@@ -980,7 +1063,7 @@ class CaptionJobs:
                         raise FetchError(413, "That episode is too large to caption.")
                     job["progress"] = got / total if total else 0.0
             job.update(state="loading", progress=0.0)
-            model = self.engine.model(job["model"], job)
+            model = self.engine.model(job["model"], job, job["opts"])
             audio = self.engine.decode(path)
             duration = len(audio) / 16000.0
             start = min(max(0.0, job["start"] - 2.0), duration)
@@ -992,7 +1075,7 @@ class CaptionJobs:
                 if code and not job["language"]:
                     job["language"] = code
             for a, b in passes:
-                for cue in self.engine.segments(model, audio, a, b, job["lang"], on_language):
+                for cue in self.engine.segments(model, audio, a, b, job["lang"], on_language, job["opts"]):
                     if job["cancel"]:
                         raise Cancelled()
                     with self.lock:
@@ -1011,6 +1094,283 @@ class CaptionJobs:
 
 
 CAPTIONS = CaptionJobs()
+
+
+def load_prefs():
+    try:
+        return json.loads((DATA_DIR / "prefs.json").read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def save_prefs():
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        (DATA_DIR / "prefs.json").write_text(json.dumps(PREFS), encoding="utf-8")
+    except Exception:
+        pass
+
+
+PREFS = load_prefs()
+ICON_PNG = base64.b64decode("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")
+MANIFEST = json.dumps({"name": "Afterhours", "short_name": "Afterhours", "description": "A small, private podcast player.",
+                       "start_url": "/", "scope": "/", "display": "standalone", "background_color": "#18181A", "theme_color": "#18181A",
+                       "icons": [{"src": "/icon.png", "sizes": "512x512", "type": "image/png", "purpose": "any"}]})
+SERVICE_WORKER = ("const C='afterhours-4';self.addEventListener('install',e=>{self.skipWaiting();e.waitUntil(caches.open(C).then(c=>c.add('/')))});"
+                  "self.addEventListener('activate',e=>e.waitUntil(self.clients.claim()));"
+                  "self.addEventListener('fetch',e=>{const u=new URL(e.request.url);if(e.request.method!=='GET'||u.origin!==location.origin||u.pathname!=='/')return;"
+                  "e.respondWith(fetch(e.request).then(r=>{const k=r.clone();caches.open(C).then(c=>c.put('/',k));return r}).catch(()=>caches.match('/')))});")
+LAN_DENIED = ("<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><title>Afterhours</title>"
+              "<body style='font:17px/1.5 system-ui,sans-serif;padding:32px;max-width:32em;margin:auto'><h1>Afterhours</h1>"
+              "<p>To use Afterhours on this phone, open the phone link from <b>Settings › Use on your phone</b> on your computer.</p>")
+
+
+class PhoneAccess:
+    """Lets phones on the same Wi-Fi use this Afterhours, with a private key."""
+
+    def __init__(self):
+        self.server, self.ip, self.port = None, "", 0
+        self.lock = threading.Lock()
+
+    def code(self, renew=False):
+        if renew or not PREFS.get("phoneCode"):
+            PREFS["phoneCode"] = secrets.token_hex(5)
+            save_prefs()
+        return PREFS["phoneCode"]
+
+    @staticmethod
+    def lan_ip():
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect(("192.0.2.1", 80))   # no packets are sent; this only picks the outgoing interface
+            return s.getsockname()[0]
+        except OSError:
+            return ""
+        finally:
+            s.close()
+
+    def info(self):
+        on = self.server is not None
+        return {"on": on, "url": "http://%s:%d/?key=%s" % (self.ip, self.port, self.code()) if on else "", "address": "%s:%d" % (self.ip, self.port) if on else ""}
+
+    def start(self, port, remember=True):
+        with self.lock:
+            if self.server is None:
+                ip = self.lan_ip()
+                if not ip or ip.startswith("127."):
+                    raise FetchError(409, "This computer doesn’t seem to be on a network your phone can reach.")
+                try:
+                    srv = Server((ip, port), Handler)
+                except OSError as e:
+                    raise FetchError(409, "Couldn’t open Afterhours to your network (%s)." % e.strerror)
+                srv.lan, srv.verbose = True, False
+                threading.Thread(target=srv.serve_forever, daemon=True).start()
+                self.server, self.ip, self.port = srv, ip, port
+            if remember:
+                PREFS["phone"] = True
+                save_prefs()
+            return self.info()
+
+    def stop(self, remember=True):
+        with self.lock:
+            if self.server is not None:
+                srv, self.server = self.server, None
+                threading.Thread(target=srv.shutdown, daemon=True).start()
+            if remember:
+                PREFS["phone"] = False
+                save_prefs()
+            return self.info()
+
+
+PHONE = PhoneAccess()
+MOVE = {"data": None, "at": 0.0}   # a library on its way from the browser tab to the app window
+RUNNING = {"mode": "none"}   # how this copy of Afterhours is shown: "window", "browser" or "none"
+RESTART = {}                 # set when Afterhours should start again in its own window
+WINDOW = {}                  # the open window, if there is one
+
+
+def venv_python():
+    return str(DATA_DIR / "venv" / ("Scripts" if os.name == "nt" else "bin") / ("python.exe" if os.name == "nt" else "python"))
+
+
+def can_import(python, code):
+    try:
+        return subprocess.call([python, "-c", code], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL, timeout=60, **NO_CONSOLE) == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+NO_CONSOLE = {"creationflags": 0x08000000} if os.name == "nt" else {}   # CREATE_NO_WINDOW: no console flashes on Windows
+_WINDOW_PY = {}
+
+
+def window_python(refresh=False):
+    """The Python that can open Afterhours' own window, or '' if the window component isn't installed."""
+    if refresh or "py" not in _WINDOW_PY:
+        found = ""
+        if importlib.util.find_spec("webview"):
+            found = sys.executable
+        elif os.path.exists(venv_python()) and can_import(venv_python(), "import webview"):
+            found = venv_python()
+        _WINDOW_PY["py"] = found
+    return _WINDOW_PY["py"]
+
+
+def install_window_component(say=print):
+    """Install pywebview: into this Python if it allows that, otherwise into Afterhours' private environment."""
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    log = open(DATA_DIR / "setup-window.log", "a", encoding="utf-8")
+
+    def run(cmd):
+        try:
+            return subprocess.call(cmd, stdin=subprocess.DEVNULL, stdout=log, stderr=log, timeout=1800, **NO_CONSOLE)
+        except (OSError, subprocess.SubprocessError):
+            return 1
+
+    custom = os.environ.get("AFTERHOURS_WINDOW_PACKAGE")
+    package = custom or "pywebview"
+    pip = ["-m", "pip", "install", "--upgrade", "--disable-pip-version-check", package]
+    say("Installing the window component…")
+    target = ""
+    in_venv = sys.prefix != getattr(sys, "base_prefix", sys.prefix)
+    if run([sys.executable] + pip) == 0 or (not in_venv and run([sys.executable] + pip + ["--user"]) == 0):
+        if can_import(sys.executable, "import webview"):
+            target = sys.executable
+    if not target:
+        if not os.path.exists(venv_python()):
+            say("Making a private Python environment for Afterhours…")
+            # system packages stay visible, so an existing caption add-on keeps working
+            if run([sys.executable, "-m", "venv", "--system-site-packages", str(DATA_DIR / "venv")]) != 0:
+                raise FetchError(500, "Couldn’t make a private Python environment. Run: python3 afterhours.py --setup-window")
+            say("Installing the window component…")
+        if run([venv_python()] + pip) != 0 or not can_import(venv_python(), "import webview"):
+            raise FetchError(500, "The window component couldn’t be installed. Check your internet connection, then try again.")
+        target = venv_python()
+    if sys.platform.startswith("linux") and not custom:
+        # Linux: use the desktop's WebKitGTK when it's there; otherwise add Qt's web view
+        gtk = "import gi\ntry:\n    gi.require_version('WebKit2', '4.1')\nexcept ValueError:\n    gi.require_version('WebKit2', '4.0')\nfrom gi.repository import WebKit2"
+        if not can_import(target, gtk):
+            say("Installing the window component…")
+            if run([target, "-m", "pip", "install", "--upgrade", "--disable-pip-version-check", "pywebview[qt]"]) != 0:
+                raise FetchError(500, "The window component couldn’t be installed. Check your internet connection, then try again.")
+    log.close()
+    window_python(refresh=True)
+    return target
+
+
+class WindowSetup:
+    """Installs the window component in the background, for Settings."""
+
+    def __init__(self):
+        self.state, self.message, self.python = "idle", "", ""
+
+    def info(self):
+        return {"state": self.state, "message": self.message}
+
+    def start(self):
+        if self.state != "working":
+            self.state, self.message = "working", "Installing the window component…"
+            threading.Thread(target=self._run, daemon=True).start()
+        return self.info()
+
+    def _run(self):
+        try:
+            self.python = install_window_component(lambda m: setattr(self, "message", m))
+            self.state, self.message = "done", ""
+        except FetchError as e:
+            self.state, self.message = "error", e.message
+        except Exception as e:  # never leave Settings waiting
+            self.state, self.message = "error", "The window component couldn’t be installed (%s)." % e.__class__.__name__
+
+
+WINDOW_SETUP = WindowSetup()
+
+
+def png_to_ico(png):
+    """An .ico that holds the PNG as it is (Windows Vista and later read these)."""
+    import struct
+    return struct.pack("<HHH", 0, 1, 1) + struct.pack("<BBBBHHII", 0, 0, 0, 0, 1, 32, len(png), 22) + png
+
+
+def run_window(server, url):
+    """Show Afterhours in its own window, using the system's web view. Returns when the window is closed."""
+    import webview
+    try:
+        webview.settings.update({"ALLOW_DOWNLOADS": True, "OPEN_EXTERNAL_LINKS_IN_BROWSER": True})
+    except Exception:
+        pass
+    store = DATA_DIR / "window-storage"
+    store.mkdir(parents=True, exist_ok=True)
+    icon = DATA_DIR / "icon.png"
+    try:
+        icon.write_bytes(ICON_PNG)
+        (DATA_DIR / "icon.ico").write_bytes(png_to_ico(ICON_PNG))
+    except OSError:
+        pass
+    if os.name == "nt":
+        try:
+            import ctypes  # its own taskbar button, not Python's
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("Afterhours")
+        except Exception:
+            pass
+    if sys.platform == "darwin":
+        try:
+            from AppKit import NSApplication, NSImage  # installed with pywebview on a Mac
+            app = NSApplication.sharedApplication()
+            app.setActivationPolicy_(0)  # a regular app with a Dock icon
+            image = NSImage.alloc().initWithContentsOfFile_(str(icon))
+            if image is not None:
+                app.setApplicationIconImage_(image)
+        except Exception:
+            pass
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    RUNNING["mode"] = "window"
+    win = webview.create_window("Afterhours", url + "?window=1", **supported(webview.create_window, {
+        "width": 1280, "height": 860, "min_size": (360, 560), "background_color": "#18181A", "text_select": True}))
+    WINDOW["win"] = win
+
+    def windows_icon():
+        try:
+            import clr  # noqa: F401  (pythonnet, installed with pywebview on Windows)
+            from System import Action
+            from System.Drawing import Icon
+            form = getattr(win, "native", None)
+            if form is not None:
+                form.Invoke(Action(lambda: setattr(form, "Icon", Icon(str(DATA_DIR / "icon.ico")))))
+        except Exception:
+            pass
+
+    if os.name == "nt":
+        try:
+            win.events.shown += windows_icon
+        except Exception:
+            pass
+    # private_mode=False keeps the library and settings between launches
+    webview.start(**supported(webview.start, {"private_mode": False, "storage_path": str(store), "icon": str(icon)}))
+    WINDOW.pop("win", None)
+    server.shutdown()
+
+
+def focus_running(port):
+    """Ask a copy that's already running to bring its window forward."""
+    try:
+        req = urllib.request.Request("http://127.0.0.1:%d/api/focus" % port, data=b"", method="POST", headers={"X-Afterhours": "1"})
+        with urllib.request.urlopen(req, timeout=3) as r:
+            return bool(json.loads(r.read().decode("utf-8")).get("focused"))
+    except Exception:
+        return False
+
+
+def setup_window_cli():
+    try:
+        python = install_window_component()
+    except FetchError as e:
+        print(e.message, file=sys.stderr)
+        return 1
+    print("\nDone. Afterhours now opens in its own window.%s" % ("" if python == sys.executable else
+          "\nIt uses its private environment: %s" % python))
+    return 0
 
 
 def clear_saved_captions():
@@ -1039,7 +1399,29 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # Refuse requests that arrive under another host name (guards against DNS rebinding).
         host = (self.headers.get("Host") or "").strip().lower()
         name = host.split("]")[0] + "]" if host.startswith("[") else host.split(":")[0]
+        if getattr(self.server, "lan", False):
+            return name == self.server.server_address[0]
         return name in ("127.0.0.1", "localhost", "[::1]")
+
+    def _lan_gate(self):
+        """Phones on the Wi-Fi need the private key: from the phone link once, then from a cookie."""
+        if not getattr(self.server, "lan", False):
+            return True
+        code = PHONE.code()
+        path, _, query = self.path.partition("?")
+        key = (urllib.parse.parse_qs(query).get("key") or [""])[0]
+        if key and secrets.compare_digest(key, code):
+            self.send_response(303)
+            self.send_header("Location", path or "/")
+            self.send_header("Set-Cookie", "ah_key=%s; Path=/; Max-Age=31536000; HttpOnly; SameSite=Lax" % code)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return False
+        m = re.search(r"(?:^|;\s*)ah_key=([0-9a-f]+)", self.headers.get("Cookie") or "")
+        if m and secrets.compare_digest(m.group(1), code):
+            return True
+        self._send(401, LAN_DENIED, "text/html; charset=utf-8")
+        return False
 
     def _send(self, code, body, ctype, extra=None, cache="no-store"):
         if isinstance(body, str):
@@ -1071,16 +1453,85 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # that header to this helper (the browser would ask first, and the helper never agrees).
         if not self._host_ok() or self.headers.get("X-Afterhours") != "1":
             return self._error(403, "Not allowed.")
+        if not self._lan_gate():
+            return
         try:
             length = int(self.headers.get("Content-Length") or 0)
         except ValueError:
             length = 0
-        if length:
-            self.rfile.read(min(length, 65536))
-        path = self.path.partition("?")[0]
+        body = self.rfile.read(min(length, 8 << 20)) if length > 0 else b""
+        path, _, query = self.path.partition("?")
+        params = urllib.parse.parse_qs(query)
+        lan = getattr(self.server, "lan", False)
+        if lan and path in ("/api/quit", "/api/prefs", "/api/phone", "/api/move", "/api/move/open", "/api/window/setup", "/api/window/switch", "/api/focus"):
+            return self._error(403, "Only the computer running Afterhours can change that.")
+        if path == "/api/move":
+            if not body or length > 8 << 20:
+                return self._error(413, "That’s too much to move at once.")
+            try:
+                data = json.loads(body.decode("utf-8"))
+            except ValueError:
+                data = None
+            if not isinstance(data, dict):
+                return self._error(400, "That isn’t a library.")
+            MOVE["data"], MOVE["at"] = {k: v for k, v in data.items() if isinstance(k, str) and k.startswith("ah.") and isinstance(v, str)}, time.time()
+            return self._json({"ok": True})
+        if path == "/api/move/open":
+            MOVE["data"] = None
+            if not os.environ.get("AFTERHOURS_NO_OPEN"):
+                webbrowser.open("http://127.0.0.1:%d/#/move" % self.server.server_address[1])
+            return self._json({"ok": True})
+        if path == "/api/window/setup":
+            return self._json(WINDOW_SETUP.start())
+        if path == "/api/window/switch":
+            python = window_python(refresh=True)
+            if not python:
+                return self._error(409, "The window component isn’t installed yet.")
+            try:
+                data = json.loads(body.decode("utf-8")) if body else {}
+            except ValueError:
+                data = {}
+            if isinstance(data, dict) and data:   # the browser's library goes with it
+                try:
+                    (DATA_DIR / "move.json").write_text(json.dumps({"at": time.time(), "data": {
+                        k: v for k, v in data.items() if isinstance(k, str) and k.startswith("ah.") and isinstance(v, str)}}), encoding="utf-8")
+                except OSError:
+                    pass
+            PREFS["window"] = True
+            save_prefs()
+            RESTART["python"] = python
+            threading.Timer(0.4, self.server.shutdown).start()
+            return self._json({"ok": True})
+        if path == "/api/focus":
+            win = WINDOW.get("win")
+            for name in ("restore", "show"):
+                try:
+                    getattr(win, name)()
+                except Exception:
+                    pass
+            return self._json({"focused": win is not None})
+        if path == "/api/prefs":
+            if "window" in params:
+                PREFS["window"] = params["window"][0] == "1"
+                save_prefs()
+            return self._json({"window": PREFS.get("window", True)})
+        if path == "/api/phone":
+            try:
+                if "renew" in params:
+                    PHONE.code(renew=True)
+                    return self._json(PHONE.info())
+                if params.get("on", [""])[0] == "1":
+                    return self._json(PHONE.start(self.server.server_address[1]))
+                return self._json(PHONE.stop())
+            except FetchError as e:
+                return self._error(e.code, e.message)
         if path == "/api/quit":
             self._json({"ok": True})
-            threading.Thread(target=self.server.shutdown, daemon=True).start()
+            win = WINDOW.get("win")
+            if win is not None:
+                threading.Timer(1.2, win.destroy).start()   # the window closes, and Afterhours stops after it
+            else:
+                threading.Thread(target=self.server.shutdown, daemon=True).start()
             return
         if path == "/api/captions/clear":
             return self._json({"removed": clear_saved_captions()})
@@ -1089,6 +1540,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         if not self._host_ok():
             return self._error(403, "Afterhours only answers on 127.0.0.1.")
+        if not self._lan_gate():
+            return
         path, _, query = self.path.partition("?")
         params = urllib.parse.parse_qs(query)
         arg = lambda name, default="": (params.get(name) or [default])[0].strip()
@@ -1096,7 +1549,25 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if path in ("/", "/index.html"):
                 return self._send(200, PAGE, "text/html; charset=utf-8", {"Content-Security-Policy": PAGE_CSP})
             if path == "/api/ping":
-                return self._json({"app": APP_ID, "name": APP_NAME, "version": VERSION})
+                return self._json({"app": APP_ID, "name": APP_NAME, "version": VERSION, "platform": sys.platform,
+                                   "client": "lan" if getattr(self.server, "lan", False) else "local"})
+            if path == "/manifest.webmanifest":
+                return self._send(200, MANIFEST, "application/manifest+json", cache="no-cache")
+            if path == "/icon.png":
+                return self._send(200, ICON_PNG, "image/png", cache="public, max-age=86400")
+            if path == "/sw.js":
+                return self._send(200, SERVICE_WORKER, "text/javascript; charset=utf-8", cache="no-cache")
+            if path == "/api/prefs":
+                return self._json({"window": PREFS.get("window", True), "native": bool(window_python()),
+                                   "running": RUNNING["mode"], "setup": WINDOW_SETUP.info()})
+            if path == "/api/phone":
+                return self._json(PHONE.info())
+            if path == "/api/move":
+                if getattr(self.server, "lan", False):
+                    return self._error(403, "Only the computer running Afterhours can change that.")
+                fresh = MOVE["data"] is not None and time.time() - MOVE["at"] < 600
+                data, MOVE["data"] = (MOVE["data"] if fresh else None), None if fresh else MOVE["data"]
+                return self._json({"data": data})
             if path == "/api/fetch":
                 data, ctype, final_url = fetch_url(arg("url"))
                 return self._send(200, data, ctype, {
@@ -1137,10 +1608,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
                 if not engine:
                     return self._error(501, "Caption recognition isn’t installed. Run: " + INSTALL_HINT)
-                url, model = arg("url"), arg("model", "base")
+                url, model, job_id = arg("url"), arg("model", "base"), arg("id")
                 if model not in MODELS:
                     model = "base"
-                if not url.startswith(("http://", "https://")):
+                if not job_id and not url.startswith(("http://", "https://")):
                     return self._error(400, "That episode has no audio address.")
                 if path == "/api/captions/start":
                     lang = arg("lang").lower()
@@ -1148,15 +1619,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         start = max(0.0, float(arg("start", "0")))
                     except ValueError:
                         start = 0.0
-                    return self._json(CAPTIONS.start(url, model, start, lang if re.fullmatch(r"[a-z]{2}", lang) else ""))
+                    return self._json(CAPTIONS.start(url, model, start, lang if re.fullmatch(r"[a-z]{2}", lang) else "", clean_opts(arg("opts")[:4000])))
                 if path == "/api/captions/status":
                     try:
                         since = max(0, int(arg("since", "0")))
                     except ValueError:
                         since = 0
-                    return self._json(CAPTIONS.status(url, model, since))
+                    return self._json(CAPTIONS.status(url, model, since, job_id))
                 if path == "/api/captions/cancel":
-                    return self._json(CAPTIONS.cancel(url, model))
+                    return self._json(CAPTIONS.cancel(url, model, job_id))
             if path == "/favicon.ico":
                 return self._send(204, b"", "image/x-icon")
             return self._error(404, "Not found.")
@@ -1193,6 +1664,13 @@ def setup_captions():
 
 
 def main():
+    if sys.stdout is None or sys.stderr is None:
+        try:
+            DATA_DIR.mkdir(parents=True, exist_ok=True)
+            log = open(DATA_DIR / "afterhours.log", "a", encoding="utf-8", buffering=1)
+            sys.stdout, sys.stderr = sys.stdout or log, sys.stderr or log
+        except OSError:
+            pass
     for stream in (sys.stdout, sys.stderr):
         try:
             stream.reconfigure(errors="replace")
@@ -1200,37 +1678,91 @@ def main():
             pass
     parser = argparse.ArgumentParser(description="Afterhours: a small, private podcast player.")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT, help="port to use (default %d)" % DEFAULT_PORT)
-    parser.add_argument("--no-browser", action="store_true", help="don't open the browser automatically")
+    parser.add_argument("--window", action="store_true", help="open in its own window (the default)")
+    parser.add_argument("--browser", action="store_true", help="open in a normal browser tab instead")
+    parser.add_argument("--no-browser", action="store_true", help="don't open anything")
     parser.add_argument("--setup-captions", action="store_true", help="install the caption recognition add-on, then exit")
+    parser.add_argument("--setup-window", action="store_true", help="install the window component (pywebview), then exit")
+    parser.add_argument("--restarted", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--verbose", action="store_true", help="log every request")
     args = parser.parse_args()
     if args.setup_captions:
         sys.exit(setup_captions())
+    if args.setup_window:
+        sys.exit(setup_window_cli())
     url = "http://127.0.0.1:%d/" % args.port
-    try:
-        server = Server(("127.0.0.1", args.port), Handler)
-    except OSError:
+    mode = "none" if args.no_browser else "browser" if args.browser else "window" if (args.window or PREFS.get("window", True)) else "browser"
+    if mode == "window" and not args.restarted and importlib.util.find_spec("webview") is None             and not already_running(args.port) and window_python():
+        # the window component lives in Afterhours' private environment: carry on there
+        argv = [window_python(), os.path.abspath(sys.argv[0])] + sys.argv[1:]
+        if os.name == "nt":
+            subprocess.Popen(argv, close_fds=True, creationflags=0x00000008 | 0x00000200)
+            return
+        os.execv(argv[0], argv)
+    server = None
+    for attempt in range(40 if args.restarted else 1):   # after a restart, wait for the old copy to let go of the port
+        try:
+            server = Server(("127.0.0.1", args.port), Handler)
+            break
+        except OSError:
+            if args.restarted:
+                time.sleep(0.25)
+    if server is None:
         if already_running(args.port):
             print("Afterhours is already running at %s" % url)
-            if not args.no_browser:
+            if mode == "window" and focus_running(args.port):
+                return
+            if mode != "none":
                 webbrowser.open(url)
             return
         print("Port %d is in use by another program. Try:  python3 afterhours.py --port %d\n"
               "Each port keeps its own library, so pick one and stick with it." % (args.port, args.port + 1), file=sys.stderr)
         sys.exit(1)
-    server.verbose = args.verbose
+    server.verbose, server.lan = args.verbose, False
+    try:   # a library on its way from the browser, saved by "Switch now"
+        moving = json.loads((DATA_DIR / "move.json").read_text(encoding="utf-8"))
+        (DATA_DIR / "move.json").unlink()
+        if time.time() - float(moving.get("at", 0)) < 600 and isinstance(moving.get("data"), dict):
+            MOVE["data"], MOVE["at"] = moving["data"], time.time()
+    except (OSError, ValueError, AttributeError):
+        pass
+    if PREFS.get("phone"):
+        try:
+            PHONE.start(args.port, remember=False)
+        except FetchError:
+            pass
     engine = caption_engine_name()
-    print("Afterhours %s is running at %s\n%s\nKeep this window open while you listen. To stop, press Ctrl+C or use Settings > Quit Afterhours."
+    native = mode == "window" and importlib.util.find_spec("webview") is not None
+    print("Afterhours %s is running at %s\n%s%s%s\nTo stop, close the Afterhours window, press Ctrl+C, or use Settings > Quit Afterhours."
           % (VERSION, url, "Caption recognition: on (%s)." % engine if engine else
-             "Caption recognition: off. To caption episodes that have none, run:  " + INSTALL_HINT))
-    if not args.no_browser:
-        threading.Timer(0.6, lambda: webbrowser.open(url)).start()
+             "Caption recognition: off. To caption episodes that have none, run:  " + INSTALL_HINT,
+             "" if native or mode != "window" else "\nTo open Afterhours in its own window instead of your browser, use Settings > Window, or run:  python3 afterhours.py --setup-window",
+             "\nPhones on your Wi-Fi can use: " + PHONE.info()["url"] if PHONE.server else ""))
     try:
-        server.serve_forever()
+        if native:
+            run_window(server, url)
+        else:
+            RUNNING["mode"] = "browser" if mode == "window" else mode
+            if RUNNING["mode"] == "browser":
+                threading.Timer(0.6, lambda: webbrowser.open(url)).start()
+            server.serve_forever()
     except KeyboardInterrupt:
-        print("\nStopped. Good night.")
+        pass
     finally:
         server.server_close()
+        PHONE.stop(remember=False)
+        print("\nStopped. Good night." if not RESTART else "\nOpening Afterhours in its own window…")
+    if RESTART:   # "Switch now": start again in the window, with the same Python that has the window component
+        python = RESTART["python"]
+        argv = [python, os.path.abspath(sys.argv[0]), "--port", str(args.port), "--window", "--restarted"]
+        if os.name == "nt":
+            quiet = os.path.join(os.path.dirname(python), "pythonw.exe")
+            if os.path.exists(quiet):
+                argv[0] = quiet
+            subprocess.Popen(argv, close_fds=True, creationflags=0x00000008 | 0x00000200)   # detached, its own process group
+            os._exit(0)
+        sys.stdout.flush()
+        os.execv(python, argv)
 
 
 PAGE = r'''<!DOCTYPE html>
@@ -1241,6 +1773,13 @@ PAGE = r'''<!DOCTYPE html>
 <meta name="color-scheme" content="light dark">
 <meta name="referrer" content="no-referrer">
 <title>Afterhours</title>
+<link rel="manifest" href="/manifest.webmanifest">
+<meta name="theme-color" content="#18181A">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Afterhours">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<link rel="apple-touch-icon" href="/icon.png">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0' y1='0' x2='0' y2='1'%3E%3Cstop offset='0' stop-color='%23FFC15E'/%3E%3Cstop offset='.6' stop-color='%23F26B7A'/%3E%3Cstop offset='1' stop-color='%23B2418F'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect width='64' height='64' rx='14' fill='%2321184F'/%3E%3Ccircle cx='32' cy='32' r='20' fill='url(%23g)'/%3E%3C/svg%3E">
 <style>
 :root {
@@ -1798,6 +2337,21 @@ html:not(.no-glow) :is(.side-shows a, .nav a, .side-tool, .side-switch, .set-row
 ::view-transition-old(root), ::view-transition-new(root) { animation-duration: 280ms; animation-timing-function: var(--ease-out); }
 ::view-transition-group(show-art) { animation-duration: 520ms; animation-timing-function: cubic-bezier(0.1, 0.9, 0.2, 1); }
 ::view-transition-old(show-art), ::view-transition-new(show-art) { height: 100%; mix-blend-mode: normal; }
+.sel, .num, .txt { height: 32px; padding: 0 10px; border: 0; border-radius: 8px; background: var(--fill); color: var(--text); font-size: 13.5px; outline: none; }
+.sel:focus-visible, .num:focus-visible, .txt:focus-visible { box-shadow: 0 0 0 3px var(--accent-soft); }
+.num { width: 96px; text-align: right; font-variant-numeric: tabular-nums; }
+.txt { width: min(340px, 100%); }
+.set-row > .sel, .set-row > .num, .set-row > .txt, .set-row > .set-actions { margin-left: auto; }
+.set-subhead { padding: 14px 16px 2px; border-top: 1px solid var(--sep); font-size: 12px; font-weight: 700; letter-spacing: .02em; color: var(--accent); }
+.set-card > .set-subhead:first-child { border-top: 0; }
+.set-subhead + .set-row { border-top: 0; }
+.set-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.pro-box .set-group { margin-top: 14px; }
+.phone-box { padding: 0 16px 16px; }
+.move-card { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 14px 24px; margin: 4px 0 28px; padding: 18px 20px; border-radius: 16px; background: var(--accent-soft); }
+.move-text h2 { margin: 0 0 4px; font-size: 17px; }
+.move-text p, .move-note { margin: 0; max-width: 62ch; font-size: 14.5px; color: var(--text-2); }
+.phone-link { display: block; margin: 8px 0 12px; padding: 10px 12px; border-radius: 10px; background: var(--fill); font: 13px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; user-select: all; overflow-wrap: anywhere; }
 html.no-motion *, html.no-motion *::before, html.no-motion *::after { animation: none !important; transition: none !important; scroll-behavior: auto !important; }
 </style>
 </head>
@@ -1876,8 +2430,8 @@ html.no-motion *, html.no-motion *::before, html.no-motion *::after { animation:
   <div class="bar-info">
     <button class="bar-art" id="barArt" type="button" aria-label="Open Now Playing"></button>
     <div class="bar-meta">
-      <button class="bar-title" id="barTitle" type="button" title="Open Now Playing"></button>
-      <a class="bar-show" id="barShow" href="#/library"></a>
+      <button class="bar-title" id="barTitle" type="button" translate="no" title="Open Now Playing"></button>
+      <a class="bar-show" id="barShow" translate="no" href="#/library"></a>
     </div>
   </div>
   <div class="bar-center">
@@ -1910,7 +2464,7 @@ html.no-motion *, html.no-motion *::before, html.no-motion *::after { animation:
   <div class="np-body">
     <div class="np-left">
       <div class="np-art" id="npArt"></div>
-      <div class="np-meta"><h2 class="np-title" id="npTitle"></h2><a class="np-show" id="npShow" href="#/library"></a></div>
+      <div class="np-meta"><h2 class="np-title" id="npTitle" translate="no"></h2><a class="np-show" id="npShow" translate="no" href="#/library"></a></div>
       <p class="np-caption" id="npCaption" aria-live="off"></p>
       <div class="np-scrub"><input class="seek" id="npSeek" type="range" min="0" max="1000" step="1" value="0" aria-label="Position in episode"><div class="np-times"><span id="npCur">0:00</span><span id="npLeft">-0:00</span></div></div>
       <div class="np-transport">
@@ -2017,6 +2571,337 @@ html.no-motion *, html.no-motion *::before, html.no-motion *::after { animation:
 </script>
 
 <script>
+/* Afterhours interface translations. Keys are the English text; values are [简体中文, 日本語].
+   Podcast titles, descriptions, captions and anything marked translate="no" are never changed. */
+(() => {
+'use strict';
+const T = {
+  // navigation and player
+  'Listen Now': ['现在收听', '今すぐ聴く'], 'Discover': ['发现', '見つける'], 'Library': ['资料库', 'ライブラリ'], 'Search': ['搜索', '検索'],
+  'Settings': ['设置', '設定'], 'Your shows': ['我的节目', 'マイ番組'], 'Main': ['主导航', 'メイン'], 'Sections': ['栏目', 'セクション'],
+  'Search or paste a link': ['搜索或粘贴链接', '検索、またはリンクを貼り付け'],
+  'Search podcasts, or paste a feed or Apple Podcasts link': ['搜索播客，或粘贴订阅源或 Apple 播客链接', 'ポッドキャストを検索、またはフィードか Apple Podcasts のリンクを貼り付け'],
+  'Auto captions': ['自动字幕', '自動字幕'], 'Afterhours, Listen Now': ['Afterhours，现在收听', 'Afterhours、今すぐ聴く'],
+  'Auto captions: caption episodes that have none, on this computer': ['自动字幕：在这台电脑上为没有字幕的单集生成字幕', '自動字幕：字幕のないエピソードに、このコンピュータで字幕を付けます'],
+  'Player': ['播放器', 'プレーヤー'], 'Now Playing': ['正在播放', '再生中'], 'Open Now Playing': ['打开“正在播放”', '再生中の画面を開く'],
+  'Back 15 seconds': ['后退 15 秒', '15秒戻る'], 'Forward 30 seconds': ['前进 30 秒', '30秒進む'],
+  'Back 15 seconds (←)': ['后退 15 秒 (←)', '15秒戻る (←)'], 'Forward 30 seconds (→)': ['前进 30 秒 (→)', '30秒進む (→)'],
+  'Play': ['播放', '再生'], 'Pause': ['暂停', '一時停止'], 'Play (Space)': ['播放（空格键）', '再生（スペース）'], 'Pause (Space)': ['暂停（空格键）', '一時停止（スペース）'],
+  'Position in episode': ['播放位置', '再生位置'], 'Playback speed': ['播放速度', '再生速度'], 'Playback speed ([ and ])': ['播放速度（[ 和 ]）', '再生速度（[ と ]）'],
+  'Captions': ['字幕', '字幕'], 'Captions (C)': ['字幕 (C)', '字幕 (C)'], 'Transcript': ['文字稿', '文字起こし'], 'Transcript (T)': ['文字稿 (T)', '文字起こし (T)'],
+  'Sleep timer': ['睡眠定时', 'スリープタイマー'], 'Sleep timer, off': ['睡眠定时：关闭', 'スリープタイマー：オフ'],
+  'Sleep timer, stops at the end of this episode': ['睡眠定时：本集结束时停止', 'スリープタイマー：このエピソードの終わりで停止'], 'Ep. end': ['集末', '終了時'],
+  'Mute': ['静音', 'ミュート'], 'Unmute': ['取消静音', 'ミュート解除'], 'Mute (M)': ['静音 (M)', 'ミュート (M)'], 'Volume': ['音量', '音量'],
+  'Close Now Playing': ['关闭“正在播放”', '再生中の画面を閉じる'], 'Play the next episode automatically': ['自动播放下一集', '次のエピソードを自動再生'],
+  'Autoplay next episode': ['自动播放下一集', '次のエピソードを自動再生'], 'Previous episode': ['上一集', '前のエピソード'], 'Next episode': ['下一集', '次のエピソード'],
+  'Previous episode (Shift+P)': ['上一集 (Shift+P)', '前のエピソード (Shift+P)'], 'Next episode (Shift+N)': ['下一集 (Shift+N)', '次のエピソード (Shift+N)'],
+  'About this episode': ['关于本集', 'このエピソードについて'], 'No notes for this episode.': ['本集没有简介。', 'このエピソードには説明がありません。'],
+  'Load a caption file': ['载入字幕文件', '字幕ファイルを読み込む'], 'Loading captions…': ['正在载入字幕…', '字幕を読み込み中…'], 'Reset': ['重置', 'リセット'], 'Topics': ['主题', 'トピック'],
+  // captions
+  'Getting ready to recognise speech…': ['正在准备语音识别…', '音声認識の準備中…'], 'Loading the speech model…': ['正在载入语音模型…', '音声モデルを読み込み中…'],
+  'Auto captions, made on this computer': ['自动字幕，在这台电脑上生成', '自動字幕（このコンピュータで作成）'], 'Auto captions, partly done': ['自动字幕，部分完成', '自動字幕（一部完了）'],
+  'Auto captions stopped': ['自动字幕已停止', '自動字幕を停止しました'], 'Caption recognition stopped.': ['字幕识别已停止。', '字幕の認識が停止しました。'],
+  'Stop': ['停止', '停止'], 'Continue': ['继续', '続ける'], 'Redo with more accuracy': ['用更高准确度重做', 'より高い精度でやり直す'],
+  'Recognising speech on this computer': ['正在这台电脑上识别语音', 'このコンピュータで音声を認識中'],
+  'Captions appear here as they’re ready, starting from where you are in the episode.': ['字幕会从你当前收听的位置开始，生成后逐步显示在这里。', '字幕は今聴いている位置から、できた順にここに表示されます。'],
+  'Caption any episode': ['为任意单集生成字幕', 'どのエピソードにも字幕を'],
+  'This episode has no captions. Afterhours can recognise the speech on your computer and caption it, privately and for free. To turn this on, quit Afterhours and run this once:': ['本集没有字幕。Afterhours 可以在你的电脑上识别语音并生成字幕，私密且免费。要开启此功能，请退出 Afterhours 并运行一次：', 'このエピソードには字幕がありません。Afterhours はコンピュータ上で音声を認識して字幕を付けられます（プライベートで無料）。有効にするには、Afterhours を終了して次を一度実行してください：'],
+  'Then start Afterhours again. If you’d rather not, switch auto captions off.': ['然后重新启动 Afterhours。如果不需要，可以关闭自动字幕。', 'その後 Afterhours をもう一度起動してください。不要なら自動字幕をオフにできます。'],
+  'No captions for this episode': ['本集没有字幕', 'このエピソードには字幕がありません'], 'No captions for this episode.': ['本集没有字幕。', 'このエピソードには字幕がありません。'],
+  'Auto captions are off, so episodes without captions aren’t captioned automatically.': ['自动字幕已关闭，没有字幕的单集不会自动生成字幕。', '自動字幕がオフのため、字幕のないエピソードには自動で字幕が付きません。'],
+  'Caption this episode': ['为本集生成字幕', 'このエピソードに字幕を付ける'], 'Captions couldn’t be made': ['无法生成字幕', '字幕を作成できませんでした'], 'Try again': ['重试', 'もう一度試す'],
+  'Captions stopped': ['字幕已停止', '字幕を停止しました'],
+  'This transcript isn’t timed. Open the transcript to read it.': ['这份文字稿没有时间轴。请打开文字稿阅读。', 'この文字起こしにはタイミング情報がありません。文字起こしを開いて読んでください。'],
+  'No captions for this episode. Open the transcript to turn on auto captions.': ['本集没有字幕。打开文字稿即可开启自动字幕。', 'このエピソードには字幕がありません。文字起こしを開くと自動字幕をオンにできます。'],
+  'This episode’s captions couldn’t be loaded.': ['无法载入本集字幕。', 'このエピソードの字幕を読み込めませんでした。'],
+  'Auto captions aren’t available on phones yet. Feed transcripts and caption files still work.': ['手机上暂不支持自动字幕。订阅源自带的文字稿和字幕文件仍可使用。', 'スマートフォンではまだ自動字幕を使えません。フィードの文字起こしと字幕ファイルは使えます。'],
+  // Listen Now
+  'Good morning': ['早上好', 'おはようございます'], 'Good afternoon': ['下午好', 'こんにちは'], 'Good evening': ['晚上好', 'こんばんは'], 'Up late': ['夜深了', '夜ふかしですね'],
+  'Up Next': ['接着听', '次に聴く'], 'Pick up where you left off.': ['从上次停下的地方继续。', '前回の続きから。'], 'Latest episodes': ['最新单集', '最新エピソード'],
+  'New from the shows on your shelf.': ['你节目架上的新单集。', 'あなたの番組の新着。'], 'Picked for you': ['为你精选', 'あなたへのおすすめ'],
+  'Related shows that sit well next to your shelf.': ['与你的节目架相得益彰的相关节目。', 'あなたの棚に合う関連番組。'], 'See all': ['查看全部', 'すべて表示'],
+  'Gathering the latest episodes…': ['正在收集最新单集…', '最新エピソードを集めています…'], 'No episodes yet. Open a show to load it.': ['还没有单集。打开一个节目即可载入。', 'まだエピソードがありません。番組を開くと読み込まれます。'],
+  'Setting up your shelf': ['正在布置你的节目架', '棚を準備しています'],
+  'Apple’s directory asked for a short pause. Carrying on in a moment…': ['Apple 的目录要求稍作暂停，马上继续…', 'Apple のディレクトリから少し待つよう求められました。まもなく再開します…'],
+  // episodes and shows
+  'Playing': ['播放中', '再生中'], 'Played': ['已播放', '再生済み'], 'Resume': ['继续播放', '続きから'], 'More': ['更多', 'もっと見る'], 'Less': ['收起', '閉じる'],
+  'Captions available': ['有字幕', '字幕あり'], 'Today': ['今天', '今日'], 'Episodes': ['单集', 'エピソード'], 'Newest first': ['最新在前', '新しい順'], 'Oldest first': ['最早在前', '古い順'],
+  'Latest episode': ['最新一集', '最新エピソード'], 'Check for new episodes': ['检查新单集', '新着を確認'], 'Change source': ['更换来源', 'ソースを変更'], 'Website': ['网站', 'ウェブサイト'],
+  'Remove from library': ['从资料库移除', 'ライブラリから削除'], 'Add to Library': ['添加到资料库', 'ライブラリに追加'], 'Preview': ['预览', 'プレビュー'], 'Your additions': ['我添加的', '自分で追加'],
+  'This show has no playable episodes.': ['这个节目没有可播放的单集。', 'この番組には再生できるエピソードがありません。'], 'Finding this show’s feed…': ['正在查找这个节目的订阅源…', 'この番組のフィードを探しています…'],
+  'Still loading. If the feed doesn’t answer, Afterhours will look for episodes on the show’s website.': ['仍在载入。如果订阅源没有回应，Afterhours 会去节目的网站上查找单集。', '読み込み中です。フィードが応答しない場合は、番組のウェブサイトでエピソードを探します。'],
+  'Afterhours couldn’t find this show’s feed in Apple’s directory or on its website.': ['Afterhours 在 Apple 目录和节目网站上都没找到这个节目的订阅源。', 'Apple のディレクトリでも番組のウェブサイトでも、この番組のフィードが見つかりませんでした。'],
+  'or': ['或', 'または'], 'search for it': ['搜索它', '検索する'],
+  'No working RSS feed, so these episodes come from the show’s website.': ['没有可用的 RSS 订阅源，所以这些单集来自节目的网站。', '使える RSS フィードがないため、エピソードは番組のウェブサイトから取得しています。'],
+  'Paste the show’s RSS feed or website': ['粘贴节目的 RSS 订阅源或网站', '番組の RSS フィードかウェブサイトを貼り付け'], 'RSS feed or website address': ['RSS 订阅源或网站地址', 'RSS フィードまたはウェブサイトのアドレス'],
+  'Use this source': ['使用这个来源', 'このソースを使う'],
+  'Afterhours reads the RSS feed. If there isn’t one, it looks through the website for episodes.': ['Afterhours 会读取 RSS 订阅源；如果没有，就在网站上查找单集。', 'Afterhours は RSS フィードを読み込みます。ない場合はウェブサイトからエピソードを探します。'],
+  'Checking that address. A website can take up to half a minute to look through…': ['正在检查这个地址。查找网站可能需要半分钟…', 'アドレスを確認中です。ウェブサイトの確認には30秒ほどかかることがあります…'],
+  'This show is up to date.': ['这个节目已是最新。', 'この番組は最新です。'], 'This show isn’t in your library': ['这个节目不在你的资料库里', 'この番組はライブラリにありません'],
+  'It may have been removed.': ['它可能已被移除。', '削除された可能性があります。'], 'Open Library': ['打开资料库', 'ライブラリを開く'],
+  // Library and Discover
+  'Paste a feed or Apple Podcasts link': ['粘贴订阅源或 Apple 播客链接', 'フィードか Apple Podcasts のリンクを貼り付け'], 'Add a show by link': ['通过链接添加节目', 'リンクから番組を追加'],
+  'Add': ['添加', '追加'], 'Your library is empty': ['你的资料库是空的', 'ライブラリは空です'],
+  'Find shows in Discover, or search by name.': ['去“发现”里找节目，或按名称搜索。', '「見つける」で番組を探すか、名前で検索してください。'], 'Open Discover': ['打开“发现”', '「見つける」を開く'],
+  'Not found automatically': ['未能自动找到', '自動では見つかりませんでした'], 'Finding feed…': ['正在查找订阅源…', 'フィードを探しています…'],
+  'City pop & anime songs': ['城市流行与动画歌曲', 'シティポップとアニソン'], 'Jazz, hip-hop & piano': ['爵士、嘻哈与钢琴', 'ジャズ、ヒップホップ、ピアノ'],
+  'Gadgets & latest tech': ['数码与前沿科技', 'ガジェットと最新テック'], 'Literature & light lit': ['文学与轻文学', '文学とライト文芸'], 'Mystery novels': ['推理小说', 'ミステリー小説'],
+  'Economics, physics & astronomy': ['经济、物理与天文', '経済・物理・天文'], 'Game industry': ['游戏行业', 'ゲーム業界'],
+  'city pop & anime songs': ['城市流行与动画歌曲', 'シティポップとアニソン'], 'jazz, hip-hop & piano': ['爵士、嘻哈与钢琴', 'ジャズ、ヒップホップ、ピアノ'],
+  'gadgets & latest tech': ['数码与前沿科技', 'ガジェットと最新テック'], 'literature & light lit': ['文学与轻文学', '文学とライト文芸'], 'mystery novels': ['推理小说', 'ミステリー小説'],
+  'economics, physics & astronomy': ['经济、物理与天文', '経済・物理・天文'], 'game industry': ['游戏行业', 'ゲーム業界'],
+  'City pop': ['城市流行', 'シティポップ'], 'Jazz & piano': ['爵士与钢琴', 'ジャズとピアノ'], 'Tech': ['科技', 'テック'], 'Books': ['书籍', '本'], 'Mystery': ['推理', 'ミステリー'],
+  'Knowledge': ['知识', '知識'], 'Games': ['游戏', 'ゲーム'], 'city pop': ['城市流行', 'シティポップ'], 'jazz & piano': ['爵士与钢琴', 'ジャズとピアノ'], 'tech': ['科技', 'テック'],
+  'books': ['书籍', '本'], 'mystery': ['推理', 'ミステリー'], 'knowledge': ['知识', '知識'], 'games': ['游戏', 'ゲーム'],
+  'Related shows, picked around what you love.': ['围绕你的喜好挑选的相关节目。', 'あなたの好みに合わせて選んだ関連番組。'], 'For you': ['为你推荐', 'おすすめ'],
+  'Made for your evenings': ['为你的夜晚而选', 'あなたの夜のために'], 'City pop, slow jazz, good books and big ideas': ['城市流行、慢爵士、好书与大问题', 'シティポップ、スロージャズ、良い本、大きなアイデア'],
+  'Related shows for everything on your shelf. Press + to add one, or open it to preview its episodes first.': ['为你节目架上的每个节目找来相关节目。按 + 添加，或先打开预览单集。', '棚の番組すべてに関連する番組です。＋で追加、または開いてエピソードをプレビューできます。'],
+  'From the interests you told me about.': ['根据你告诉我的兴趣。', '教えてもらった興味から。'], 'Hand-picked to sit next to your shelf.': ['精心挑选，与你的节目架相配。', 'あなたの棚に合わせて厳選。'],
+  'Already on your shelf': ['已在你的节目架上', 'すでに棚にあります'], 'Japanese picks': ['日语精选', '日本語のおすすめ'], 'Chinese picks': ['中文精选', '中国語のおすすめ'],
+  'From your poster': ['来自你的海报', 'ポスターから'], 'Shows you removed from your library.': ['你从资料库中移除的节目。', 'ライブラリから削除した番組。'],
+  'Nothing new here right now.': ['这里暂时没有新内容。', '今は新しいものがありません。'], 'In your library': ['已在资料库中', 'ライブラリにあります'], 'Add to library': ['添加到资料库', 'ライブラリに追加'],
+  'Shows, topics, or a feed link': ['节目、主题或订阅源链接', '番組、トピック、またはフィードのリンク'], 'Search podcasts': ['搜索播客', 'ポッドキャストを検索'], 'Try a topic': ['试试这些主题', 'トピックを試す'],
+  'No shows found. Try fewer words, or paste the feed link.': ['没有找到节目。试试少用几个词，或粘贴订阅源链接。', '番組が見つかりませんでした。言葉を減らすか、フィードのリンクを貼り付けてください。'],
+  // Settings
+  'Afterhours runs on this computer. Your library and settings stay in this browser.': ['Afterhours 在这台电脑上运行。你的资料库和设置保存在此浏览器中。', 'Afterhours はこのコンピュータで動作します。ライブラリと設定はこのブラウザに保存されます。'],
+  'Language': ['语言', '言語'], 'System': ['跟随系统', 'システム'],
+  'Choose the language for Afterhours. Podcast titles and descriptions stay as their publishers wrote them.': ['选择 Afterhours 的界面语言。播客标题和简介保持发布者的原文。', 'Afterhours の表示言語を選びます。番組名や説明は配信者が書いたままです。'],
+  'Show captions': ['显示字幕', '字幕を表示'], 'The current line above the player and in Now Playing.': ['在播放器上方和“正在播放”中显示当前这一句。', 'プレーヤーの上と再生中の画面に、今の一行を表示します。'],
+  'When an episode has no captions, recognise the speech on this computer and caption it.': ['单集没有字幕时，在这台电脑上识别语音并生成字幕。', '字幕のないエピソードは、このコンピュータで音声を認識して字幕を付けます。'],
+  'Recognition quality': ['识别质量', '認識の品質'],
+  'Captions come from OpenAI’s Whisper speech models, running on this computer. Fast uses Whisper base, Accurate uses Whisper small and Most accurate uses Whisper medium. Automatic picks base for English shows and small for Japanese and Chinese ones.': ['字幕由在这台电脑上运行的 OpenAI Whisper 语音模型生成。“快速”使用 Whisper base，“准确”使用 Whisper small，“最准确”使用 Whisper medium。“自动”会为英语节目选择 base，为日语和中文节目选择 small。', '字幕は、このコンピュータで動く OpenAI の Whisper 音声モデルが作ります。「高速」は Whisper base、「正確」は Whisper small、「最も正確」は Whisper medium を使います。「自動」は英語の番組に base、日本語と中国語の番組に small を選びます。'],
+  'Automatic': ['自动', '自動'], 'Fast': ['快速', '高速'], 'Accurate': ['准确', '正確'], 'Most accurate': ['最准确', '最も正確'],
+  'Caption recognition': ['字幕识别', '字幕の認識'], 'Checking…': ['正在检查…', '確認中…'], 'Ready.': ['已就绪。', '準備完了。'],
+  'Not set up yet. Quit Afterhours, run this once, then start it again:': ['尚未设置。请退出 Afterhours，运行一次以下命令，然后重新启动：', 'まだ設定されていません。Afterhours を終了し、次を一度実行してから再起動してください：'],
+  'Afterhours’ helper isn’t answering. Is afterhours.py still running?': ['Afterhours 的后台程序没有响应。afterhours.py 还在运行吗？', 'Afterhours のヘルパーが応答しません。afterhours.py は動いていますか？'],
+  'The player’s helper isn’t answering. Is afterhours.py still running?': ['Afterhours 的后台程序没有响应。afterhours.py 还在运行吗？', 'Afterhours のヘルパーが応答しません。afterhours.py は動いていますか？'],
+  'Saved auto captions': ['已保存的自动字幕', '保存済みの自動字幕'],
+  'Captions made on this computer are kept, so they load instantly next time.': ['在这台电脑上生成的字幕会被保存，下次可立即载入。', 'このコンピュータで作った字幕は保存され、次回はすぐ読み込まれます。'],
+  'Delete': ['删除', '削除'], 'Playback': ['播放', '再生'], 'Appearance': ['外观', '外観'],
+  'Follow your system, or always use light or dark.': ['跟随系统，或始终使用浅色或深色。', 'システムに合わせるか、常にライトまたはダークを使います。'], 'Light': ['浅色', 'ライト'], 'Dark': ['深色', 'ダーク'],
+  'Animations': ['动画效果', 'アニメーション'],
+  'Fluent-style motion: pages glide in, artwork flies into place, and controls respond as you press them.': ['Fluent 风格的动效：页面滑入、封面飞入到位、控件随按压回应。', 'Fluent スタイルの動き：ページがすべり込み、アートワークが飛んで収まり、押すと操作が反応します。'],
+  'Mouse halo': ['鼠标光晕', 'マウスの光彩'],
+  'The soft glow that follows your mouse over lists, menus and buttons.': ['鼠标移过列表、菜单和按钮时跟随的柔和光晕。', 'リストやメニュー、ボタンの上でマウスを追うやわらかな光。'],
+  'Look for missing shows again': ['重新查找缺失的节目', '見つからない番組をもう一度探す'], 'Every show on your shelf was found.': ['你节目架上的每个节目都已找到。', '棚の番組はすべて見つかりました。'],
+  'Look again': ['重新查找', 'もう一度探す'], 'Import OPML': ['导入 OPML', 'OPML を読み込む'], 'Add shows from another podcast app.': ['从其他播客应用添加节目。', 'ほかのポッドキャストアプリから番組を追加します。'],
+  'Import…': ['导入…', '読み込む…'], 'Export OPML': ['导出 OPML', 'OPML を書き出す'], 'Save your shows for another podcast app.': ['保存你的节目，供其他播客应用使用。', '番組をほかのアプリ用に保存します。'],
+  'Export': ['导出', '書き出す'], 'About': ['关于', 'このアプリについて'], 'Version': ['版本', 'バージョン'], 'Quit Afterhours': ['退出 Afterhours', 'Afterhours を終了'],
+  'Stops Afterhours on this computer. Open it again whenever you want to listen.': ['在这台电脑上停止 Afterhours。想听时再打开即可。', 'このコンピュータで Afterhours を停止します。聴きたいときにまた開いてください。'],
+  'Quit': ['退出', '終了'], 'Afterhours has stopped': ['Afterhours 已停止', 'Afterhours を停止しました'],
+  'You can close this tab. To listen again, open Afterhours.': ['你可以关闭这个页面。要再次收听，请打开 Afterhours。', 'この画面は閉じて構いません。また聴くときは Afterhours を開いてください。'],
+  'Window': ['窗口', 'ウィンドウ'], 'Open in its own window': ['在独立窗口中打开', '専用ウィンドウで開く'],
+  'Afterhours opens like an app, without tabs or an address bar. Closing the window quits it. Takes effect the next time you open Afterhours.': ['Afterhours 会像应用一样打开，没有标签页和地址栏；关闭窗口即退出。下次打开 Afterhours 时生效。', 'タブやアドレスバーのないアプリとして開き、ウィンドウを閉じると終了します。次に Afterhours を開いたときから有効です。'],
+  'Uses a native window.': ['使用原生窗口。', 'ネイティブのウィンドウを使います。'], 'your browser': ['你的浏览器', 'お使いのブラウザ'],
+  'Needs Microsoft Edge, Google Chrome or Chromium. Without one, Afterhours opens in your browser.': ['需要 Microsoft Edge、Google Chrome 或 Chromium。没有的话，Afterhours 会在浏览器中打开。', 'Microsoft Edge、Google Chrome、Chromium のいずれかが必要です。ない場合はブラウザで開きます。'],
+  'Phone': ['手机', 'スマートフォン'], 'Use on your phone': ['在手机上使用', 'スマートフォンで使う'],
+  'Let phones on the same Wi-Fi use Afterhours from this computer, with a private link.': ['让同一 Wi-Fi 下的手机通过私密链接使用这台电脑上的 Afterhours。', '同じ Wi-Fi のスマートフォンから、専用リンクでこのコンピュータの Afterhours を使えるようにします。'],
+  'Open this link on your phone, then add it to your home screen:': ['在手机上打开这个链接，然后添加到主屏幕：', 'スマートフォンでこのリンクを開き、ホーム画面に追加してください：'],
+  'Copy link': ['复制链接', 'リンクをコピー'], 'New link': ['新链接', '新しいリンク'], 'Link copied.': ['链接已复制。', 'リンクをコピーしました。'],
+  'Phone access on. Keep this computer awake while you listen.': ['已开启手机访问。收听时请让这台电脑保持唤醒。', 'スマートフォンからの利用をオンにしました。聴いている間はこのコンピュータをスリープさせないでください。'],
+  'Phone access off.': ['已关闭手机访问。', 'スマートフォンからの利用をオフにしました。'],
+  'The old link no longer works. Use the new one on your phones.': ['旧链接已失效，请在手机上使用新链接。', '古いリンクは使えなくなりました。新しいリンクを使ってください。'],
+  'This computer doesn’t seem to be on a network your phone can reach.': ['这台电脑似乎不在手机可以访问的网络上。', 'このコンピュータはスマートフォンからつながるネットワークにないようです。'],
+  'Only the computer running Afterhours can change that.': ['只有运行 Afterhours 的电脑才能更改此项。', 'これは Afterhours を動かしているコンピュータでのみ変更できます。'],
+  // pro mode
+  'Pro mode': ['专业模式', 'プロモード'], 'Fine-tune the speech recognition: model, language, hardware and decoding.': ['精细调整语音识别：模型、语言、硬件与解码。', '音声認識を細かく調整します：モデル、言語、ハードウェア、デコード。'],
+  'Model': ['模型', 'モデル'], 'Hardware': ['硬件', 'ハードウェア'], 'Decoding': ['解码', 'デコード'], 'Silence and filtering': ['静音与过滤', '無音とフィルター'],
+  'Caption lines': ['字幕行', '字幕の行'], 'Vocabulary': ['词汇', '語彙'],
+  'Bigger models are more accurate and slower. “.en” models are English-only. large-v3-turbo needs faster-whisper 1.1 or later.': ['模型越大越准确，也越慢。“.en”模型只支持英语。large-v3-turbo 需要 faster-whisper 1.1 或更新版本。', '大きいモデルほど正確ですが遅くなります。「.en」モデルは英語専用です。large-v3-turbo には faster-whisper 1.1 以降が必要です。'],
+  'Spoken language': ['口语语言', '話されている言語'], 'Automatic detects it from the episode.': ['“自动”会从单集中检测。', '「自動」はエピソードから判定します。'],
+  'Translate into English': ['翻译成英语', '英語に翻訳'], 'Write the captions in English, whatever language is spoken.': ['无论说的是什么语言，字幕都用英语写出。', '話されている言語にかかわらず、字幕を英語で書きます。'],
+  'Run on': ['运行于', '実行する場所'], 'Automatic uses a supported NVIDIA graphics card when there is one.': ['“自动”会在有兼容的 NVIDIA 显卡时使用它。', '「自動」は対応する NVIDIA のグラフィックカードがあれば使います。'],
+  'Processor': ['处理器', 'プロセッサ'], 'Graphics card': ['显卡', 'グラフィックカード'], 'Precision': ['精度', '精度'],
+  'Lower precision is faster and uses less memory.': ['精度越低越快，占用内存也越少。', '精度を下げると速く、メモリも少なくて済みます。'],
+  'Processor threads': ['处理器线程', 'プロセッサのスレッド数'], '0 lets Afterhours decide.': ['0 表示由 Afterhours 决定。', '0 にすると Afterhours が決めます。'],
+  'Beam size': ['束搜索宽度', 'ビームサイズ'], 'How many guesses Whisper weighs at once. 1 is fastest; 5 is more careful.': ['Whisper 同时权衡的候选数量。1 最快；5 更仔细。', 'Whisper が同時に比べる候補の数。1 が最速、5 はより慎重です。'],
+  'Temperature': ['温度', '温度'], 'Above 0 adds variety. Keep it at 0 for steady results.': ['大于 0 会增加变化。保持 0 可获得稳定结果。', '0 より大きいと多様になります。安定させるなら 0 のままに。'],
+  'Use previous text': ['利用前文', '直前の文を使う'], 'Lets Whisper use what it just heard as context. Smoother, but it can repeat itself.': ['让 Whisper 把刚听到的内容作为上下文。更流畅，但可能重复。', '直前に聞いた内容を文脈として使います。なめらかになりますが、繰り返すことがあります。'],
+  'Skip silence': ['跳过静音', '無音をスキップ'], 'Finds speech first, so music and silence are skipped.': ['先检测语音，跳过音乐和静音。', '先に音声を見つけ、音楽や無音を飛ばします。'],
+  'Speech threshold': ['语音阈值', '音声のしきい値'], 'Higher means only clear speech counts.': ['越高，只有清晰的语音才算数。', '高いほど、はっきりした声だけを音声とみなします。'],
+  'Shortest silence (ms)': ['最短静音（毫秒）', '最短の無音（ミリ秒）'], 'Pauses shorter than this don’t split speech.': ['短于此的停顿不会切分语音。', 'これより短い間では音声を区切りません。'],
+  'No-speech threshold': ['无语音阈值', '無音判定のしきい値'], 'How sure Whisper must be that a stretch has no speech before skipping it.': ['Whisper 判定一段没有语音并跳过之前需要的把握程度。', '区間に音声がないと判断して飛ばすための確信度。'],
+  'Repetition limit': ['重复上限', '繰り返しの上限'], 'Lines that compress more than this are treated as mistakes and retried.': ['压缩率高于此值的句子会被视为错误并重试。', 'これより圧縮率が高い行は誤りとみなして再試行します。'],
+  'Confidence floor': ['置信度下限', '確信度の下限'], 'Lines less confident than this are retried.': ['置信度低于此值的句子会重试。', 'これより確信度の低い行は再試行します。'],
+  'Word timing': ['逐词时间', '単語ごとのタイミング'], 'Splits captions into short lines using the timing of each word.': ['利用每个词的时间把字幕切成短句。', '単語ごとのタイミングで字幕を短い行に分けます。'],
+  'Longest line (characters)': ['最长一行（字符）', '1行の最大文字数'], 'Longest line (seconds)': ['最长一行（秒）', '1行の最大秒数'],
+  'Vocabulary hint': ['词汇提示', '語彙のヒント'], 'Names and words to expect, such as hosts, guests or places.': ['可能出现的名字和词，比如主持人、嘉宾或地名。', '出てきそうな名前や言葉（ホスト、ゲスト、地名など）。'],
+  'e.g. Agatha Christie, Hercule Poirot': ['例如：阿加莎·克里斯蒂、赫尔克里·波洛', '例：アガサ・クリスティー、エルキュール・ポアロ'],
+  'Hotwords': ['热词', 'ホットワード'], 'Words Whisper should listen out for. Needs faster-whisper 1.0 or later.': ['让 Whisper 特别留意的词。需要 faster-whisper 1.0 或更新版本。', 'Whisper に特に注意して聞き取ってほしい言葉。faster-whisper 1.0 以降が必要です。'],
+  'Re-caption this episode': ['重新生成本集字幕', 'このエピソードの字幕を作り直す'], 'Reset to defaults': ['恢复默认', '初期設定に戻す'],
+  'Pro settings reset.': ['已恢复专业模式的默认设置。', 'プロモードの設定を初期状態に戻しました。'], 'Start an episode first.': ['请先开始播放一集。', '先にエピソードを再生してください。'],
+  'Pro settings apply to the next captions Afterhours makes.': ['专业设置会用于 Afterhours 接下来生成的字幕。', 'プロモードの設定は、次に作る字幕から使われます。'],
+  // toasts and messages
+  'Captions on.': ['字幕已开启。', '字幕をオンにしました。'], 'Captions off.': ['字幕已关闭。', '字幕をオフにしました。'], 'Sleep timer off.': ['睡眠定时已关闭。', 'スリープタイマーをオフにしました。'],
+  'Sleep timer: at the end of this episode.': ['睡眠定时：本集结束时。', 'スリープタイマー：このエピソードの終わり。'],
+  'Sleep timer paused playback. Good night.': ['睡眠定时已暂停播放。晚安。', 'スリープタイマーで一時停止しました。おやすみなさい。'],
+  'Sleep timer stopped at the end of the episode. Good night.': ['睡眠定时在本集结束时停止。晚安。', 'エピソードの終わりで停止しました。おやすみなさい。'],
+  'The next episode will play automatically.': ['将自动播放下一集。', '次のエピソードを自動再生します。'], 'Autoplay off.': ['已关闭自动播放。', '自動再生をオフにしました。'],
+  'Animations on.': ['动画效果已开启。', 'アニメーションをオンにしました。'], 'Animations off.': ['动画效果已关闭。', 'アニメーションをオフにしました。'],
+  'Mouse halo on.': ['鼠标光晕已开启。', 'マウスの光彩をオンにしました。'], 'Mouse halo off.': ['鼠标光晕已关闭。', 'マウスの光彩をオフにしました。'],
+  'Auto captions off. Episodes without captions won’t be captioned automatically.': ['自动字幕已关闭。没有字幕的单集不会自动生成字幕。', '自動字幕をオフにしました。字幕のないエピソードに自動で字幕は付きません。'],
+  'Auto captions on. Episodes without captions will be captioned on this computer.': ['自动字幕已开启。没有字幕的单集会在这台电脑上生成字幕。', '自動字幕をオンにしました。字幕のないエピソードはこのコンピュータで字幕が付きます。'],
+  'Press play to start listening.': ['按播放开始收听。', '再生を押して聴き始めましょう。'], 'This episode couldn’t start. Try again in a moment.': ['本集无法开始播放，请稍后再试。', 'このエピソードを開始できませんでした。少し待ってからもう一度お試しください。'],
+  'This episode’s audio couldn’t be played. The link may have changed, so try refreshing the show.': ['无法播放本集音频。链接可能已变更，请尝试刷新节目。', 'このエピソードの音声を再生できませんでした。リンクが変わった可能性があるので、番組を更新してみてください。'],
+  'That’s the last episode in this list.': ['这是列表中的最后一集。', 'このリストの最後のエピソードです。'], 'That’s the first episode in this list.': ['这是列表中的第一集。', 'このリストの最初のエピソードです。'],
+  'Loading that link…': ['正在载入链接…', 'リンクを読み込み中…'], 'That isn’t a feed, so Afterhours is looking through the page for episodes…': ['这不是订阅源，Afterhours 正在页面中查找单集…', 'フィードではないので、ページからエピソードを探しています…'],
+  'There’s nothing to export yet.': ['还没有可导出的内容。', '書き出すものがまだありません。'], 'That file isn’t valid OPML.': ['这不是有效的 OPML 文件。', '有効な OPML ファイルではありません。'],
+  'No new shows in that file.': ['这个文件中没有新节目。', 'このファイルに新しい番組はありません。'], 'That file has no timed captions I can read.': ['这个文件里没有可读取的带时间字幕。', 'このファイルには読み取れる字幕がありません。'],
+  'Start an episode first, then load its caption file.': ['请先开始播放一集，再载入它的字幕文件。', '先にエピソードを再生してから字幕ファイルを読み込んでください。'],
+  'Saved auto captions deleted.': ['已删除保存的自动字幕。', '保存済みの自動字幕を削除しました。'], 'Nothing is missing.': ['没有缺失的节目。', '見つからない番組はありません。'],
+  'Delete the auto captions saved on this computer? They’ll be made again when you next play those episodes.': ['要删除这台电脑上保存的自动字幕吗？下次播放这些单集时会重新生成。', 'このコンピュータに保存した自動字幕を削除しますか？次にそのエピソードを再生するときにもう一度作られます。'],
+  'Quit Afterhours? Playback stops, and you can open Afterhours again any time.': ['要退出 Afterhours 吗？播放会停止，你可以随时再打开。', 'Afterhours を終了しますか？再生は止まりますが、いつでもまた開けます。'],
+  'The site took too long to answer.': ['网站响应超时。', 'サイトの応答に時間がかかりすぎました。'], 'That link doesn’t look like a podcast feed.': ['这个链接看起来不是播客订阅源。', 'このリンクはポッドキャストのフィードではないようです。'],
+  'No episodes were found at that address.': ['在这个地址没有找到单集。', 'このアドレスでエピソードが見つかりませんでした。'], 'This feed has no playable episodes.': ['这个订阅源没有可播放的单集。', 'このフィードには再生できるエピソードがありません。'],
+  'Apple’s podcast directory asked Afterhours to slow down. Try again in a minute.': ['Apple 播客目录要求 Afterhours 放慢速度，请一分钟后再试。', 'Apple のポッドキャストディレクトリから速度を落とすよう求められました。1分後にもう一度お試しください。'],
+  'Apple doesn’t list a public feed for that show.': ['Apple 没有列出这个节目的公开订阅源。', 'Apple にはこの番組の公開フィードがありません。'],
+  'Moving your library': ['正在搬移你的资料库', 'ライブラリを移動しています'],
+  'Sending your shows, progress and settings to the Afterhours window…': ['正在把你的节目、进度和设置发送到 Afterhours 窗口…', '番組、再生位置、設定を Afterhours のウィンドウに送っています…'],
+  'Done. Your library is in the Afterhours window now, so you can close this tab.': ['完成。你的资料库已经在 Afterhours 窗口里了，可以关闭这个标签页。', '完了しました。ライブラリは Afterhours のウィンドウに移りました。このタブは閉じて構いません。'],
+  'Used Afterhours in your browser before?': ['以前在浏览器里用过 Afterhours？', '以前ブラウザで Afterhours を使っていましたか？'],
+  'Bring your shows, listening progress and settings into this window. Your browser opens for a moment to hand them over.': ['把你的节目、收听进度和设置带到这个窗口。浏览器会短暂打开来转交它们。', '番組、再生位置、設定をこのウィンドウに移せます。受け渡しのため、ブラウザが少しだけ開きます。'],
+  'Bring them over': ['搬过来', '移動する'], 'Not now': ['以后再说', '今はしない'],
+  'Opening your browser to collect your library…': ['正在打开浏览器以取回你的资料库…', 'ライブラリを受け取るためにブラウザを開いています…'],
+  'Your library is here.': ['你的资料库已经搬过来了。', 'ライブラリを移動しました。'],
+  'Nothing arrived from your browser. Try again, or use Export and Import OPML.': ['没有收到浏览器发来的内容。请重试，或使用导出和导入 OPML。', 'ブラウザから何も届きませんでした。もう一度試すか、OPML の書き出しと読み込みを使ってください。'],
+  'Bring over your library': ['搬入资料库', 'ライブラリを移す'],
+  'Copy your shows, progress and settings from the browser you used before.': ['从你以前使用的浏览器复制节目、进度和设置。', '以前使っていたブラウザから番組、再生位置、設定をコピーします。'],
+  'Bring over': ['搬入', '移す'],
+  'That’s too much to move at once.': ['一次要搬的内容太多了。', '一度に移すには多すぎます。'], 'That isn’t a library.': ['这不是资料库。', 'これはライブラリではありません。'],
+  'Afterhours is its own app here, using the web view built into your system. No browser is involved, and closing the window quits Afterhours.': ['Afterhours 在这里作为独立应用运行，使用系统内置的网页视图，不经过任何浏览器；关闭窗口即退出 Afterhours。', 'Afterhours はここでは単独のアプリとして、システム内蔵の Web ビューで動いています。ブラウザは使わず、ウィンドウを閉じると終了します。'],
+  'The window component is installed. Switch now, or Afterhours opens in its own window the next time you start it.': ['窗口组件已安装。可以现在切换，或者下次启动时 Afterhours 会在独立窗口中打开。', 'ウィンドウ部品はインストール済みです。今すぐ切り替えるか、次回の起動時から専用ウィンドウで開きます。'],
+  'Switch now': ['现在切换', '今すぐ切り替える'], 'Install': ['安装', 'インストール'], 'Set it up': ['开始设置', '設定する'],
+  'Installing the window component…': ['正在安装窗口组件…', 'ウィンドウ部品をインストールしています…'],
+  'Making a private Python environment for Afterhours…': ['正在为 Afterhours 创建专用的 Python 环境…', 'Afterhours 専用の Python 環境を作っています…'],
+  'Afterhours can run as its own app instead of in your browser, using the web view built into your system. It needs a small window component, installed once.': ['Afterhours 可以使用系统内置的网页视图，作为独立应用运行，而不是在浏览器里。这需要安装一次小小的窗口组件。', 'Afterhours はブラウザではなく、システム内蔵の Web ビューを使った単独のアプリとして動かせます。小さなウィンドウ部品を一度だけインストールします。'],
+  'The window component couldn’t be installed. Check your internet connection, then try again.': ['无法安装窗口组件。请检查网络连接后重试。', 'ウィンドウ部品をインストールできませんでした。インターネット接続を確認して、もう一度お試しください。'],
+  'Couldn’t make a private Python environment. Run: python3 afterhours.py --setup-window': ['无法创建专用的 Python 环境。请运行：python3 afterhours.py --setup-window', '専用の Python 環境を作れませんでした。次を実行してください：python3 afterhours.py --setup-window'],
+  'The window component isn’t installed yet.': ['窗口组件还没有安装。', 'ウィンドウ部品はまだインストールされていません。'],
+  'Afterhours is opening in its own window': ['Afterhours 正在独立窗口中打开', 'Afterhours を専用ウィンドウで開いています'],
+  'Your library goes with it. You can close this tab.': ['你的资料库也会一起带过去。你可以关闭这个标签页。', 'ライブラリも一緒に移ります。このタブは閉じて構いません。'],
+  'Make Afterhours its own app': ['让 Afterhours 成为独立应用', 'Afterhours を単独のアプリに'],
+  'Run it in its own window, without a browser. Afterhours installs a small window component once.': ['在独立窗口中运行，无需浏览器。Afterhours 只需安装一次小小的窗口组件。', 'ブラウザを使わず専用ウィンドウで動かせます。小さなウィンドウ部品を一度だけインストールします。'],
+  'Afterhours runs on this computer, and your library and settings stay on it.': ['Afterhours 在这台电脑上运行，你的资料库和设置都保存在这里。', 'Afterhours はこのコンピュータで動作し、ライブラリと設定もここに保存されます。']
+};
+// Sentences with names or numbers in them. $1, $2… are filled in (and translated where possible).
+const P = [
+  [/^(Good morning|Good afternoon|Good evening|Up late)\. Here’s what’s new on your shelf\.$/, '$1。这是你的节目架上的新内容。', '$1。あなたの棚の新着です。'],
+  [/^Finding the (\d+) shows from your poster\. (\d+) of (\d+) ready\. Apple’s directory is queried gently, so this takes about a minute the first time\.$/, '正在查找海报上的 $1 个节目，已就绪 $2/$3。为了不打扰 Apple 的目录，首次大约需要一分钟。', 'ポスターの $1 番組を探しています（$2/$3 完了）。Apple のディレクトリに負担をかけないよう、初回は1分ほどかかります。'],
+  [/^Checking (\d+) shows for new episodes…$/, '正在检查 $1 个节目的新单集…', '$1 番組の新着を確認中…'],
+  [/^Checking for new episodes… (\d+) of (\d+)$/, '正在检查新单集… $1/$2', '新着を確認中… $1/$2'],
+  [/^(\d+) of (\d+)$/, '$1/$2', '$1/$2'],
+  [/^Downloading the episode for captions… (\d+)%$/, '正在下载本集用于生成字幕… $1%', '字幕作成のためにエピソードをダウンロード中… $1%'],
+  [/^Loading the (.+) speech model\. The first time, it downloads once \(about (.+)\)\.$/, '正在载入 $1 语音模型。首次使用时会下载一次（约 $2）。', '$1 音声モデルを読み込み中です。初回のみダウンロードします（約 $2）。'],
+  [/^Auto captions: recognising speech, (\d+)% done$/, '自动字幕：正在识别语音，已完成 $1%', '自動字幕：音声を認識中（$1% 完了）'],
+  [/^Scroll (.+) left$/, '向左滚动“$1”', '「$1」を左へスクロール'],
+  [/^Scroll (.+) right$/, '向右滚动“$1”', '「$1」を右へスクロール'],
+  [/^(\d.*) left$/, '剩余 $1', '残り $1'],
+  [/^Sleep timer, (\d+) minutes left$/, '睡眠定时：还剩 $1 分钟', 'スリープタイマー：残り$1分'],
+  [/^(\d+) min$/, '$1 分钟', '$1分'],
+  [/^Episode (\d+)$/, '第 $1 集', '第$1回'],
+  [/^Show more episodes \((\d+)\)$/, '显示更多单集（$1）', 'さらにエピソードを表示（$1）'],
+  [/^Play (.+) again$/, '再次播放“$1”', '「$1」をもう一度再生'],
+  [/^Resume (.+)$/, '继续播放“$1”', '「$1」を続きから再生'],
+  [/^Pause (.+)$/, '暂停“$1”', '「$1」を一時停止'],
+  [/^Play (.+)$/, '播放“$1”', '「$1」を再生'],
+  [/^Couldn’t load episodes\. (.+)$/, '无法载入单集。$1', 'エピソードを読み込めませんでした。$1'],
+  [/^Couldn’t refresh\. (.+)$/, '无法刷新。$1', '更新できませんでした。$1'],
+  [/^(.+) now has (\d+) episodes\.$/, '“$1”现在有 $2 集。', '「$1」は $2 エピソードになりました。'],
+  [/^(\d+) shows$/, '$1 个节目', '$1 番組'],
+  [/^Because you listen to (.+)$/, '因为你在听“$1”', '「$1」を聴いているあなたへ'],
+  [/^Because you like (.+)$/, '因为你喜欢$1', '$1が好きなあなたへ'],
+  [/^More about (.+)\.$/, '更多关于“$1”的节目。', '「$1」についてもっと。'],
+  [/^More (.+)$/, '更多$1', 'もっと：$1'],
+  [/^Shows about “(.+)”$/, '关于“$1”的节目', '「$1」の番組'],
+  [/^Results for “(.+)”$/, '“$1”的搜索结果', '「$1」の検索結果'],
+  [/^Open (.+)$/, '打开“$1”', '「$1」を開く'],
+  [/^Add (.+) to your library$/, '将“$1”添加到资料库', '「$1」をライブラリに追加'],
+  [/^(.+) is in your library$/, '“$1”已在资料库中', '「$1」はライブラリにあります'],
+  [/^Couldn’t find a public feed for (.+)\.$/, '找不到“$1”的公开订阅源。', '「$1」の公開フィードが見つかりませんでした。'],
+  [/^(\d+) shows? couldn’t be found automatically\.$/, '有 $1 个节目未能自动找到。', '$1 番組が自動では見つかりませんでした。'],
+  [/^Looking for (\d+) shows? again…$/, '正在重新查找 $1 个节目…', '$1 番組をもう一度探しています…'],
+  [/^Speed (.+)$/, '速度 $1', '速度 $1'],
+  [/^Sleep timer: (\d+) minutes\.$/, '睡眠定时：$1 分钟。', 'スリープタイマー：$1分。'],
+  [/^Auto captions need a one-time setup\. Quit Afterhours and run: (.+)$/, '自动字幕需要一次性设置。请退出 Afterhours 并运行：$1', '自動字幕には一度だけ設定が必要です。Afterhours を終了して次を実行してください：$1'],
+  [/^Couldn’t add that show\. (.+)$/, '无法添加这个节目。$1', 'この番組を追加できませんでした。$1'],
+  [/^Added (.+) to your library\.$/, '已将“$1”添加到资料库。', '「$1」をライブラリに追加しました。'],
+  [/^Removed (.+)\.$/, '已移除“$1”。', '「$1」を削除しました。'],
+  [/^Remove “(.+)” from your library\?$/, '要从资料库移除“$1”吗？', '「$1」をライブラリから削除しますか？'],
+  [/^Imported (\d+) shows\.$/, '已导入 $1 个节目。', '$1 番組を読み込みました。'],
+  [/^Loaded captions from (.+)\.$/, '已从 $1 载入字幕。', '$1 から字幕を読み込みました。'],
+  [/^(.+): the feed didn’t work, so episodes now come from the show’s website\.$/, '“$1”：订阅源无法使用，单集现在来自节目的网站。', '「$1」：フィードが使えないため、番組のウェブサイトから取得しています。'],
+  [/^(.+): switched to a working feed\.$/, '“$1”：已切换到可用的订阅源。', '「$1」：使えるフィードに切り替えました。'],
+  [/^(.+) Afterhours also looked on the show’s website and found no episodes\.$/, '$1 Afterhours 也查看了节目的网站，但没有找到单集。', '$1 番組のウェブサイトも確認しましたが、エピソードは見つかりませんでした。'],
+  [/^The site answered with an error \((\d+)\)\.$/, '网站返回了错误（$1）。', 'サイトがエラーを返しました（$1）。'],
+  [/^Couldn['’]t reach the site \((.+)\)\.$/, '无法连接到网站（$1）。', 'サイトに接続できませんでした（$1）。'],
+  [/^The window component couldn’t be installed \((.+)\)\.$/, '无法安装窗口组件（$1）。', 'ウィンドウ部品をインストールできませんでした（$1）。'],
+  [/^Afterhours (\d[\d.]*)$/, 'Afterhours $1', 'Afterhours $1']
+];
+const IDX = { 'zh-Hans': 0, ja: 1 };
+const ATTRS = ['placeholder', 'aria-label', 'title'];
+const ORIG = new WeakMap(), ATTR = new WeakMap();
+let lang = 'en', idx = -1, observer = null;
+
+function tr(text, depth) {
+  depth = depth || 0;
+  if (idx < 0 || text == null) return text;
+  const s = String(text), k = s.trim();
+  if (!k || !/[A-Za-z]/.test(k)) return s;
+  let out = T[k] ? T[k][idx] : null;
+  if (out == null && depth < 3) {
+    for (const p of P) {
+      const m = k.match(p[0]);
+      if (m) { out = p[idx + 1].replace(/\$(\d)/g, (_, n) => tr(m[+n] || '', depth + 1)); break; }
+    }
+  }
+  return out == null ? s : s.replace(k, out);
+}
+function doText(n) {
+  if (!ORIG.has(n)) { if (idx < 0) return; ORIG.set(n, n.nodeValue); }
+  const base = ORIG.get(n), want = idx < 0 ? base : tr(base);
+  if (n.nodeValue !== want) n.nodeValue = want;
+}
+function doAttrs(el) {
+  let rec = ATTR.get(el);
+  for (const a of ATTRS) {
+    if (!el.hasAttribute(a)) continue;
+    const cur = el.getAttribute(a);
+    if (!rec) { if (idx < 0) return; rec = {}; ATTR.set(el, rec); }
+    const r = rec[a], base = r && cur === r[1] ? r[0] : cur, want = idx < 0 ? base : tr(base);
+    rec[a] = [base, want];
+    if (cur !== want) el.setAttribute(a, want);
+  }
+}
+const SKIP = /^(SCRIPT|STYLE|CODE|TEXTAREA)$/;
+const skipped = el => !!(el && el.closest && el.closest('[translate="no"], script, style, code, textarea'));
+function walk(root) {
+  if (root.nodeType === 3) { if (!skipped(root.parentElement)) doText(root); return; }
+  if (root.nodeType !== 1 || skipped(root)) return;
+  doAttrs(root);
+  const w = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT, {
+    acceptNode: n => n.nodeType === 1 && (n.getAttribute('translate') === 'no' || SKIP.test(n.tagName)) ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT });
+  let n;
+  while ((n = w.nextNode())) { if (n.nodeType === 3) doText(n); else doAttrs(n); }
+}
+function onMutations(list) {
+  for (const m of list) {
+    if (m.type === 'attributes') { if (!skipped(m.target)) doAttrs(m.target); }
+    else for (const n of m.addedNodes) walk(n);
+  }
+}
+function setLang(code) {
+  lang = code;
+  idx = code in IDX ? IDX[code] : -1;
+  walk(document.body);
+  if (idx >= 0 && !observer) {
+    observer = new MutationObserver(onMutations);
+    observer.observe(document.body, { subtree: true, childList: true, attributes: true, attributeFilter: ATTRS });
+  } else if (idx < 0 && observer) { observer.disconnect(); observer = null; }
+}
+window.AHI18N = { tr, setLang, get lang() { return lang; }, keys: () => Object.keys(T) };
+})();
+</script>
+<script>
 (() => {
 'use strict';
 
@@ -2032,9 +2917,10 @@ const reduceMotion = matchMedia('(prefers-reduced-motion: reduce)').matches;
 const VIA_HELPER = location.protocol === 'http:' || location.protocol === 'https:';
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
+let IMPORTING = false;   // set while a moved library is written in, so nothing overwrites it before the reload
 const store = {
   get(k, d) { try { const v = localStorage.getItem(k); return v == null ? d : JSON.parse(v); } catch { return d; } },
-  set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); return true; } catch { return false; } },
+  set(k, v) { if (IMPORTING) return false; try { localStorage.setItem(k, JSON.stringify(v)); return true; } catch { return false; } },
   del(k) { try { localStorage.removeItem(k); } catch {} }
 };
 const idb = (() => {
@@ -2070,8 +2956,12 @@ function fnv(str) { let h = 0x811c9dc5; for (let i = 0; i < str.length; i++) { h
 const norm = s => String(s || '').normalize('NFKC').toLowerCase().replace(/[\s\p{P}\p{S}]+/gu, '');
 const KEY = { library: 'ah.library', settings: 'ah.settings', progress: 'ah.progress', last: 'ah.last', recent: 'ah.recent', resolved: 'ah.resolved', dir: 'ah.dir', colors: 'ah.colors', cap: id => 'ah.cap.' + fnv(id) };
 
+const tr = text => (window.AHI18N ? window.AHI18N.tr(text) : text);
+const IN_WINDOW = new URLSearchParams(location.search).get('window') === '1';   // opened as Afterhours' own window
+const NO_TR = /(^|\s)(ep-title|ep-desc|ep-show|show-title|show-author|show-about|card-title|card-why|up-show|up-title|notes-text|lyric|t)(\s|$)/;  // podcast content stays as published
 function el(tag, props = {}, ...kids) {
   const n = document.createElement(tag);
+  if (props.class && NO_TR.test(props.class)) n.setAttribute('translate', 'no');
   for (const [k, v] of Object.entries(props)) {
     if (v == null || v === false) continue;
     if (k === 'class') n.className = v;
@@ -2111,20 +3001,27 @@ function fmtTime(s) {
   const h = Math.floor(s / 3600), m = Math.floor(s % 3600 / 60), sec = s % 60;
   return h ? `${h}:${String(m).padStart(2, '0')}:${String(sec).padStart(2, '0')}` : `${m}:${String(sec).padStart(2, '0')}`;
 }
+let LANG = 'en';
 function fmtDur(s) {
   if (!s) return '';
-  const m = Math.round(s / 60);
-  if (m < 60) return `${Math.max(1, m)} min`;
-  const h = Math.floor(m / 60), r = m % 60;
-  return r ? `${h} h ${r} min` : `${h} h`;
+  const m = Math.round(s / 60), h = Math.floor(m / 60), r = m % 60, mm = Math.max(1, m);
+  if (LANG === 'zh-Hans') return m < 60 ? `${mm} 分钟` : r ? `${h} 小时 ${r} 分钟` : `${h} 小时`;
+  if (LANG === 'ja') return m < 60 ? `${mm}分` : r ? `${h}時間${r}分` : `${h}時間`;
+  return m < 60 ? `${mm} min` : r ? `${h} h ${r} min` : `${h} h`;
 }
-const dShort = new Intl.DateTimeFormat(undefined, { day: 'numeric', month: 'short' });
-const dLong = new Intl.DateTimeFormat(undefined, { day: 'numeric', month: 'short', year: 'numeric' });
+let dShort, dLong, dWeek;
+function makeFormatters() {
+  const loc = LANG === 'zh-Hans' ? 'zh-CN' : LANG === 'ja' ? 'ja-JP' : undefined;
+  dShort = new Intl.DateTimeFormat(loc, { day: 'numeric', month: 'short' });
+  dLong = new Intl.DateTimeFormat(loc, { day: 'numeric', month: 'short', year: 'numeric' });
+  dWeek = new Intl.DateTimeFormat(loc, { weekday: 'long' });
+}
+makeFormatters();
 function fmtDate(ms) {
   if (!ms) return '';
   const days = Math.floor((Date.now() - ms) / 864e5);
   if (days >= 0 && days < 1 && new Date(ms).getDate() === new Date().getDate()) return 'Today';
-  if (days >= 0 && days < 7) return new Intl.DateTimeFormat(undefined, { weekday: 'long' }).format(ms);
+  if (days >= 0 && days < 7) return dWeek.format(ms);
   return (new Date(ms).getFullYear() === new Date().getFullYear() ? dShort : dLong).format(ms);
 }
 const fmtSpeed = v => (Math.round(v * 100) / 100).toString() + '×';
@@ -2141,11 +3038,25 @@ function toast(msg, isError) {
 }
 
 /* ---------- state ---------- */
-const DEFAULTS = { speed: 1, volume: 1, muted: false, captions: true, autoNext: true, theme: 'system', sort: 'newest', autoCaptions: true, captionModel: 'auto', motion: !reduceMotion, pointerGlow: true };
+const DEFAULTS = { speed: 1, volume: 1, muted: false, captions: true, autoNext: true, theme: 'system', sort: 'newest', autoCaptions: true, captionModel: 'auto', motion: !reduceMotion, pointerGlow: true, language: 'system', pro: false, asr: {} };
 const settings = Object.assign({}, DEFAULTS, store.get(KEY.settings, {}));
 const saveSettings = () => store.set(KEY.settings, settings);
 const motionOn = () => settings.motion !== false;
 function applyMotion() { document.documentElement.classList.toggle('no-motion', !motionOn()); }
+function currentLang() {
+  const v = settings.language || 'system';
+  if (v !== 'system') return v;
+  const n = (navigator.language || 'en').toLowerCase();
+  return n.startsWith('zh') ? 'zh-Hans' : n.startsWith('ja') ? 'ja' : 'en';
+}
+function applyLanguage() {
+  LANG = currentLang();
+  document.documentElement.lang = LANG;
+  makeFormatters();
+  if (window.AHI18N) window.AHI18N.setLang(LANG);
+}
+let whoP = null;
+const whoami = () => whoP || (whoP = getJSON('/api/ping').then(j => { S.client = j.client || 'local'; S.platform = j.platform || ''; return j; }, () => ({ client: 'local' })));
 function applyGlow() { document.documentElement.classList.toggle('no-glow', settings.pointerGlow === false); }
 let library = store.get(KEY.library, null);
 let progress = store.get(KEY.progress, {});
@@ -2384,7 +3295,7 @@ const Recog = {
     try { this.cap = await getJSON('/api/captions'); } catch { this.cap = { available: false }; }
     return this.cap;
   },
-  modelFor(show) { return settings.captionModel && settings.captionModel !== 'auto' ? settings.captionModel : (langOf(show) ? 'small' : 'base'); },
+  modelFor(show) { if (settings.pro && asrGet('model') !== 'auto') return asrGet('model'); return settings.captionModel && settings.captionModel !== 'auto' ? settings.captionModel : (langOf(show) ? 'small' : 'base'); },
   maybeStart(ep, resume) {
     if (!this.cap) { this.init().then(() => { if (S.current && S.current.ep.id === ep.id) { this.maybeStart(ep, resume); paintRecog(); renderLyrics(); renderCaptions(true); } }); return; }
     if (!this.cap.available) { if (!S.auto) S.auto = { state: 'unavailable' }; return; }
@@ -2395,12 +3306,12 @@ const Recog = {
     this.stop();
     if (!S.current || S.current.ep.id !== ep.id) return;
     const show = S.current.show;
-    Object.assign(this, { ep, url: ep.url, model: model || this.modelFor(show), since: 0, dropCached: S.cues.length > 0 });
+    Object.assign(this, { ep, id: '', url: ep.url, model: model || this.modelFor(show), since: 0, dropCached: S.cues.length > 0 });
     S.auto = { state: 'queued', progress: 0, model: this.model };
     paintRecog();
     const at = Math.floor(S.pendingSeek != null ? S.pendingSeek : (audio.currentTime || 0));
     try {
-      const st = await getJSON(`/api/captions/start?url=${encodeURIComponent(ep.url)}&model=${this.model}&start=${at}&lang=${langOf(show)}`);
+      const st = await getJSON(`/api/captions/start?url=${encodeURIComponent(ep.url)}&model=${this.model}&start=${at}&lang=${langOf(show)}${settings.pro ? '&opts=' + encodeURIComponent(JSON.stringify(proOpts())) : ''}`);
       if (this.ep === ep) this.apply(st);
     } catch (e) { if (this.ep === ep) { S.auto = { state: 'error', error: e.message }; paintRecog(); renderLyrics(); renderCaptions(true); } return; }
     this.poll();
@@ -2410,13 +3321,14 @@ const Recog = {
     if (!this.ep || !recogActive()) return;
     const ep = this.ep;
     this.timer = setTimeout(async () => {
-      try { const st = await getJSON(`/api/captions/status?url=${encodeURIComponent(this.url)}&model=${this.model}&since=${this.since}`); if (this.ep === ep) this.apply(st); }
+      try { const st = await getJSON(`/api/captions/status?url=${encodeURIComponent(this.url)}&model=${this.model}&since=${this.since}&id=${this.id || ''}`); if (this.ep === ep) this.apply(st); }
       catch {}
       if (this.ep === ep) this.poll();
     }, 1500);
   },
   apply(st) {
     if (!st || st.state === 'none') return;
+    if (st.id) this.id = st.id;
     const fresh = (st.segments || []).map(c => ({ start: c.start, end: c.end, text: c.text, speaker: '', auto: true }));
     if (fresh.length) {
       const before = S.cues.length;
@@ -2444,7 +3356,7 @@ const Recog = {
     clearTimeout(this.timer);
     if (this.ep && recogActive()) {
       this.save(false);
-      getJSON(`/api/captions/cancel?url=${encodeURIComponent(this.url)}&model=${this.model}`).catch(() => {});
+      getJSON(`/api/captions/cancel?url=${encodeURIComponent(this.url)}&model=${this.model}&id=${this.id || ''}`).catch(() => {});
     }
     this.ep = null;
   }
@@ -2487,6 +3399,7 @@ function captionCard() {
   if (recogActive()) return card('Recognising speech on this computer', 'Captions appear here as they’re ready, starting from where you are in the episode.',
     el('p', { text: recogText() }), el('span', { class: 'meter' }, el('i', { style: `width:${recogPct()}%` })),
     el('div', { class: 'cap-actions' }, el('button', { class: 'np-chip', type: 'button', onclick: stopRecognition }, el('span', { text: 'Stop' })), capSwitch()));
+  if (a.state === 'unavailable' && S.client === 'android') return card('No captions for this episode', 'Auto captions aren’t available on phones yet. Feed transcripts and caption files still work.');
   if (a.state === 'unavailable') return card('Caption any episode', 'This episode has no captions. Afterhours can recognise the speech on your computer and caption it, privately and for free. To turn this on, quit Afterhours and run this once:',
     el('code', { text: (Recog.cap && Recog.cap.install) || 'python3 afterhours.py --setup-captions' }), el('p', { text: 'Then start Afterhours again. If you’d rather not, switch auto captions off.' }), el('div', { class: 'cap-actions' }, capSwitch()));
   if (a.state === 'off') return card('No captions for this episode', 'Auto captions are off, so episodes without captions aren’t captioned automatically.', el('div', { class: 'cap-actions' }, startBtn('Caption this episode'), capSwitch()));
@@ -2915,7 +3828,7 @@ function card(c) {
   const body = el('button', { class: 'card-body', type: 'button', 'aria-label': `Open ${c.title}` },
     art(c.image, c.title, { pending: !!c.item && !c.feedUrl && !c.failed }),
     el('span', { class: 'card-title', text: c.title }),
-    el('span', { class: 'card-sub', text: c.author || '\u00a0' }),
+    el('span', { class: 'card-sub', translate: 'no', text: c.author || '\u00a0' }),
     c.why ? el('span', { class: 'card-why', text: c.why }) : null);
   body.addEventListener('click', () => openCandidate(c, body.querySelector('.art')));
   const add = el('button', { class: 'add-btn', type: 'button' });
@@ -2973,7 +3886,7 @@ function addShow(c, quiet) {
   return s;
 }
 function removeShow(s) {
-  if (!confirm(`Remove “${s.title}” from your library?`)) return;
+  if (!confirm(tr(`Remove “${s.title}” from your library?`))) return;
   library = library.filter(x => x !== s);
   saveLibrary();
   idb.del('eps:' + s.feedUrl);
@@ -2984,7 +3897,7 @@ function removeShow(s) {
 function showTile(s) {
   const status = s.status === 'missing' ? 'Not found automatically' : s.status === 'pending' ? 'Finding feed…' : (s.author || '');
   const t = el('div', { class: 'tile' + (s.status === 'missing' ? ' missing' : ''), dataset: { sid: s.sid } },
-    el('a', { class: 'tile-link', href: '#/show/' + s.sid }, art(s.image, s.title, { pending: s.status === 'pending' }), el('span', { class: 'card-title', text: s.title }), el('span', { class: 'card-sub', text: status })));
+    el('a', { class: 'tile-link', href: '#/show/' + s.sid }, art(s.image, s.title, { pending: s.status === 'pending' }), el('span', { class: 'card-title', text: s.title }), el('span', Object.assign({ class: 'card-sub', text: status }, status === s.author ? { translate: 'no' } : {}))));
   if (s.feedUrl && s.feedUrl === playingFeed()) t.append(el('span', { class: 'tile-eq' }, eq()));
   return t;
 }
@@ -3087,14 +4000,16 @@ function flyArt(from, to, back) {
 /* ---------- routing ---------- */
 function parseRoute() { const h = location.hash.replace(/^#\/?/, ''); const [name, ...rest] = h.split('/'); return { name: name || 'home', arg: decodeURIComponent(rest.join('/')) }; }
 function go(path) { if (location.hash === '#/' + path) render(); else location.hash = '#/' + path; }
+let renderSeq = 0;
 function render() {
+  renderSeq++;
   route = parseRoute();
   closeSpeed();
   if (S.npOpen) closeNp();
   view.replaceChildren();
   view.classList.toggle('drill', route.name === 'show');
   view.style.animation = 'none'; void view.offsetWidth; view.style.animation = S.flyArt ? 'none' : '';
-  const fn = { home: renderHome, discover: renderDiscover, library: renderLibrary, show: renderShow, search: renderSearch, settings: renderSettings }[route.name] || renderHome;
+  const fn = { home: renderHome, discover: renderDiscover, library: renderLibrary, show: renderShow, search: renderSearch, settings: renderSettings, move: renderMove }[route.name] || renderHome;
   fn(route.arg);
   $('main').scrollTop = 0;
   markNav();
@@ -3109,15 +4024,56 @@ function renderSidebar() {
   const ul = $('sideShows');
   const cur = route.name === 'show' ? route.arg : null;
   const playing = playingFeed();
-  ul.replaceChildren(...library.map(s => el('li', {}, el('a', { href: '#/show/' + s.sid, 'aria-current': s.sid === cur ? 'page' : null, class: s.status !== 'ready' ? 'dim' : null, title: s.title },
+  ul.replaceChildren(...library.map(s => el('li', {}, el('a', { href: '#/show/' + s.sid, 'aria-current': s.sid === cur ? 'page' : null, class: s.status !== 'ready' ? 'dim' : null, title: s.title, translate: 'no' },
     art(s.image, s.title, { cls: 'side-art', eager: true }), el('span', { class: 't', text: s.title }), s.feedUrl && s.feedUrl === playing ? eq() : null))));
 }
 
 /* ---------- views ---------- */
+async function renderMove() {
+  view.append(pageHead('Moving your library', null));
+  const note = el('p', { class: 'move-note', text: 'Sending your shows, progress and settings to the Afterhours window…' });
+  view.append(note);
+  const data = {};
+  for (let i = 0; i < localStorage.length; i++) { const k = localStorage.key(i); if (k && k.startsWith('ah.') && k !== 'ah.moveOffer') data[k] = localStorage.getItem(k); }
+  try {
+    const r = await fetch('/api/move', { method: 'POST', headers: { 'X-Afterhours': '1', 'Content-Type': 'application/json' }, body: JSON.stringify(data) });
+    if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || 'Afterhours’ helper isn’t answering. Is afterhours.py still running?');
+    note.textContent = 'Done. Your library is in the Afterhours window now, so you can close this tab.';
+  } catch (e) { note.textContent = e.message; }
+}
+function importMove(data) {
+  IMPORTING = true;
+  for (const [k, v] of Object.entries(data)) if (k.startsWith('ah.') && typeof v === 'string') localStorage.setItem(k, v);
+  localStorage.removeItem('ah.moveOffer');
+  toast('Your library is here.');
+  setTimeout(() => location.reload(), 700);
+}
+async function startMove() {
+  toast('Opening your browser to collect your library…');
+  try { await postJSON('/api/move/open'); } catch (e) { toast(e.message, true); return; }
+  for (const until = Date.now() + 120000; Date.now() < until;) {
+    await sleep(1500);
+    let j = null;
+    try { j = await getJSON('/api/move'); } catch { continue; }
+    if (j && j.data) { importMove(j.data); return; }
+  }
+  toast('Nothing arrived from your browser. Try again, or use Export and Import OPML.', true);
+}
+function moveCard() {
+  const card = el('section', { class: 'move-card' },
+    el('div', { class: 'move-text' }, el('h2', { text: 'Used Afterhours in your browser before?' }),
+      el('p', { text: 'Bring your shows, listening progress and settings into this window. Your browser opens for a moment to hand them over.' })),
+    el('div', { class: 'set-actions' },
+      el('button', { class: 'btn primary small', type: 'button', text: 'Bring them over', onclick: startMove }),
+      el('button', { class: 'btn tonal small', type: 'button', text: 'Not now', onclick: () => { localStorage.removeItem('ah.moveOffer'); card.remove(); } })));
+  return card;
+}
 function renderHome() {
   const h = new Date().getHours();
   const greet = h < 5 ? 'Up late' : h < 12 ? 'Good morning' : h < 18 ? 'Good afternoon' : 'Good evening';
   view.append(pageHead('Listen Now', `${greet}. Here’s what’s new on your shelf.`, gearLink()));
+  if (IN_WINDOW && localStorage.getItem('ah.moveOffer')) view.append(moveCard());
+  if (!IN_WINDOW && !localStorage.getItem('ah.windowOfferOff')) offerWindow();
   view.append(el('div', { id: 'setupBanner' }));
   updateSetupUI();
   const up = recent.filter(r => { const p = progress[r.ep.id]; return p && !p.done && p.p > 10; }).slice(0, 12);
@@ -3354,49 +4310,205 @@ function retryMissing() {
   render();
 }
 async function clearAutoCaptions() {
-  if (!confirm('Delete the auto captions saved on this computer? They’ll be made again when you next play those episodes.')) return;
+  if (!confirm(tr('Delete the auto captions saved on this computer? They’ll be made again when you next play those episodes.'))) return;
   try { await postJSON('/api/captions/clear'); } catch {}
   await idb.delPrefix('asr:');
   toast('Saved auto captions deleted.');
 }
-function renderSettings() {
-  view.append(pageHead('Settings', 'Afterhours runs on this computer. Your library and settings stay in this browser.'));
-  const row = (title, sub, control) => el('div', { class: 'set-row' }, el('div', { class: 'set-text' }, el('span', { class: 'set-title', text: title }), sub ? el('span', { class: 'set-sub' }, sub) : null), control || null);
-  const group = (title, ...rows) => el('section', { class: 'set-group' }, el('h2', { class: 'set-head', text: title }), el('div', { class: 'set-card' }, rows));
+const ASR_DEFAULTS = { model: 'auto', language: 'auto', task: 'transcribe', device: 'auto', compute: 'auto', threads: 0, beam: 1, temperature: 0,
+  condition: false, vad: true, vadThreshold: 0.5, minSilence: 500, noSpeech: 0.6, compression: 2.4, logProb: -1, words: true, maxChars: 84, maxSeconds: 6.5, prompt: '', hotwords: '' };
+const asrGet = k => (settings.asr && settings.asr[k] !== undefined ? settings.asr[k] : ASR_DEFAULTS[k]);
+function asrSet(k, v) { settings.asr = Object.assign({}, settings.asr, { [k]: v }); saveSettings(); }
+function proOpts() {
+  const o = {};
+  for (const k of Object.keys(ASR_DEFAULTS)) if (k !== 'model') o[k] = asrGet(k);
+  if (o.language === 'auto') o.language = '';
+  return o;
+}
+const setRow = (title, sub, control) => el('div', { class: 'set-row' }, el('div', { class: 'set-text' }, el('span', { class: 'set-title', text: title }), sub ? el('span', { class: 'set-sub' }, sub) : null), control || null);
+const setGroup = (title, ...rows) => el('section', { class: 'set-group' }, el('h2', { class: 'set-head', text: title }), el('div', { class: 'set-card' }, rows));
+function selectInput(options, value, onChange, label) {
+  const sel = el('select', { class: 'sel', 'aria-label': label });
+  for (const [v, text] of options) sel.append(el('option', { value: v, text }));
+  sel.value = value;
+  sel.addEventListener('change', () => onChange(sel.value));
+  return sel;
+}
+function numberInput(value, min, max, step, onChange, label) {
+  const i = el('input', { type: 'number', class: 'num', min, max, step, value: String(value), 'aria-label': label, inputmode: 'decimal' });
+  i.addEventListener('change', () => { let v = parseFloat(i.value); if (!isFinite(v)) v = value; v = Math.min(max, Math.max(min, v)); i.value = String(v); onChange(v); });
+  return i;
+}
+function textInput(value, placeholder, onChange, label) {
+  const i = el('input', { type: 'text', class: 'txt', value, placeholder, 'aria-label': label, spellcheck: 'false', autocomplete: 'off' });
+  i.addEventListener('change', () => onChange(i.value.trim()));
+  return i;
+}
+function asrToggle(k, label, on, off) {
+  const i = el('input', { type: 'checkbox', class: 'switch', role: 'switch', 'aria-label': label });
+  i.checked = on ? asrGet(k) === on : !!asrGet(k);
+  i.addEventListener('change', () => asrSet(k, on ? (i.checked ? on : off) : i.checked));
+  return i;
+}
+function proPanel() {
+  const head = text => el('div', { class: 'set-subhead', text });
+  const num = (k, min, max, step, label) => numberInput(asrGet(k), min, max, step, v => asrSet(k, v), label);
+  const models = [['auto', 'Automatic'], ['tiny', 'tiny · 75 MB'], ['tiny.en', 'tiny.en · 75 MB'], ['base', 'base · 145 MB'], ['base.en', 'base.en · 145 MB'],
+    ['small', 'small · 480 MB'], ['small.en', 'small.en · 480 MB'], ['medium', 'medium · 1.5 GB'], ['medium.en', 'medium.en · 1.5 GB'],
+    ['large-v3', 'large-v3 · 3 GB'], ['large-v3-turbo', 'large-v3-turbo · 1.6 GB'], ['distil-large-v3', 'distil-large-v3 · 1.5 GB']];
+  const langs = [['auto', 'Automatic'], ['en', 'English'], ['ja', '日本語'], ['zh', '中文'], ['yue', '粵語'], ['ko', '한국어'], ['fr', 'Français'],
+    ['de', 'Deutsch'], ['es', 'Español'], ['it', 'Italiano'], ['pt', 'Português'], ['ru', 'Русский']];
+  return setGroup('Pro mode',
+    head('Model'),
+    setRow('Model', 'Bigger models are more accurate and slower. “.en” models are English-only. large-v3-turbo needs faster-whisper 1.1 or later.', selectInput(models, asrGet('model'), v => asrSet('model', v), 'Model')),
+    setRow('Spoken language', 'Automatic detects it from the episode.', selectInput(langs, asrGet('language'), v => asrSet('language', v), 'Spoken language')),
+    setRow('Translate into English', 'Write the captions in English, whatever language is spoken.', asrToggle('task', 'Translate into English', 'translate', 'transcribe')),
+    head('Hardware'),
+    setRow('Run on', 'Automatic uses a supported NVIDIA graphics card when there is one.', selectInput([['auto', 'Automatic'], ['cpu', 'Processor'], ['cuda', 'Graphics card']], asrGet('device'), v => asrSet('device', v), 'Run on')),
+    setRow('Precision', 'Lower precision is faster and uses less memory.', selectInput([['auto', 'Automatic'], ['int8', 'int8'], ['int8_float16', 'int8_float16'], ['int16', 'int16'], ['float16', 'float16'], ['float32', 'float32']], asrGet('compute'), v => asrSet('compute', v), 'Precision')),
+    setRow('Processor threads', '0 lets Afterhours decide.', num('threads', 0, 64, 1, 'Processor threads')),
+    head('Decoding'),
+    setRow('Beam size', 'How many guesses Whisper weighs at once. 1 is fastest; 5 is more careful.', num('beam', 1, 10, 1, 'Beam size')),
+    setRow('Temperature', 'Above 0 adds variety. Keep it at 0 for steady results.', num('temperature', 0, 1, 0.1, 'Temperature')),
+    setRow('Use previous text', 'Lets Whisper use what it just heard as context. Smoother, but it can repeat itself.', asrToggle('condition', 'Use previous text')),
+    head('Silence and filtering'),
+    setRow('Skip silence', 'Finds speech first, so music and silence are skipped.', asrToggle('vad', 'Skip silence')),
+    setRow('Speech threshold', 'Higher means only clear speech counts.', num('vadThreshold', 0.05, 0.95, 0.05, 'Speech threshold')),
+    setRow('Shortest silence (ms)', 'Pauses shorter than this don’t split speech.', num('minSilence', 50, 5000, 50, 'Shortest silence (ms)')),
+    setRow('No-speech threshold', 'How sure Whisper must be that a stretch has no speech before skipping it.', num('noSpeech', 0, 1, 0.05, 'No-speech threshold')),
+    setRow('Repetition limit', 'Lines that compress more than this are treated as mistakes and retried.', num('compression', 1, 10, 0.1, 'Repetition limit')),
+    setRow('Confidence floor', 'Lines less confident than this are retried.', num('logProb', -10, 0, 0.1, 'Confidence floor')),
+    head('Caption lines'),
+    setRow('Word timing', 'Splits captions into short lines using the timing of each word.', asrToggle('words', 'Word timing')),
+    setRow('Longest line (characters)', null, num('maxChars', 20, 300, 1, 'Longest line (characters)')),
+    setRow('Longest line (seconds)', null, num('maxSeconds', 1, 30, 0.5, 'Longest line (seconds)')),
+    head('Vocabulary'),
+    setRow('Vocabulary hint', 'Names and words to expect, such as hosts, guests or places.', textInput(asrGet('prompt'), 'e.g. Agatha Christie, Hercule Poirot', v => asrSet('prompt', v), 'Vocabulary hint')),
+    setRow('Hotwords', 'Words Whisper should listen out for. Needs faster-whisper 1.0 or later.', textInput(asrGet('hotwords'), '', v => asrSet('hotwords', v), 'Hotwords')),
+    setRow('Pro settings apply to the next captions Afterhours makes.', null, el('div', { class: 'set-actions' },
+      el('button', { class: 'btn tonal small', type: 'button', text: 'Re-caption this episode', onclick: () => { if (!S.current) { toast('Start an episode first.'); return; } Recog.start(S.current.ep); renderLyrics(); } }),
+      el('button', { class: 'btn tonal small', type: 'button', text: 'Reset to defaults', onclick: () => { settings.asr = {}; saveSettings(); toast('Pro settings reset.'); render(); } }))));
+}
+function windowGroup() {
+  const sub = el('span', { text: 'Checking…' }), ctl = el('div', { class: 'set-actions' });
+  const group = setGroup('Window', setRow('Open in its own window', sub, ctl));
+  const paint = p => {
+    if (!group.isConnected && sub.textContent !== 'Checking…') return;
+    ctl.replaceChildren();
+    const setup = p.setup || {};
+    if (p.native) {
+      const sw = el('input', { type: 'checkbox', class: 'switch', role: 'switch', 'aria-label': 'Open in its own window' });
+      sw.checked = !!p.window;
+      sw.addEventListener('change', () => postJSON('/api/prefs?window=' + (sw.checked ? 1 : 0)).catch(e => toast(e.message, true)));
+      if (p.running === 'window') sub.textContent = 'Afterhours is its own app here, using the web view built into your system. No browser is involved, and closing the window quits Afterhours.';
+      else {
+        sub.textContent = 'The window component is installed. Switch now, or Afterhours opens in its own window the next time you start it.';
+        ctl.append(el('button', { class: 'btn primary small', type: 'button', text: 'Switch now', onclick: switchToWindow }));
+      }
+      ctl.append(sw);
+    } else if (setup.state === 'working') {
+      sub.textContent = setup.message || 'Installing the window component…';
+      setTimeout(() => { if (group.isConnected) getJSON('/api/prefs').then(paint, () => {}); }, 1500);
+    } else {
+      sub.textContent = setup.state === 'error' ? setup.message : 'Afterhours can run as its own app instead of in your browser, using the web view built into your system. It needs a small window component, installed once.';
+      ctl.append(el('button', { class: 'btn primary small', type: 'button', text: setup.state === 'error' ? 'Try again' : 'Install',
+        onclick: () => postJSON('/api/window/setup').then(() => getJSON('/api/prefs').then(paint), e => toast(e.message, true)) }));
+    }
+  };
+  getJSON('/api/prefs').then(paint).catch(() => { sub.textContent = ''; });
+  return group;
+}
+function libraryData() {
+  const data = {};
+  for (let i = 0; i < localStorage.length; i++) { const k = localStorage.key(i); if (k && k.startsWith('ah.') && k !== 'ah.moveOffer') data[k] = localStorage.getItem(k); }
+  return data;
+}
+async function switchToWindow() {
+  try {
+    const r = await fetch('/api/window/switch', { method: 'POST', headers: { 'X-Afterhours': '1', 'Content-Type': 'application/json' }, body: JSON.stringify(libraryData()) });
+    if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || 'Afterhours’ helper isn’t answering. Is afterhours.py still running?');
+  } catch (e) { toast(e.message, true); return; }
+  $('audio').pause();
+  document.body.replaceChildren(el('div', { class: 'empty', style: 'margin-top:30vh' }, el('h2', { text: 'Afterhours is opening in its own window' }), el('p', { text: 'Your library goes with it. You can close this tab.' })));
+}
+async function offerWindow() {
+  const who = await whoami();
+  if (who.client !== 'local') return;
+  const p = await getJSON('/api/prefs').catch(() => null);
+  if (!p || p.native || p.running !== 'browser' || route.name !== 'home' || view.querySelector('.window-card')) return;
+  const card = el('section', { class: 'move-card window-card' },
+    el('div', { class: 'move-text' }, el('h2', { text: 'Make Afterhours its own app' }),
+      el('p', { text: 'Run it in its own window, without a browser. Afterhours installs a small window component once.' })),
+    el('div', { class: 'set-actions' },
+      el('button', { class: 'btn primary small', type: 'button', text: 'Set it up', onclick: () => postJSON('/api/window/setup').then(() => go('settings'), e => toast(e.message, true)) }),
+      el('button', { class: 'btn tonal small', type: 'button', text: 'Not now', onclick: () => { localStorage.setItem('ah.windowOfferOff', '1'); card.remove(); } })));
+  const head = view.querySelector('.page-head');
+  if (head) head.after(card);
+}
+async function renderSettings() {
+  const seq = renderSeq, who = await whoami();
+  if (seq !== renderSeq || route.name !== 'settings') return;
+  const local = who.client === 'local';
+  view.append(pageHead('Settings', !local ? null : IN_WINDOW ? 'Afterhours runs on this computer, and your library and settings stay on it.' : 'Afterhours runs on this computer. Your library and settings stay in this browser.'));
+  view.append(setGroup('Language', setRow('Language', 'Choose the language for Afterhours. Podcast titles and descriptions stay as their publishers wrote them.',
+    selectInput([['system', 'System'], ['en', 'English'], ['zh-Hans', '简体中文'], ['ja', '日本語']], settings.language || 'system', v => { settings.language = v; saveSettings(); applyLanguage(); render(); }, 'Language'))));
   const status = el('span', { text: 'Checking…' });
-  view.append(group('Captions',
-    row('Show captions', 'The current line above the player and in Now Playing.', switchInput('captions', 'Show captions', on => { settings.captions = on; saveSettings(); syncCC(); renderCaptions(true); })),
-    row('Auto captions', 'When an episode has no captions, recognise the speech on this computer and caption it.', switchInput('autoCaptions', 'Auto captions', on => setAutoCaptions(on))),
-    row('Recognition quality', 'Captions come from OpenAI’s Whisper speech models, running on this computer. Fast uses Whisper base, Accurate uses Whisper small and Most accurate uses Whisper medium. Automatic picks base for English shows and small for Japanese and Chinese ones.',
+  const proBox = el('div', { class: 'pro-box', hidden: !settings.pro }, proPanel());
+  view.append(setGroup('Captions',
+    setRow('Show captions', 'The current line above the player and in Now Playing.', switchInput('captions', 'Show captions', on => { settings.captions = on; saveSettings(); syncCC(); renderCaptions(true); })),
+    setRow('Auto captions', 'When an episode has no captions, recognise the speech on this computer and caption it.', switchInput('autoCaptions', 'Auto captions', on => setAutoCaptions(on))),
+    setRow('Recognition quality', 'Captions come from OpenAI’s Whisper speech models, running on this computer. Fast uses Whisper base, Accurate uses Whisper small and Most accurate uses Whisper medium. Automatic picks base for English shows and small for Japanese and Chinese ones.',
       segmented([['auto', 'Automatic'], ['base', 'Fast'], ['small', 'Accurate'], ['medium', 'Most accurate']], settings.captionModel || 'auto', v => { settings.captionModel = v; saveSettings(); }, 'Recognition quality')),
-    row('Caption recognition', status),
-    row('Saved auto captions', 'Captions made on this computer are kept, so they load instantly next time.', el('button', { class: 'btn tonal small', type: 'button', text: 'Delete', onclick: clearAutoCaptions }))));
+    setRow('Caption recognition', status),
+    setRow('Pro mode', 'Fine-tune the speech recognition: model, language, hardware and decoding.', switchInput('pro', 'Pro mode', on => { settings.pro = on; saveSettings(); proBox.hidden = !on; if (on) animateItems(proBox.querySelectorAll('.set-row'), 10); })),
+    setRow('Saved auto captions', 'Captions made on this computer are kept, so they load instantly next time.', el('button', { class: 'btn tonal small', type: 'button', text: 'Delete', onclick: clearAutoCaptions }))));
+  view.append(proBox);
   getJSON('/api/captions').then(cap => {
     Recog.cap = cap;
     const v = cap.versions || {};
-    if (cap.available) status.replaceChildren(el('span', { class: 'set-ok', text: 'Ready. ' }),
-      `Speech is recognised by Whisper, running in ${cap.engine}${v['faster-whisper'] ? ' ' + v['faster-whisper'] : ''}${v.av ? `, and audio is read with PyAV ${v.av}` : ''}${v.ffmpeg ? ' (ffmpeg is there as a backup)' : ''}.`);
+    if (cap.available) status.replaceChildren(el('span', { class: 'set-ok', text: 'Ready.' }), ' ',
+      el('span', { translate: 'no', text: `Whisper · ${cap.engine}${v['faster-whisper'] ? ' ' + v['faster-whisper'] : ''}${v.av ? ` · PyAV ${v.av}` : ''}${v.ffmpeg ? ' · ffmpeg' : ''}` }));
+    else if (S.client === 'android') status.textContent = 'Auto captions aren’t available on phones yet. Feed transcripts and caption files still work.';
     else status.replaceChildren('Not set up yet. Quit Afterhours, run this once, then start it again:', el('code', { text: cap.install || 'python3 afterhours.py --setup-captions' }));
   }).catch(() => { status.textContent = 'Afterhours’ helper isn’t answering. Is afterhours.py still running?'; });
-  view.append(group('Playback',
-    row('Play the next episode automatically', null, switchInput('autoNext', 'Play the next episode automatically', on => { settings.autoNext = on; saveSettings(); $('npAuto').setAttribute('aria-pressed', String(on)); }))));
-  view.append(group('Appearance',
-    row('Appearance', 'Follow your system, or always use light or dark.', segmented([['system', 'System'], ['light', 'Light'], ['dark', 'Dark']], settings.theme, v => { settings.theme = v; saveSettings(); applyTheme(); }, 'Appearance')),
-    row('Animations', 'Fluent-style motion: pages glide in, artwork flies into place, and controls respond as you press them.', switchInput('motion', 'Animations', on => { settings.motion = on; saveSettings(); applyMotion(); toast(on ? 'Animations on.' : 'Animations off.'); })),
-    row('Pointer highlight', 'The soft glow that follows your mouse over lists, menus and buttons.', switchInput('pointerGlow', 'Pointer highlight', on => { settings.pointerGlow = on; saveSettings(); applyGlow(); toast(on ? 'Pointer highlight on.' : 'Pointer highlight off.'); }))));
+  view.append(setGroup('Playback',
+    setRow('Play the next episode automatically', null, switchInput('autoNext', 'Play the next episode automatically', on => { settings.autoNext = on; saveSettings(); $('npAuto').setAttribute('aria-pressed', String(on)); }))));
+  view.append(setGroup('Appearance',
+    setRow('Appearance', 'Follow your system, or always use light or dark.', segmented([['system', 'System'], ['light', 'Light'], ['dark', 'Dark']], settings.theme, v => { settings.theme = v; saveSettings(); applyTheme(); }, 'Appearance')),
+    setRow('Animations', 'Fluent-style motion: pages glide in, artwork flies into place, and controls respond as you press them.', switchInput('motion', 'Animations', on => { settings.motion = on; saveSettings(); applyMotion(); toast(on ? 'Animations on.' : 'Animations off.'); })),
+    setRow('Mouse halo', 'The soft glow that follows your mouse over lists, menus and buttons.', switchInput('pointerGlow', 'Mouse halo', on => { settings.pointerGlow = on; saveSettings(); applyGlow(); toast(on ? 'Mouse halo on.' : 'Mouse halo off.'); }))));
+  if (local) {
+    view.append(windowGroup());
+    const phoneSwitch = el('input', { type: 'checkbox', class: 'switch', role: 'switch', 'aria-label': 'Use on your phone' });
+    const phoneBox = el('div', { class: 'phone-box', hidden: true });
+    const paintPhone = info => {
+      phoneSwitch.checked = !!info.on;
+      phoneBox.hidden = !info.on;
+      if (!info.on) return;
+      phoneBox.replaceChildren(el('p', { class: 'set-sub', text: 'Open this link on your phone, then add it to your home screen:' }), el('code', { class: 'phone-link', text: info.url }),
+        el('div', { class: 'set-actions' },
+          el('button', { class: 'btn tonal small', type: 'button', text: 'Copy link', onclick: () => navigator.clipboard.writeText(info.url).then(() => toast('Link copied.'), () => {}) }),
+          el('button', { class: 'btn tonal small', type: 'button', text: 'New link', onclick: () => postJSON('/api/phone?renew=1').then(i => { paintPhone(i); toast('The old link no longer works. Use the new one on your phones.'); }, e => toast(e.message, true)) })));
+    };
+    phoneSwitch.addEventListener('change', () => postJSON('/api/phone?on=' + (phoneSwitch.checked ? 1 : 0))
+      .then(i => { paintPhone(i); toast(i.on ? 'Phone access on. Keep this computer awake while you listen.' : 'Phone access off.'); },
+        e => { phoneSwitch.checked = false; toast(e.message, true); }));
+    getJSON('/api/phone').then(paintPhone).catch(() => {});
+    view.append(setGroup('Phone', setRow('Use on your phone', 'Let phones on the same Wi-Fi use Afterhours from this computer, with a private link.', phoneSwitch), phoneBox));
+  }
   const missing = library.filter(s => s.status === 'missing').length;
-  view.append(group('Library',
-    row('Look for missing shows again', missing ? `${missing} show${missing > 1 ? 's' : ''} couldn’t be found automatically.` : 'Every show on your shelf was found.', el('button', { class: 'btn tonal small', type: 'button', text: 'Look again', disabled: !missing, onclick: retryMissing })),
-    row('Import OPML', 'Add shows from another podcast app.', el('button', { class: 'btn tonal small', type: 'button', text: 'Import…', onclick: () => $('opmlFile').click() })),
-    row('Export OPML', 'Save your shows for another podcast app.', el('button', { class: 'btn tonal small', type: 'button', text: 'Export', onclick: exportOPML }))));
-  const ver = el('span', { text: 'Afterhours' });
-  getJSON('/api/ping').then(x => { ver.textContent = `Afterhours ${x.version}`; }).catch(() => {});
-  view.append(group('About', row('Version', ver),
-    row('Quit Afterhours', 'Stops Afterhours on this computer. Open it again whenever you want to listen.', el('button', { class: 'btn tonal small', type: 'button', text: 'Quit', onclick: quitApp }))));
+  view.append(setGroup('Library',
+    IN_WINDOW ? setRow('Bring over your library', 'Copy your shows, progress and settings from the browser you used before.', el('button', { class: 'btn tonal small', type: 'button', text: 'Bring over', onclick: startMove })) : null,
+    setRow('Look for missing shows again', missing ? `${missing} show${missing > 1 ? 's' : ''} couldn’t be found automatically.` : 'Every show on your shelf was found.', el('button', { class: 'btn tonal small', type: 'button', text: 'Look again', disabled: !missing, onclick: retryMissing })),
+    setRow('Import OPML', 'Add shows from another podcast app.', el('button', { class: 'btn tonal small', type: 'button', text: 'Import…', onclick: () => $('opmlFile').click() })),
+    setRow('Export OPML', 'Save your shows for another podcast app.', el('button', { class: 'btn tonal small', type: 'button', text: 'Export', onclick: exportOPML }))));
+  const ver = el('span', { text: `Afterhours ${who.version || ''}`.trim() });
+  view.append(setGroup('About', setRow('Version', ver),
+    local ? setRow('Quit Afterhours', 'Stops Afterhours on this computer. Open it again whenever you want to listen.', el('button', { class: 'btn tonal small', type: 'button', text: 'Quit', onclick: quitApp })) : null));
   animateItems(view.querySelectorAll('.set-group'), 50);
 }
 async function quitApp() {
-  if (!confirm('Quit Afterhours? Playback stops, and you can open Afterhours again any time.')) return;
+  if (!confirm(tr('Quit Afterhours? Playback stops, and you can open Afterhours again any time.'))) return;
   audio.pause();
   saveProgress(true);
   try { await postJSON('/api/quit'); } catch {}
@@ -3410,7 +4522,7 @@ function renderSearch(term) {
   if (!term) {
     setTimeout(() => input.focus(), 60);
     const topics = [...CATS.map(c => c.keywords[0]), CATALOG.langs.ja.keywords[1], CATALOG.langs.zh.keywords[0]];
-    view.append(section('Try a topic', null, el('div', { class: 'chips wrap' }, topics.map(([t]) => el('a', { class: 'chip', href: '#/search/' + encodeURIComponent(t), text: t })))));
+    view.append(section('Try a topic', null, el('div', { class: 'chips wrap' }, topics.map(([t]) => el('a', { class: 'chip', translate: 'no', href: '#/search/' + encodeURIComponent(t), text: t })))));
     return;
   }
   if (looksLikeLink(term)) { handleLink(term); return; }
@@ -3938,10 +5050,24 @@ function wire() {
 }
 
 function init() {
+  if (IN_WINDOW && !localStorage.getItem('ah.library') && !sessionStorage.getItem('ah.moveChecked')) {
+    // a brand-new window: a library may already be waiting ("Switch now"), so take it before anything starts
+    sessionStorage.setItem('ah.moveChecked', '1');
+    const go = () => init();
+    fetch('/api/move').then(r => r.json()).then(j => {
+      if (j && j.data && typeof j.data === 'object') {
+        for (const [k, v] of Object.entries(j.data)) if (k.startsWith('ah.') && typeof v === 'string') localStorage.setItem(k, v);
+        location.reload();
+      } else go();
+    }).catch(go);
+    return;
+  }
+  if (IN_WINDOW && !localStorage.getItem('ah.library')) localStorage.setItem('ah.moveOffer', '1');   // a new window: offer to bring the old library
   seedLibrary();
   applyTheme();
   applyMotion();
   applyGlow();
+  applyLanguage();
   syncAutoCap();
   Recog.init();
   wire();
@@ -3963,6 +5089,7 @@ function init() {
   setPlaying(false);
   updateSleepLabel();
   runSetup();
+  whoami().then(w => { if ('serviceWorker' in navigator && w.client !== 'android') navigator.serviceWorker.register('/sw.js').catch(() => {}); });
 }
 init();
 })();
